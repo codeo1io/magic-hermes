@@ -52,7 +52,7 @@ class TestHandlers:
         handler = make_handlers(session)["ctx_search"]
         out = json.loads(handler({"query": "glm"}))
         assert out == {"hits": [{"id": "m1", "text": "match"}]}
-        seen = daemon.requests_seen
+        seen = [r for r in daemon.requests_seen if "method" in r]
         assert seen[0]["method"] == "memory.search"
         assert seen[0]["params"]["query"] == "glm"
 
