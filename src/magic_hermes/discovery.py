@@ -38,6 +38,16 @@ def candidate_paths() -> list[Path]:
     hermes_dir = home / ".hermes"
     paths.append(hermes_dir / "subc-hermes.json")
     paths.append(hermes_dir / "runtime" / "subc-hermes.json")
+    # bridge/daemon.mjs default: the cortexkit shared-data rpc dir.
+    paths.append(
+        home
+        / ".local"
+        / "share"
+        / "cortexkit"
+        / "magic-context"
+        / "rpc"
+        / "subc-hermes.json"
+    )
     return paths
 
 
