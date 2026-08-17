@@ -3,7 +3,7 @@ name = "magic-hermes"
 version = "0.1.0.dev0"
 description = "Magic Context connector plugin for hermes-agent (client to the subc daemon)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = []
 
