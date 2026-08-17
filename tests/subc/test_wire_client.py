@@ -178,10 +178,10 @@ class TestClientFlow:
             client = SubcClient.connect(daemon.connection_file(tmp_path))
             try:
                 modules = client.catalog_list()
-                assert modules[0].module_id == "mc.module"
+                assert modules[0].module_id == "mc.core"
 
                 handle = client.route_open(
-                    {"kind": "management_surface", "module_id": "mc.module"},
+                    {"kind": "management_surface", "module_id": "mc.core"},
                     make_identity(),
                 )
                 result = client.request(handle, {"method": "ping", "params": {"x": 1}})
@@ -189,7 +189,7 @@ class TestClientFlow:
                 client.route_close(handle)
 
                 managed = client.call(
-                    "mc.module", "status", {"a": True}, identity=make_identity()
+                    "mc.core", "status", {"a": True}, identity=make_identity()
                 )
                 assert managed["echo"]["method"] == "status"
             finally:
@@ -221,7 +221,7 @@ class TestClientFlow:
             try:
                 with pytest.raises(SocketTimeout):
                     handle = client.route_open(
-                        {"kind": "management_surface", "module_id": "mc.module"},
+                        {"kind": "management_surface", "module_id": "mc.core"},
                         make_identity(),
                         timeout_ms=500,
                     )

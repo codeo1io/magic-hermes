@@ -41,6 +41,7 @@ class FakeSubcDaemon:
         close_after_hello: bool = False,
         drop_requests: bool = False,
         daemon_ver: str = "fake-1.0",
+        modules: list[dict] | None = None,
     ):
         self.key = secrets.token_bytes(32)
         self.daemon_id = secrets.token_bytes(16)
@@ -48,6 +49,13 @@ class FakeSubcDaemon:
         self._bad_key = bad_key
         self._close_after_hello = close_after_hello
         self._drop_requests = drop_requests
+        self._modules = (
+            modules
+            if modules is not None
+            else [
+                {"module_id": "mc.core", "ops": ["compact", "search", "memory"]},
+            ]
+        )
         self._next_channel = 1
         self._lock = threading.Lock()
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -75,6 +83,9 @@ class FakeSubcDaemon:
             json.dump(payload, fh)
         os.chmod(path, 0o644 if insecure_perms else 0o600)
         return path
+
+    def start(self) -> None:
+        """No-op: the serve thread starts in the constructor."""
 
     def stop(self) -> None:
         try:
@@ -170,7 +181,11 @@ class FakeSubcDaemon:
                 self._control(conn, header.corr, payload)
             else:
                 self._respond(
-                    conn, header.channel, header.epoch, header.corr, {"echo": payload}
+                    conn,
+                    header.channel,
+                    header.epoch,
+                    header.corr,
+                    {"result": {"echo": payload}},
                 )
 
     def _control(self, conn: socket.socket, corr: int, payload: dict) -> None:
@@ -183,13 +198,7 @@ class FakeSubcDaemon:
                 corr,
                 {
                     "op": "catalog.list",
-                    "modules": [
-                        {
-                            "module_id": "mc.module",
-                            "roles": ["provider"],
-                            "control_ops": ["route.open"],
-                        }
-                    ],
+                    "modules": self._modules,
                 },
             )
         elif op == "route.open":
