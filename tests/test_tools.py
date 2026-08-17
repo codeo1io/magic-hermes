@@ -43,7 +43,7 @@ class TestSchemas:
     def test_schemas_have_required_fields(self):
         for schema in TOOL_SPECS:
             assert schema["description"]
-            assert schema["input_schema"]["type"] == "object"
+            assert schema["parameters"]["type"] == "object"
 
 
 class TestHandlers:

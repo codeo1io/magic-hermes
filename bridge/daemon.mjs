@@ -20,6 +20,8 @@ import { DatabaseSync } from "node:sqlite";
 const PROTOCOL_VERSION = 2;
 const HEADER_LEN = 21;
 const MAX_FRAME_BODY_LEN = 64 * 1024 * 1024;
+const MAX_AUTH_MSG_LEN = 64 * 1024; // handshake messages are tiny JSON
+const MAX_BUFFERED_BYTES = 128 * 1024 * 1024; // hard cap on unconsumed input
 const FRAME_TYPE = { RESPONSE: 1, ERROR: 5, PONG: 8 };
 const DAEMON_VER = "magic-hermes-bridge/0.1.0";
 const MODULE_ID = "mc-bridge-hermes";
@@ -49,6 +51,8 @@ const host = arg("host", "127.0.0.1");
 
 // ---------------------------------------------------------------- sqlite
 
+fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+fs.mkdirSync(runtimeDir, { recursive: true });
 const shared = new DatabaseSync(dbPath);
 shared.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
 // Ensure an FTS5 index over memories exists and stays in sync (external
@@ -75,6 +79,7 @@ try {
 	/* FTS5 unavailable — LIKE fallback still serves queries */
 }
 const hermesDb = new DatabaseSync(path.join(runtimeDir, "hermes.db"));
+hermesDb.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
 hermesDb.exec(`
   CREATE TABLE IF NOT EXISTS mh_sessions (
     session_id TEXT PRIMARY KEY, platform TEXT, model TEXT,
@@ -517,6 +522,12 @@ function handleConn(sock) {
 	function readAuthMessage() {
 		if (state.buf.length < 4) return null;
 		const len = state.buf.readUInt32LE(0);
+		// Pre-auth size cap: reject oversized handshake messages before
+		// buffering the body (memory-exhaustion guard).
+		if (len > MAX_AUTH_MSG_LEN) {
+			fail("auth message too large");
+			return null;
+		}
 		if (state.buf.length < 4 + len) return null;
 		const b = state.buf.subarray(4, 4 + len);
 		state.buf = state.buf.subarray(4 + len);
@@ -551,7 +562,7 @@ function handleConn(sock) {
 						state.serverNonce,
 						DAEMON_ID,
 					);
-					if (!expected.equals(Buffer.from(msg.client_auth)))
+					if (!crypto.timingSafeEqual(expected, Buffer.from(msg.client_auth)))
 						return fail("bad client proof");
 					state.authed = true;
 					return;
@@ -565,6 +576,7 @@ function handleConn(sock) {
 			} catch (e) {
 				return fail(e.message);
 			}
+			if (h.len > MAX_FRAME_BODY_LEN) return fail("frame too large");
 			if (state.buf.length < HEADER_LEN + h.len) return;
 			const body = state.buf.subarray(HEADER_LEN, HEADER_LEN + h.len);
 			state.buf = state.buf.subarray(HEADER_LEN + h.len);
@@ -670,6 +682,13 @@ function handleConn(sock) {
 
 	sock.on("data", (d) => {
 		state.buf = Buffer.concat([state.buf, d]);
+		if (state.buf.length > MAX_BUFFERED_BYTES) {
+			// Unconsumed input exceeds the hard cap (peer sending garbage or
+			// frames we never parse): drop the connection before memory grows
+			// unbounded.
+			sock.destroy();
+			return;
+		}
 		readFrames();
 	});
 	sock.on("error", () => sock.destroy());
@@ -698,5 +717,20 @@ server.listen(0, host, () => {
 		JSON.stringify({ conn_path: connPath, port, module_id: MODULE_ID }) + "\n",
 	);
 });
-process.on("SIGTERM", () => process.exit(0));
-process.on("SIGINT", () => process.exit(0));
+// Remove the connection file on exit so a stale rendezvous record never
+// outlives the daemon (discovery would otherwise keep probing a dead port).
+const connPathFinal = path.join(runtimeDir, "subc-hermes.json");
+function cleanupConnFile() {
+	try {
+		fs.unlinkSync(connPathFinal);
+	} catch {}
+}
+process.on("SIGTERM", () => {
+	cleanupConnFile();
+	process.exit(0);
+});
+process.on("SIGINT", () => {
+	cleanupConnFile();
+	process.exit(0);
+});
+process.on("exit", cleanupConnFile);

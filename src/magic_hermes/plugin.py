@@ -24,6 +24,17 @@ log = logging.getLogger(__name__)
 PLUGIN_API_VERSION = "0.1"
 
 
+def register(ctx):
+    """Entry point for hermes plugin discovery.
+
+    hermes calls ``register(ctx)`` for every discovered plugin (directory
+    ``plugin.yaml`` manifests and pip entry points in the
+    ``hermes_agent.plugins`` group both land here). ``load`` stays
+    keyword-friendly for tests and direct embedding.
+    """
+    return load(ctx)
+
+
 def load(ctx, *, project_root: str | None = None, session_id: str | None = None):
     """Register Magic Context surfaces on a hermes plugin context.
 

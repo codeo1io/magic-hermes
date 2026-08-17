@@ -23,7 +23,7 @@ SEARCH_TOOL_SCHEMA = {
         "raw conversation history (including compacted parts), git commits, "
         "and notes — from one ranked query."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Search query"},
@@ -44,7 +44,7 @@ EXPAND_TOOL_SCHEMA = {
         "Recover the full raw content of a message or range by ordinal "
         "(e.g. from ctx_search hits or session-history compartments)."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "start": {"type": "integer"},
@@ -61,7 +61,7 @@ REDUCE_TOOL_SCHEMA = {
         "Mark spent tagged conversation content as discardable to reclaim "
         "context space. Accepts ranges like '3-5' or lists like '1,2,9'."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {"drop": {"type": "string"}},
         "required": ["drop"],
@@ -73,7 +73,7 @@ MEMORY_TOOL_SCHEMA = {
     "description": (
         "Long-term recall: write/update/archive durable project memories, or list them."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "action": {
@@ -95,7 +95,7 @@ NOTE_TOOL_SCHEMA = {
         "Working notes for this session's future — reminders and "
         "follow-ups that resurface at natural work boundaries."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "action": {

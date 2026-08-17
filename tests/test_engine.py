@@ -18,19 +18,6 @@ def daemon(tmp_path):
     d.stop()
 
 
-@pytest.fixture()
-def session(daemon, monkeypatch):
-    monkeypatch.setenv(
-        "SUBC_CONNECTION_FILE", daemon.connection_file.__self__ if False else ""
-    )  # replaced below
-    s = MagicContextSession(
-        project_root=str(tmp_path if hasattr(tmp_path, "name") else "/tmp"),
-        session_id="sess-1",
-    )
-    yield s
-    s.close()
-
-
 def _make_session(daemon, tmp_path, monkeypatch):
     conn = daemon.connection_file(tmp_path)
     monkeypatch.setenv("SUBC_CONNECTION_FILE", conn)

@@ -1,0 +1,3 @@
+name: magic-hermes
+version: 0.1.0.dev0
+description: "Magic Context connector for hermes-agent: persistent memory, background compaction, and ctx_* tools backed by the shared cortexkit subc daemon."

@@ -20,15 +20,19 @@ logger = logging.getLogger("magic_hermes.engine")
 # Fractions mirror the TS plugins' compartment planning defaults.
 _DEFAULT_THRESHOLD_PERCENT = 0.75
 
+try:  # hermes enforces isinstance(engine, ContextEngine) at registration
+    from agent.context_engine import ContextEngine as _ContextEngineBase
+except Exception:  # pragma: no cover - hermes not on sys.path (unit tests)
+    _ContextEngineBase = object
 
-class MagicContextEngine:
+
+class MagicContextEngine(_ContextEngineBase):
     """ContextEngine implementation delegating to mc-core over subc.
 
-    The host (run_agent.py) reads the public attributes defined on
-    ``agent.context_engine.ContextEngine``; this class intentionally mirrors
-    that surface without importing hermes (importable even when hermes is
-    not on sys.path, e.g. for unit tests). ``plugin.py`` performs the actual
-    ABC-registration dance with hermes at load time.
+    Subclasses hermes' ``agent.context_engine.ContextEngine`` when hermes is
+    importable (register_context_engine enforces isinstance); falls back to
+    ``object`` otherwise so unit tests can construct it without hermes on
+    sys.path.
     """
 
     # -- Identity ----------------------------------------------------------

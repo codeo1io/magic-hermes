@@ -7,6 +7,9 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = []
 
+[project.entry-points."hermes_agent.plugins"]
+magic_hermes = "magic_hermes.plugin:register"
+
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
 

@@ -31,6 +31,13 @@ def candidate_paths() -> list[Path]:
     home = Path.home()
     paths.append(home / ".local" / "state" / "cortexkit" / "subc-connection.json")
     paths.append(home / ".local" / "share" / "cortexkit" / "subc-connection.json")
+    # magic-hermes' own bridge daemon publishes its connection file as
+    # subc-hermes.json in the hermes runtime dir (see bridge/daemon.mjs).
+    # Without these candidates the shipped daemon is only discoverable via
+    # SUBC_CONNECTION_FILE.
+    hermes_dir = home / ".hermes"
+    paths.append(hermes_dir / "subc-hermes.json")
+    paths.append(hermes_dir / "runtime" / "subc-hermes.json")
     return paths
 
 

@@ -195,7 +195,7 @@ class DreamerRunner:
 
 
 def auxiliary_defaults_from_config(
-    config: MagicContextConfig,
+    config: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
     """Build hermes auxiliary-task ``defaults`` from the shared config."""
     historian_model = str(config.get("historian", {}).get("model", "")).strip()
