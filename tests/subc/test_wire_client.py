@@ -185,7 +185,7 @@ class TestClientFlow:
                     make_identity(),
                 )
                 result = client.request(handle, {"method": "ping", "params": {"x": 1}})
-                assert result == {"echo": {"method": "ping", "params": {"x": 1}}}
+                assert result == {"result": {"echo": {"method": "ping", "params": {"x": 1}}}}
                 client.route_close(handle)
 
                 managed = client.call(
