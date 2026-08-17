@@ -56,6 +56,8 @@ class FakeSubcDaemon:
                 {"module_id": "mc.core", "ops": ["compact", "search", "memory"]},
             ]
         )
+        self._scripts: dict[str, dict] = {}
+        self._script_errors: dict[str, str] = {}
         self._next_channel = 1
         self._lock = threading.Lock()
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -66,6 +68,20 @@ class FakeSubcDaemon:
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
         self.requests_seen: list[dict] = []
+
+    @property
+    def calls(self) -> list[dict]:
+        """Route payloads seen so far (method/params dicts)."""
+        with self._lock:
+            return list(self.requests_seen)
+
+    def script(self, method: str, result: dict) -> None:
+        """Serve ``result`` as the reply for route calls to ``method``."""
+        self._scripts[method] = result
+
+    def script_error(self, method: str, message: str) -> None:
+        """Fail route calls to ``method`` with an error reply."""
+        self._script_errors[method] = message
 
     # -- test plumbing -----------------------------------------------------
 
@@ -180,13 +196,36 @@ class FakeSubcDaemon:
             if header.channel == 0:
                 self._control(conn, header.corr, payload)
             else:
-                self._respond(
-                    conn,
-                    header.channel,
-                    header.epoch,
-                    header.corr,
-                    {"result": {"echo": payload}},
-                )
+                method = payload.get("method", "")
+                if method in self._script_errors:
+                    self._respond(
+                        conn,
+                        header.channel,
+                        header.epoch,
+                        header.corr,
+                        {
+                            "error": {
+                                "code": "internal",
+                                "message": self._script_errors[method],
+                            }
+                        },
+                    )
+                elif method in self._scripts:
+                    self._respond(
+                        conn,
+                        header.channel,
+                        header.epoch,
+                        header.corr,
+                        {"result": self._scripts[method]},
+                    )
+                else:
+                    self._respond(
+                        conn,
+                        header.channel,
+                        header.epoch,
+                        header.corr,
+                        {"result": {"echo": payload}},
+                    )
 
     def _control(self, conn: socket.socket, corr: int, payload: dict) -> None:
         op = payload.get("op")

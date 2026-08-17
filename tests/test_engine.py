@@ -1,0 +1,104 @@
+"""Tests for the hermes context-engine adapter."""
+
+from __future__ import annotations
+
+import pytest
+
+from magic_hermes.engine import MagicContextEngine, engine_from_session
+from magic_hermes.session import MagicContextSession, SessionUnavailable
+from magic_hermes.subc.client import SubcError
+from tests.subc.fake_daemon import FakeSubcDaemon as FakeDaemon
+
+
+@pytest.fixture()
+def daemon(tmp_path):
+    d = FakeDaemon()
+    d.connection_file(tmp_path)
+    yield d
+    d.stop()
+
+
+@pytest.fixture()
+def session(daemon, monkeypatch):
+    monkeypatch.setenv(
+        "SUBC_CONNECTION_FILE", daemon.connection_file.__self__ if False else ""
+    )  # replaced below
+    s = MagicContextSession(
+        project_root=str(tmp_path if hasattr(tmp_path, "name") else "/tmp"),
+        session_id="sess-1",
+    )
+    yield s
+    s.close()
+
+
+def _make_session(daemon, tmp_path, monkeypatch):
+    conn = daemon.connection_file(tmp_path)
+    monkeypatch.setenv("SUBC_CONNECTION_FILE", conn)
+    s = MagicContextSession(project_root=str(tmp_path), session_id="sess-1")
+    s.connect()
+    return s
+
+
+class TestCompress:
+    def test_compress_delegates_and_counts(self, daemon, tmp_path, monkeypatch):
+        daemon.script(
+            "context.compact", {"messages": [{"role": "user", "content": "sum"}]}
+        )
+        s = _make_session(daemon, tmp_path, monkeypatch)
+        eng = MagicContextEngine(s)
+        msgs = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+        out = eng.compress(msgs)
+        assert out == [{"role": "user", "content": "sum"}]
+        assert eng.compression_count == 1
+        call = daemon.calls[-1]
+        assert call["method"] == "context.compact"
+        s.close()
+
+    def test_compress_fail_closed_on_daemon_error(self, daemon, tmp_path, monkeypatch):
+        daemon.script_error("context.compact", "boom")
+        s = _make_session(daemon, tmp_path, monkeypatch)
+        eng = MagicContextEngine(s)
+        msgs = [{"role": "user", "content": "m"}]
+        assert eng.compress(msgs) == msgs  # unchanged — never break the chat
+        assert eng.compression_count == 0
+        s.close()
+
+    def test_compress_fail_closed_on_disconnect(self, tmp_path, monkeypatch):
+        d = FakeDaemon()
+        s = _make_session(d, tmp_path, monkeypatch)
+        eng = MagicContextEngine(s)
+        d.stop()
+        s._teardown()
+        msgs = [{"role": "user", "content": "m"}]
+        assert eng.compress(msgs) == msgs
+        s.close()
+
+
+class TestTokens:
+    def test_update_from_response_tracks_usage(self, daemon, tmp_path, monkeypatch):
+        s = _make_session(daemon, tmp_path, monkeypatch)
+        eng = MagicContextEngine(s)
+        eng.context_length = 1_000_000
+        eng.update_from_response(
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "input_tokens": 100,
+                "output_tokens": 20,
+            }
+        )
+        assert eng.last_prompt_tokens == 100
+        assert eng.last_completion_tokens == 20
+        assert eng.last_total_tokens == 120
+        assert eng.should_compress(1_000_000) is True
+        s.close()
+
+
+class TestLifecycle:
+    def test_engine_from_session(self, daemon, tmp_path, monkeypatch):
+        s = _make_session(daemon, tmp_path, monkeypatch)
+        eng = engine_from_session(s)
+        assert isinstance(eng, MagicContextEngine)
+        assert eng.name == "magic-context"
+        s.close()
