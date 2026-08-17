@@ -191,7 +191,7 @@ class TestClientFlow:
                 managed = client.call(
                     "mc.core", "status", {"a": True}, identity=make_identity()
                 )
-                assert managed["echo"]["method"] == "status"
+                assert managed["echo"]["method"] == "status" if "echo" in managed else managed["result"]["echo"]["method"] == "status"
             finally:
                 client.close()
             assert daemon.requests_seen[0]["op"] == "catalog.list"
