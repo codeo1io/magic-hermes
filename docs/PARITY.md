@@ -1,51 +1,33 @@
-# Hermes ↔ Pi ↔ OpenCode: Intentional Divergences
+# Magic Hermes — Parity Map
 
-Modeled on `packages/pi-plugin/PARITY.md` upstream. Records **deliberate**
-differences between magic-hermes and the pi/opencode plugins. "Same effective
-behavior, different mechanism where the host runtimes differ" is the rule.
+Hermes ↔ pi (`@cortexkit/pi-magic-context`) ↔ opencode (`@cortexkit/opencode-magic-context`).
 
-All three implementations share one SQLite DB (`~/.local/share/cortexkit/
-magic-context/`) and the same subc daemon.
+Legend: ✅ supported · 🟡 partial / hermes-shaped · ❌ not available on this harness · ➖ n/a
 
----
+| Magic Context feature | pi | opencode | hermes (magic-hermes) | Notes |
+|---|---|---|---|---|
+| Compartmented history / `<session-history>` | ✅ | ✅ | ✅ U3 engine | `register_context_engine` replaces hermes `ContextCompressor` |
+| Background compaction (no pauses) | ✅ | ✅ | ✅ | engine delegate `context.compact` on daemon |
+| `<project-memory>` injection | ✅ | ✅ | ✅ | injected at session start via engine metadata |
+| ctx_search / ctx_expand / ctx_reduce tools | ✅ | ✅ | ✅ U4 | `register_tool` |
+| Persistent memories (write/update/merge/archive) | ✅ | ✅ | ✅ U5 | hermes standard memory config surface backed by mc memory ops |
+| Session notes | ✅ | ✅ | ✅ U5 | |
+| Historian | ✅ subagent (`pi --print`) | ✅ | 🟡 U6 auxiliary task (`mc_historian`) | hermes-native scheduling; same shared model config |
+| Dreamer | ✅ subagent | ✅ | 🟡 U6 auxiliary task (`mc_dreamer`) | cadence-gated signal queue |
+| Tokenizer | ✅ in-process (mc-tokenizer) | ✅ | ✅ daemon-side | client requests token counts via session ops |
+| Embeddings | ✅ | ✅ | ✅ daemon-side | config in `~/.config/cortexkit/magic-context.jsonc` |
+| Shared DB / cross-harness continuity | ✅ | ✅ | ✅ | same `~/.local/share/cortexkit/magic-context` store |
+| Status line / UI affordances | ✅ | ✅ | ➖ | hermes has no status-line surface; parity via tool outputs |
+| Command palette commands | ✅ | ✅ | 🟡 | `/magic-*` handled as hermes skills/commands where exposed |
 
-## 1. Language and transport
+## Known divergences
 
-**Pi/OpenCode:** TypeScript plugins, in-process core (TS) or Rust mode via
-subc.
-
-**Hermes:** Python plugin. There is no in-process TS option, so **every**
-transform/store/tokenize call goes through the subc daemon (the path pi/
-opencode call "rust mode"). magic-hermes has no reduced-transport mode to
-choose; daemon mode is the only mode.
-
-## 2. Subagent execution model
-
-**Pi:** historian/dreamer/sidekick run as separate `pi --print` processes
-loading a lean entry file; recursion guard prevents them reaching the
-context pipeline.
-
-**Hermes:** TBD (outstanding question #2 in the plan) — hermes has
-`register_auxiliary_task` and its own agent runtime; the hermes-native
-mechanism is preferred over subprocess spawning.
-
-## 3. Context surface
-
-**Pi/OpenCode:** context arrives via the harness's message-transform hooks.
-
-**Hermes:** the plugin registers a `ContextEngine` (replacing hermes' built-in
-`ContextCompressor` — hermes allows exactly one). Compaction therefore flows
-through hermes' native compression seam, not a parallel pipeline.
-
-## 4. Memory surface
-
-**Pi/OpenCode:** plugin-managed memory config.
-
-**Hermes:** hermes' standard memory config surface is the authority;
-magic-hermes feeds the shared store but surfaces toggles through hermes
-config keys.
-
----
-
-*(Extend as implementation reveals further divergences. Do not delete entries;
-supersede in place.)*
+1. **Auxiliary execution model.** pi/opencode spawn subprocess subagents; hermes uses its
+   auxiliary-task API (`mc_historian`, `mc_dreamer`). Same models (shared config), different
+   scheduling host.
+2. **In-process core unavailable.** Hermes is Python; the TS core cannot load in-process, so
+   magic-hermes always uses the subc daemon ("rust mode" in the pi plugin's terms). A running
+   daemon is a hard requirement — the engine fails closed (falls back to hermes' native
+   compressor) when the daemon is absent.
+3. **UI surfaces.** No status line; context telemetry surfaces through tool outputs and engine
+   metadata only.
