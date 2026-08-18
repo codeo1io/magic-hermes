@@ -1,6 +1,6 @@
 """Hermes plugin entry point for magic-hermes.
 
-Composes the U1–U6 adapters onto hermes' native plugin surfaces:
+Composes the U1-U6 adapters onto hermes' native plugin surfaces:
 
     register_context_engine(engine)   -> compaction / session-history
     register_tool(...)                -> ctx_search/expand/reduce/note
@@ -53,24 +53,33 @@ def load(ctx, *, project_root: str | None = None, session_id: str | None = None)
     session = MagicContextSession(project_root=project_root, session_id=session_id)
     registered = {"enabled": True}
 
-    from .engine import engine_from_session
-    from .tools import register_tools
-    from .memory_provider import MagicContextMemoryProvider
     from .auxiliary import (
         register as register_auxiliary,
-        auxiliary_defaults_from_config,
     )
+    from .engine import engine_from_session
     from .jsonc import load_jsonc
+    from .memory_provider import MagicContextMemoryProvider
+    from .tools import register_tools
 
-    _register(ctx, "register_context_engine", engine_from_session(session))
+    config = load_jsonc() or {}
+    if getattr(ctx, "register_auxiliary_task", None) is not None:
+        queues = register_auxiliary(ctx, config)
+    else:
+        queues = {}
+    registered["auxiliary"] = queues
+    # Wire the historian signal queue into the engine so successful
+    # compaction passes reach the mc_historian auxiliary task (U6).
+    signal_queue = queues.get("mc_historian")
+
+    _register(
+        ctx, "register_context_engine", engine_from_session(session, signal_queue)
+    )
     registered["tools"] = register_tools(ctx, session)
     registered["memory"] = _register(
         ctx,
         "register_memory_provider",
         MagicContextMemoryProvider(session_factory=lambda: session),
     )
-    config = load_jsonc() or {}
-    registered["auxiliary"] = register_auxiliary(ctx, config)
 
     return registered
 

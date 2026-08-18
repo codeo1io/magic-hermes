@@ -8,12 +8,11 @@ compressor remains responsible when magic-context is disabled.
 
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from .subc.client import SubcError
 from .session import MagicContextSession, SessionUnavailable
+from .subc.client import SubcError
 
 logger = logging.getLogger("magic_hermes.engine")
 
@@ -22,7 +21,7 @@ _DEFAULT_THRESHOLD_PERCENT = 0.75
 
 try:  # hermes enforces isinstance(engine, ContextEngine) at registration
     from agent.context_engine import ContextEngine as _ContextEngineBase
-except Exception:  # pragma: no cover - hermes not on sys.path (unit tests)
+except ImportError:  # pragma: no cover - hermes not on sys.path (unit tests)
     _ContextEngineBase = object
 
 
@@ -55,12 +54,18 @@ class MagicContextEngine(_ContextEngineBase):
     # quiet, surface warnings/errors only.
     emit_automatic_compaction_status = False
 
-    def __init__(self, session: MagicContextSession) -> None:
+    def __init__(self, session: MagicContextSession, signal_queue=None) -> None:
         self._session = session
+        # Optional auxiliary.SignalQueue: when present, a successful
+        # compaction pass publishes a CompactionSignal for the historian
+        # (U6). Import stays local so the engine never depends on the
+        # auxiliary module when hermes runs without it.
+        self._signal_queue = signal_queue
+        self._session_id = ""
 
     # -- Core interface -----------------------------------------------------
 
-    def update_from_response(self, usage: Dict[str, Any]) -> None:
+    def update_from_response(self, usage: dict[str, Any]) -> None:
         prompt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
         completion = usage.get("completion_tokens") or usage.get("output_tokens") or 0
         self.last_prompt_tokens = int(prompt)
@@ -86,23 +91,23 @@ class MagicContextEngine(_ContextEngineBase):
                 "usage.report failed; daemon unavailable or errored", exc_info=True
             )
 
-    def should_compress(self, prompt_tokens: Optional[int] = None) -> bool:
+    def should_compress(self, prompt_tokens: int | None = None) -> bool:
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if self.threshold_tokens <= 0 or tokens <= 0:
             return False
         return tokens >= self.threshold_tokens
 
-    def should_compress_info(self, prompt_tokens: Optional[int] = None):
+    def should_compress_info(self, prompt_tokens: int | None = None):
         return self.should_compress(prompt_tokens), None
 
     def compress(
         self,
-        messages: List[Dict[str, Any]],
-        current_tokens: Optional[int] = None,
-        focus_topic: Optional[str] = None,
+        messages: list[dict[str, Any]],
+        current_tokens: int | None = None,
+        focus_topic: str | None = None,
         force: bool = False,
         memory_context: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         try:
             result = self._session.call(
                 "context.compact",
@@ -126,6 +131,7 @@ class MagicContextEngine(_ContextEngineBase):
         compacted = result.get("messages")
         if isinstance(compacted, list) and compacted:
             self.compression_count += 1
+            self._publish_compaction_signal(len(messages), len(compacted))
             return compacted
         logger.warning("context.compact returned no messages; unchanged")
         return messages
@@ -133,7 +139,7 @@ class MagicContextEngine(_ContextEngineBase):
     # -- Optional hooks -------------------------------------------------------
 
     def prune_tool_results_only(
-        self, messages: List[Dict[str, Any]], current_tokens: Optional[int] = None
+        self, messages: list[dict[str, Any]], current_tokens: int | None = None
     ):
         try:
             result = self._session.call(
@@ -147,6 +153,7 @@ class MagicContextEngine(_ContextEngineBase):
         return messages, 0
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
+        self._session_id = session_id
         try:
             self._session.call(
                 "session.begin",
@@ -159,7 +166,7 @@ class MagicContextEngine(_ContextEngineBase):
         except (SessionUnavailable, SubcError, OSError):
             logger.debug("session.begin failed", exc_info=True)
 
-    def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+    def on_session_end(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         try:
             self._session.call(
                 "session.end",
@@ -170,8 +177,8 @@ class MagicContextEngine(_ContextEngineBase):
 
     def on_turn_complete(
         self,
-        messages: List[Dict[str, Any]],
-        usage: Optional[Dict[str, Any]] = None,
+        messages: list[dict[str, Any]],
+        usage: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         if not messages:
@@ -188,13 +195,31 @@ class MagicContextEngine(_ContextEngineBase):
         except (SessionUnavailable, SubcError, OSError):
             logger.debug("session.observe_turn failed", exc_info=True)
 
-    def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+    def has_content_to_compress(self, messages: list[dict[str, Any]]) -> bool:
         return len(messages) > (self.protect_first_n + self.protect_last_n)
 
+    def _publish_compaction_signal(self, before: int, after: int) -> None:
+        """Queue a historian pass for the compacted-away span (best-effort)."""
+        if self._signal_queue is None:
+            return
+        try:
+            from .auxiliary import CompactionSignal
 
-def engine_from_session(session: MagicContextSession) -> MagicContextEngine:
+            self._signal_queue.publish(
+                CompactionSignal(
+                    session_id=self._session_id,
+                    ordinal_range=(after, max(before, after)),
+                )
+            )
+        except Exception:
+            logger.debug("failed to publish compaction signal", exc_info=True)
+
+
+def engine_from_session(
+    session: MagicContextSession, signal_queue=None
+) -> MagicContextEngine:
     """Convenience constructor used by the plugin entry point."""
-    return MagicContextEngine(session)
+    return MagicContextEngine(session, signal_queue=signal_queue)
 
 
 __all__ = ["MagicContextEngine", "engine_from_session"]

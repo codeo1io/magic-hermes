@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -66,7 +65,26 @@ def test_load_registers_all_surfaces(daemon):
     names = [payload for kind, payload in ctx.calls if kind == "tool"]
     assert {"ctx_search", "ctx_expand", "ctx_reduce"} <= set(names)
     aux = [payload for kind, payload in ctx.calls if kind == "auxiliary"]
-    assert {"mc_historian", "mc_dreamer"} <= set(aux)
+    assert sorted(aux) == ["mc_dreamer", "mc_historian"]
+    engine = next(payload for kind, payload in ctx.calls if kind == "context_engine")
+    assert engine._signal_queue is result["auxiliary"]["mc_historian"]
+
+
+def test_load_without_auxiliary_api_still_registers_core_surfaces(daemon):
+    from magic_hermes import plugin
+
+    ctx = FakeCtx()
+    ctx.register_auxiliary_task = None
+    result = plugin.load(ctx)
+
+    assert result["enabled"] is True
+    assert result["auxiliary"] == {}
+    kinds = [kind for kind, _ in ctx.calls]
+    assert "context_engine" in kinds
+    assert "memory_provider" in kinds
+    assert "auxiliary" not in kinds
+    engine = next(payload for kind, payload in ctx.calls if kind == "context_engine")
+    assert engine._signal_queue is None
 
 
 def test_engine_roundtrip_through_plugin(daemon):

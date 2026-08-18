@@ -5,8 +5,7 @@ from __future__ import annotations
 import pytest
 
 from magic_hermes.engine import MagicContextEngine, engine_from_session
-from magic_hermes.session import MagicContextSession, SessionUnavailable
-from magic_hermes.subc.client import SubcError
+from magic_hermes.session import MagicContextSession
 from tests.subc.fake_daemon import FakeSubcDaemon as FakeDaemon
 
 
@@ -88,4 +87,58 @@ class TestLifecycle:
         eng = engine_from_session(s)
         assert isinstance(eng, MagicContextEngine)
         assert eng.name == "magic-context"
+        s.close()
+
+    def test_compress_fail_closed_on_mid_request_stall(self, tmp_path, monkeypatch):
+        # Regression: a daemon that stalls mid-request raises
+        # SocketTimeout, which the fail-closed guards never used to catch.
+        d = FakeDaemon()
+        d.script("context.compact", {"messages": [{"role": "user", "content": "s"}]})
+        conn = d.connection_file(tmp_path)
+        monkeypatch.setenv("SUBC_CONNECTION_FILE", conn)
+        s = MagicContextSession(
+            project_root=str(tmp_path), session_id="sess-1", request_timeout_ms=400
+        )
+        try:
+            s.connect(retries=1)
+            eng = MagicContextEngine(s)
+            eng.on_session_start("sess-1")
+            d._drop_requests = True  # connected, then stalls
+            msgs = [{"role": "user", "content": "m"}]
+            assert eng.compress(msgs) == msgs  # unchanged — never break the turn
+            assert any(call.get("method") == "context.compact" for call in d.calls)
+            assert not s.connected
+        finally:
+            d.stop()
+            s.close()
+
+    def test_compress_publishes_historian_signal(self, daemon, tmp_path, monkeypatch):
+        # U6: a successful compaction pass must feed the historian's
+        # signal queue so the auxiliary task has work to drain.
+        from magic_hermes.auxiliary import SignalQueue
+
+        daemon.script(
+            "context.compact", {"messages": [{"role": "user", "content": "sum"}]}
+        )
+        s = _make_session(daemon, tmp_path, monkeypatch)
+        queue = SignalQueue()
+        eng = MagicContextEngine(s, signal_queue=queue)
+        eng.on_session_start("sess-1")
+        msgs = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+        assert eng.compress(msgs) == [{"role": "user", "content": "sum"}]
+        assert queue.pending() == 1
+        (signal,) = queue.drain()
+        assert signal.session_id == "sess-1"
+        assert signal.ordinal_range == (1, 20)
+        s.close()
+
+    def test_compress_without_queue_is_quiet(self, daemon, tmp_path, monkeypatch):
+        daemon.script(
+            "context.compact", {"messages": [{"role": "user", "content": "sum"}]}
+        )
+        s = _make_session(daemon, tmp_path, monkeypatch)
+        eng = MagicContextEngine(s)  # no queue wired
+        assert eng.compress([{"role": "user", "content": "m"}]) == [
+            {"role": "user", "content": "sum"}
+        ]
         s.close()

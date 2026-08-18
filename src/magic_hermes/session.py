@@ -8,6 +8,7 @@ Wraps SubcClient with the pieces a hermes plugin needs:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
@@ -16,6 +17,7 @@ from typing import Any
 from .discovery import discover_connection_file
 from .subc.client import BindIdentity, SubcClient, SubcError
 from .subc.connection_file import ConnectionFileError
+from .subc.socket import SocketClosedError, SocketTimeout
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +54,14 @@ class MagicContextSession:
             try:
                 self._connect_once()
                 return
-            except (SessionUnavailable, SubcError, ConnectionFileError, OSError) as err:
+            except (
+                SessionUnavailable,
+                SubcError,
+                ConnectionFileError,
+                OSError,
+                SocketClosedError,
+                SocketTimeout,
+            ) as err:
                 last_err = err
                 self._teardown()
                 if attempt < attempts - 1:
@@ -75,8 +84,11 @@ class MagicContextSession:
                 "no subc connection file found — is the daemon running? "
                 "(set SUBC_CONNECTION_FILE to override)"
             )
-        path, info = found
-        client = SubcClient.connect(str(path))
+        path, _info = found
+        client = SubcClient.connect(
+            str(path),
+            request_timeout_ms=self._request_timeout_ms,
+        )
         try:
             # Find the MC module in the catalog and open a route to it.
             catalog = client.catalog_list()
@@ -107,17 +119,13 @@ class MagicContextSession:
 
     def _teardown(self) -> None:
         if self._route is not None:
-            try:
-                if self._client is not None:
+            if self._client is not None:
+                with contextlib.suppress(Exception):  # teardown must never raise
                     self._client.route_close(self._route)
-            except Exception:  # noqa: BLE001 - teardown must never raise
-                pass
             self._route = None
         if self._client is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._client.close()
-            except Exception:  # noqa: BLE001
-                pass
             self._client = None
 
     @property
@@ -139,7 +147,28 @@ class MagicContextSession:
         """
         if not self.connected:
             self.connect(retries=1)
-        assert self._client is not None and self._route is not None
+        try:
+            return self._request(method, params, timeout_ms)
+        except (SocketClosedError, SocketTimeout) as err:
+            # Mid-request transport failure (daemon died or stalled):
+            # tear down and transparently reconnect once, matching the
+            # client's lazy-reconnect contract. A persistent failure is
+            # reported as SessionUnavailable so fail-closed callers
+            # (engine, tools) degrade instead of raising into the turn.
+            log.debug("transport failure during %s (%s); reconnecting", method, err)
+            self._teardown()
+            self.connect(retries=1)
+            try:
+                return self._request(method, params, timeout_ms)
+            except (SocketClosedError, SocketTimeout) as retry_err:
+                self._teardown()
+                raise SessionUnavailable(
+                    f"daemon transport failed during {method}: {retry_err}"
+                ) from retry_err
+
+    def _request(self, method: str, params: dict | None, timeout_ms: int | None) -> Any:
+        if self._client is None or self._route is None:
+            raise SessionUnavailable("session not connected")
         body = json.dumps({"method": method, "params": params or {}}).encode("utf-8")
         raw = self._client.request(
             self._route,

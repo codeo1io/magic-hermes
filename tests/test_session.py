@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from magic_hermes.discovery import ENV_VAR, candidate_paths, discover_connection_file
@@ -96,5 +94,51 @@ def test_session_no_mc_module_in_catalog(env_override):
         session = MagicContextSession(project_root="/tmp/p", session_id="s1")
         with pytest.raises(SessionUnavailable, match="no magic-context module"):
             session.connect(retries=1)
+    finally:
+        daemon.stop()
+
+
+def test_connect_reports_session_unavailable_when_daemon_stalls(env_override):
+    # Regression: a daemon that accepts but never replies used to leak
+    # SocketTimeout out of connect() instead of the documented
+    # SessionUnavailable.
+    daemon = FakeSubcDaemon(drop_requests=True)
+    daemon.start()
+    try:
+        env_override(daemon)
+        session = MagicContextSession(
+            project_root="/tmp/p", session_id="s1", request_timeout_ms=400
+        )
+        with pytest.raises(SessionUnavailable):
+            session.connect(retries=1)
+    finally:
+        daemon.stop()
+
+
+def test_call_degrades_and_recovers_on_mid_request_stall(env_override):
+    # Regression: a mid-request transport failure (SocketTimeout /
+    # SocketClosedError) used to escape session.call() and break the
+    # fail-closed contract in the engine and tools.
+    daemon = FakeSubcDaemon()
+    daemon.script("context.compact", {"messages": [{"role": "user", "content": "s"}]})
+    daemon.start()
+    try:
+        env_override(daemon)
+        session = MagicContextSession(
+            project_root="/tmp/p", session_id="s1", request_timeout_ms=400
+        )
+        session.connect(retries=1)
+        assert session.call("context.compact", {}) is not None
+
+        daemon._drop_requests = True  # daemon stalls mid-request
+        with pytest.raises(SessionUnavailable):
+            session.call("context.compact", {})
+        assert not session.connected  # torn down, not left half-open
+
+        daemon._drop_requests = False  # daemon recovers
+        result = session.call("context.compact", {})
+        assert result == {"messages": [{"role": "user", "content": "s"}]}
+        assert session.connected
+        session.close()
     finally:
         daemon.stop()
