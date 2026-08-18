@@ -565,7 +565,11 @@ function handleConn(sock) {
 					if (!crypto.timingSafeEqual(expected, Buffer.from(msg.client_auth)))
 						return fail("bad client proof");
 					state.authed = true;
-					return;
+					// Do NOT return here: the client's ClientAuth and its first
+					// request frame can arrive coalesced in one TCP segment, and
+					// returning would strand buffered frames until the next data
+					// event (which may never come) — the request then times out.
+					continue;
 				}
 				return fail("expected handshake messages");
 			}

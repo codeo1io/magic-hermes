@@ -9,7 +9,9 @@ import json
 import os
 import shutil
 import signal
+import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -148,3 +150,92 @@ def test_live_bridge_end_to_end(bridge, tmp_path):
     ).fetchall()
     hermes.close()
     assert rows and rows[0][0] == "live-1"
+
+
+def _handshake_raw(bridge):
+    """Complete the auth handshake over a raw socket; return (sock, key, nonces)."""
+    import hashlib
+    import hmac as hmac_mod
+
+    conn = json.loads(Path(bridge["conn_path"]).read_text())
+    key = bytes(conn["key"])
+    daemon_id = bytes(conn["daemon_id"])
+    sock = socket.create_connection(
+        (conn["endpoints"][0]["host"], conn["endpoints"][0]["port"])
+    )
+    sock.settimeout(5)
+
+    def send_msg(obj):
+        payload = json.dumps(obj, separators=(",", ":")).encode()
+        sock.sendall(struct.pack("<I", len(payload)) + payload)
+
+    def recv_msg():
+        (n,) = struct.unpack("<I", _recv_exact(sock, 4))
+        return json.loads(_recv_exact(sock, n))
+
+    def _recv_exact(s, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = s.recv(n - len(buf))
+            if not chunk:
+                raise AssertionError("daemon closed mid-handshake")
+            buf += chunk
+        return buf
+
+    client_nonce = os.urandom(32)
+    send_msg({"client_nonce": list(client_nonce), "role": "client"})
+    proof = recv_msg()
+    server_nonce = bytes(proof["server_nonce"])
+
+    def proof_for(domain):
+        mac = hmac_mod.new(key, domain.encode(), hashlib.sha256)
+        for part in (client_nonce, server_nonce, daemon_id):
+            mac.update(part)
+        return mac.digest()
+
+    return sock, send_msg, proof_for
+
+
+def test_coalesced_auth_and_request_gets_reply(bridge):
+    """Regression: ClientAuth and the first request frame can arrive in one
+    TCP segment; the daemon used to strand the buffered frame until the next
+    data event and the request timed out."""
+    from magic_hermes.subc.envelope import (
+        FrameType,
+        build_flags,
+        build_frame,
+        decode_header,
+        encode_frame,
+    )
+
+    sock, _send_msg, proof_for = _handshake_raw(bridge)
+    frame = encode_frame(
+        build_frame(
+            FrameType.Request,
+            build_flags(False, 1, False),
+            0,
+            0,
+            1,
+            b'{"op":"catalog.list"}',
+        )
+    )
+    # Single write: auth completion + request coalesced.
+    auth_msg = json.dumps(
+        {"client_auth": list(proof_for("subc-client-v1"))}, separators=(",", ":")
+    ).encode()
+    sock.sendall(struct.pack("<I", len(auth_msg)) + auth_msg + frame)
+
+    header = b""
+    while len(header) < 21:
+        chunk = sock.recv(21 - len(header))
+        if not chunk:
+            raise AssertionError("daemon closed without replying")
+        header += chunk
+    hdr = decode_header(header)
+    assert hdr.ty == FrameType.Response
+    body = b""
+    while len(body) < hdr.len:
+        body += sock.recv(hdr.len - len(body))
+    reply = json.loads(body)
+    assert any("module_id" in m for m in reply["modules"])
+    sock.close()

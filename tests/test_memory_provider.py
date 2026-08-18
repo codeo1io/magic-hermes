@@ -51,12 +51,27 @@ class TestLifecycle:
     def test_available_when_daemon_up(self, provider):
         assert provider.is_available() is True
 
-    def test_unavailable_when_daemon_down(self):
-        p = MagicContextMemoryProvider(
-            session_factory=lambda: MagicContextSession(
-                "127.0.0.1", 1, secret=b"x" * 32
-            )
-        )
+    def test_available_connects_lazy_session(self):
+        class LazySession:
+            connected = False
+
+            def connect(self):
+                self.connected = True
+
+        session = LazySession()
+        p = MagicContextMemoryProvider(session_factory=lambda: session)
+
+        assert p.is_available() is True
+        assert session.connected is True
+
+    def test_unavailable_when_connection_fails(self):
+        class UnavailableSession:
+            connected = False
+
+            def connect(self):
+                raise ConnectionError("down")
+
+        p = MagicContextMemoryProvider(session_factory=UnavailableSession)
         assert p.is_available() is False
 
     def test_initialize_loads_memories(self, provider, daemon):

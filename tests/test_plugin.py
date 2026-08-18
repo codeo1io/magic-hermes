@@ -77,3 +77,26 @@ def test_engine_roundtrip_through_plugin(daemon):
     engine = next(p for k, p in ctx.calls if k == "context_engine")
     result = engine.compress([])
     assert "native-fallback" not in str(result) or result
+
+
+def test_plugin_surfaces_connect_lazily(daemon):
+    """The plugin never calls session.connect() itself — surfaces must work
+    against a live daemon via lazy connect (regression: every registered
+    surface used to fail closed with 'session not connected')."""
+    from magic_hermes import plugin
+
+    daemon.script("context.compact", {"messages": [{"role": "user", "content": "sum"}]})
+    daemon.script("memory.list", {"memories": [{"id": 1, "content": "m1"}]})
+    ctx = FakeCtx()
+    result = plugin.load(ctx)
+    assert result["enabled"] is True
+
+    engine = next(p for k, p in ctx.calls if k == "context_engine")
+    msgs = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    assert engine.compress(msgs) == [{"role": "user", "content": "sum"}]
+    assert engine.compression_count == 1
+
+    provider = next(p for k, p in ctx.calls if k == "memory_provider")
+    assert provider.is_available() is True
+    assert "m1" in provider.system_prompt_block()
+    provider.shutdown()

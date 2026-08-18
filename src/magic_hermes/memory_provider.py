@@ -179,7 +179,12 @@ class MagicContextMemoryProvider:
         with self._lock:
             if self._session is None:
                 self._session = self._session_factory()
-            return self._session
+            session = self._session
+        # A session that has never connected (e.g. the plugin's shared
+        # session) must actually reach the daemon before we call it usable.
+        if getattr(session, "connected", True) is False:
+            session.connect()
+        return session
 
     def _refresh_memories(self) -> None:
         self._ensure_session()

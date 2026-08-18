@@ -81,11 +81,7 @@ class MagicContextSession:
             # Find the MC module in the catalog and open a route to it.
             catalog = client.catalog_list()
             mc = next(
-                (
-                    e
-                    for e in catalog
-                    if "mc" in e.module_id or "magic" in e.module_id
-                ),
+                (e for e in catalog if "mc" in e.module_id or "magic" in e.module_id),
                 None,
             )
             if mc is None:
@@ -133,9 +129,16 @@ class MagicContextSession:
     def call(
         self, method: str, params: dict | None = None, timeout_ms: int | None = None
     ) -> Any:
-        """Invoke an MC management operation over the open route."""
+        """Invoke an MC management operation over the open route.
+
+        Lazily connects on first use (and reconnects after a teardown) so
+        surfaces registered by the plugin work without an explicit
+        ``connect()`` call. Lazy (re)connects fail fast — a single attempt —
+        because fail-closed callers degrade every call and must not pay the
+        full retry backoff each time.
+        """
         if not self.connected:
-            raise SessionUnavailable("session not connected")
+            self.connect(retries=1)
         assert self._client is not None and self._route is not None
         body = json.dumps({"method": method, "params": params or {}}).encode("utf-8")
         raw = self._client.request(

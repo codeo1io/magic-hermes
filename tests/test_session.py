@@ -69,6 +69,25 @@ def test_session_unavailable_without_daemon(env_override, monkeypatch, tmp_path)
         session.connect(retries=1)
 
 
+def test_call_connects_lazily(env_override):
+    daemon = FakeSubcDaemon(modules=[{"module_id": "mc.core", "ops": ["compact"]}])
+    daemon.script("compact", {"ok": True})
+    daemon.start()
+    try:
+        env_override(daemon)
+        session = MagicContextSession(project_root="/tmp/p", session_id="s1")
+        assert not session.connected
+        # No explicit connect(): call() must connect on demand.
+        assert session.call("compact", {"messages": []}) == {"ok": True}
+        assert session.connected
+        # And transparently reconnect after a teardown while the daemon lives.
+        session._teardown()
+        assert session.call("compact", {}) == {"ok": True}
+        session.close()
+    finally:
+        daemon.stop()
+
+
 def test_session_no_mc_module_in_catalog(env_override):
     daemon = FakeSubcDaemon(modules=[{"module_id": "other.module", "ops": []}])
     daemon.start()
