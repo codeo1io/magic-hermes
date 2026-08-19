@@ -116,32 +116,52 @@ def find_magic_context_package() -> Path | None:
     return None
 
 
-def runtime_available() -> bool:
-    """Return whether Node and the upstream package are locally installed."""
+def runtime_available(
+    package_root: str | os.PathLike[str] | None = None,
+) -> bool:
+    """Return whether Node and the requested upstream package are available."""
 
-    package_root = find_magic_context_package()
+    if package_root is None:
+        resolved_root = find_magic_context_package()
+    else:
+        resolved_root = Path(package_root).expanduser().resolve(strict=False)
+        if not (
+            (resolved_root / "package.json").is_file()
+            and (resolved_root / "dist" / "index.js").is_file()
+        ):
+            resolved_root = None
     return (
         shutil.which("node") is not None
         and runtime_script_path().is_file()
-        and package_root is not None
-        and _is_supported_version(_package_version(package_root))
+        and resolved_root is not None
+        and _is_supported_version(_package_version(resolved_root))
     )
 
 
-def runtime_unavailable_reason() -> str:
+def runtime_unavailable_reason(
+    package_root: str | os.PathLike[str] | None = None,
+) -> str:
     """Return an actionable local-only availability diagnostic."""
 
     if shutil.which("node") is None:
         return "Node.js is not installed or not on PATH."
     if not runtime_script_path().is_file():
         return "The magic-hermes Node runtime is missing from the installation."
-    package_root = find_magic_context_package()
     if package_root is None:
-        return (
-            "@cortexkit/pi-magic-context is not installed. Install the Pi Magic "
-            "Context package or set MAGIC_CONTEXT_PACKAGE_ROOT."
-        )
-    version = _package_version(package_root)
+        resolved_root = find_magic_context_package()
+        if resolved_root is None:
+            return (
+                "@cortexkit/pi-magic-context is not installed. Install the Pi Magic "
+                "Context package or set MAGIC_CONTEXT_PACKAGE_ROOT."
+            )
+    else:
+        resolved_root = Path(package_root).expanduser().resolve(strict=False)
+        if not (
+            (resolved_root / "package.json").is_file()
+            and (resolved_root / "dist" / "index.js").is_file()
+        ):
+            return f"@cortexkit/pi-magic-context was not found at {resolved_root}."
+    version = _package_version(resolved_root)
     if not _is_supported_version(version):
         found = version or "an unreadable version"
         return (
@@ -185,8 +205,9 @@ class RuntimeClient:
         return copied
 
     def _start(self) -> subprocess.Popen[str]:
-        if not runtime_available() and self.package_root is None:
-            raise RuntimeUnavailable(runtime_unavailable_reason())
+        reason = runtime_unavailable_reason(self.package_root)
+        if reason:
+            raise RuntimeUnavailable(reason)
 
         script = runtime_script_path()
         if not script.is_file():
@@ -298,13 +319,22 @@ class RuntimeClient:
                     f"Runtime returned invalid JSON during {method}"
                 ) from exc
 
+            if not isinstance(response, dict):
+                self._dispose(process)
+                raise RuntimeProtocolError(
+                    f"Runtime returned a non-object JSON response during {method}"
+                )
             if response.get("id") != request_id:
                 self._dispose(process)
                 raise RuntimeProtocolError(
                     f"Runtime response id mismatch during {method}"
                 )
-            if response.get("error"):
-                message = response["error"].get("message", "unknown runtime error")
+            error = response.get("error")
+            if error:
+                if isinstance(error, dict):
+                    message = error.get("message") or "unknown runtime error"
+                else:
+                    message = str(error)
                 raise RuntimeProtocolError(f"{method}: {message}")
             return response.get("result")
 
