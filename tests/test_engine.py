@@ -57,6 +57,29 @@ def test_engine_deepcopy_creates_disconnected_client():
     assert cloned is not engine
     assert cloned._client is not engine._client
     assert cloned._complete is complete
+    assert cloned._project_root == engine._project_root
+
+
+def test_engine_deepcopy_resolves_live_host_root_before_schema_bind(
+    monkeypatch, tmp_path
+):
+    discovery_root = tmp_path / "discovery"
+    live_root = tmp_path / "live-project"
+    discovery_root.mkdir()
+    live_root.mkdir()
+
+    monkeypatch.chdir(discovery_root)
+    engine = MagicContextEngine(client=FakeClient({"bind": bind_result()}))
+    assert engine._project_root == str(discovery_root.resolve())
+
+    monkeypatch.chdir(live_root)
+    cloned = copy.deepcopy(engine)
+    schemas = cloned.get_tool_schemas()
+
+    assert [schema["name"] for schema in schemas] == ["ctx_search", "ctx_memory"]
+    method, params, _ = cloned._client.calls[0]
+    assert method == "bind"
+    assert params["project_root"] == str(live_root.resolve())
 
 
 def test_engine_binds_real_session_and_excludes_memory_tool(tmp_path):

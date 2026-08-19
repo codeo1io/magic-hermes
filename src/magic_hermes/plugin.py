@@ -35,7 +35,7 @@ def load(
         log.warning("magic-hermes is disabled: %s", reason)
         return {"enabled": False, "reason": reason}
 
-    root = str(Path(project_root or Path.cwd()).resolve())
+    root = str(Path(project_root).resolve()) if project_root is not None else None
     shared_config = load_jsonc()
     historian_value = shared_config.get("historian")
     dreamer_value = shared_config.get("dreamer")

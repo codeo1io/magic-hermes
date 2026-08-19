@@ -22,6 +22,17 @@ except ImportError:  # pragma: no cover - Hermes is absent in isolated unit test
 Completion = Callable[..., str]
 
 
+def _resolve_host_project_root() -> str:
+    """Resolve Hermes' logical working directory, falling back to process cwd."""
+
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        return str(resolve_agent_cwd().resolve())
+    except (ImportError, OSError, RuntimeError):
+        return str(Path.cwd().resolve())
+
+
 class MagicContextEngine(_ContextEngineBase):
     """Use upstream Magic Context for indexing, tools, and compartment history."""
 
@@ -48,7 +59,12 @@ class MagicContextEngine(_ContextEngineBase):
     ) -> None:
         self._client = client or RuntimeClient()
         self._complete = complete
-        self._project_root = str(Path(project_root or os.getcwd()).resolve())
+        self._project_root_pinned = project_root is not None
+        self._project_root = (
+            str(Path(project_root).resolve())
+            if project_root is not None
+            else _resolve_host_project_root()
+        )
         self._session_id = session_id or "magic-hermes-bootstrap"
         self._bound_identity: tuple[str, str] | None = None
         self._tool_schemas: list[dict[str, Any]] = []
@@ -65,12 +81,18 @@ class MagicContextEngine(_ContextEngineBase):
     def __deepcopy__(self, memo: dict[int, Any]) -> MagicContextEngine:
         """Copy configuration, never process handles, locks, or mutable state."""
 
+        project_root = (
+            self._project_root
+            if self._project_root_pinned
+            else _resolve_host_project_root()
+        )
         copied = type(self)(
             client=copy.deepcopy(self._client, memo),
             complete=self._complete,
-            project_root=self._project_root,
+            project_root=project_root,
             session_id=self._session_id,
         )
+        copied._project_root_pinned = self._project_root_pinned
         memo[id(self)] = copied
         copied.context_length = self.context_length
         copied.threshold_percent = self.threshold_percent
@@ -323,7 +345,9 @@ class MagicContextEngine(_ContextEngineBase):
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
         self._session_id = str(session_id)
         root = kwargs.get("project_root") or kwargs.get("cwd")
-        self._project_root = str(Path(root or Path.cwd()).resolve())
+        self._project_root = (
+            str(Path(root).resolve()) if root else _resolve_host_project_root()
+        )
         self._bound_identity = None
         if self._bind():
             log.info(

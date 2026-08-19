@@ -71,6 +71,18 @@ memory:
   provider: magic_context
 ```
 
+If `platform_toolsets` is explicitly configured, the active platform must also
+include Hermes' `context_engine` toolset or the `ctx_*` tools will be hidden even
+though the plugin and memory provider are active. For example, add it to the
+existing CLI list rather than replacing your other toolsets:
+
+```yaml
+platform_toolsets:
+  cli:
+    - ...
+    - context_engine
+```
+
 Keep historian, memory, embedding, and dreamer policy in the shared Magic Context
 JSONC file. magic-hermes does not introduce a second configuration source.
 
