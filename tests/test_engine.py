@@ -1,144 +1,269 @@
-"""Tests for the hermes context-engine adapter."""
-
 from __future__ import annotations
 
-import pytest
+import copy
+import json
 
-from magic_hermes.engine import MagicContextEngine, engine_from_session
-from magic_hermes.session import MagicContextSession
-from tests.subc.fake_daemon import FakeSubcDaemon as FakeDaemon
-
-
-@pytest.fixture()
-def daemon(tmp_path):
-    d = FakeDaemon()
-    d.connection_file(tmp_path)
-    yield d
-    d.stop()
+from magic_hermes.engine import MagicContextEngine
 
 
-def _make_session(daemon, tmp_path, monkeypatch):
-    conn = daemon.connection_file(tmp_path)
-    monkeypatch.setenv("SUBC_CONNECTION_FILE", conn)
-    s = MagicContextSession(project_root=str(tmp_path), session_id="sess-1")
-    s.connect()
-    return s
+class FakeClient:
+    def __init__(self, responses=None):
+        self.responses = responses or {}
+        self.calls = []
+        self.closed = False
+
+    def __deepcopy__(self, memo):
+        copied = type(self)(self.responses)
+        memo[id(self)] = copied
+        return copied
+
+    def call(self, method, params=None, *, timeout=None):
+        self.calls.append((method, params or {}, timeout))
+        value = self.responses.get(method)
+        if callable(value):
+            return value(params or {})
+        return value or {}
+
+    def close(self):
+        self.closed = True
 
 
-class TestCompress:
-    def test_compress_delegates_and_counts(self, daemon, tmp_path, monkeypatch):
-        daemon.script(
-            "context.compact", {"messages": [{"role": "user", "content": "sum"}]}
-        )
-        s = _make_session(daemon, tmp_path, monkeypatch)
-        eng = MagicContextEngine(s)
-        msgs = [{"role": "user", "content": f"m{i}"} for i in range(20)]
-        out = eng.compress(msgs)
-        assert out == [{"role": "user", "content": "sum"}]
-        assert eng.compression_count == 1
-        call = daemon.calls[-1]
-        assert call["method"] == "context.compact"
-        s.close()
-
-    def test_compress_fail_closed_on_daemon_error(self, daemon, tmp_path, monkeypatch):
-        daemon.script_error("context.compact", "boom")
-        s = _make_session(daemon, tmp_path, monkeypatch)
-        eng = MagicContextEngine(s)
-        msgs = [{"role": "user", "content": "m"}]
-        assert eng.compress(msgs) == msgs  # unchanged — never break the chat
-        assert eng.compression_count == 0
-        s.close()
-
-    def test_compress_fail_closed_on_disconnect(self, tmp_path, monkeypatch):
-        d = FakeDaemon()
-        s = _make_session(d, tmp_path, monkeypatch)
-        eng = MagicContextEngine(s)
-        d.stop()
-        s._teardown()
-        msgs = [{"role": "user", "content": "m"}]
-        assert eng.compress(msgs) == msgs
-        s.close()
+def bind_result():
+    return {
+        "config": {
+            "enabled": True,
+            "execute_threshold_percentage": 65,
+            "history_budget_percentage": 0.15,
+        },
+        "tool_schemas": [
+            {"name": "ctx_search", "description": "search", "parameters": {}},
+            {"name": "ctx_memory", "description": "memory", "parameters": {}},
+        ],
+    }
 
 
-class TestTokens:
-    def test_update_from_response_tracks_usage(self, daemon, tmp_path, monkeypatch):
-        s = _make_session(daemon, tmp_path, monkeypatch)
-        eng = MagicContextEngine(s)
-        eng.context_length = 1_000_000
-        eng.update_from_response(
-            {
-                "prompt_tokens": 100,
-                "completion_tokens": 20,
-                "total_tokens": 120,
-                "input_tokens": 100,
-                "output_tokens": 20,
-            }
-        )
-        assert eng.last_prompt_tokens == 100
-        assert eng.last_completion_tokens == 20
-        assert eng.last_total_tokens == 120
-        assert eng.should_compress(1_000_000) is True
-        s.close()
+def test_engine_deepcopy_creates_disconnected_client():
+    def complete(**kwargs):
+        return "output"
+
+    engine = MagicContextEngine(
+        client=FakeClient({"bind": bind_result()}),
+        complete=complete,
+        project_root="/tmp",
+    )
+
+    cloned = copy.deepcopy(engine)
+
+    assert cloned is not engine
+    assert cloned._client is not engine._client
+    assert cloned._complete is complete
 
 
-class TestLifecycle:
-    def test_engine_from_session(self, daemon, tmp_path, monkeypatch):
-        s = _make_session(daemon, tmp_path, monkeypatch)
-        eng = engine_from_session(s)
-        assert isinstance(eng, MagicContextEngine)
-        assert eng.name == "magic-context"
-        s.close()
+def test_engine_binds_real_session_and_excludes_memory_tool(tmp_path):
+    client = FakeClient({"bind": bind_result()})
+    engine = MagicContextEngine(client=client, project_root=tmp_path)
 
-    def test_compress_fail_closed_on_mid_request_stall(self, tmp_path, monkeypatch):
-        # Regression: a daemon that stalls mid-request raises
-        # SocketTimeout, which the fail-closed guards never used to catch.
-        d = FakeDaemon()
-        d.script("context.compact", {"messages": [{"role": "user", "content": "s"}]})
-        conn = d.connection_file(tmp_path)
-        monkeypatch.setenv("SUBC_CONNECTION_FILE", conn)
-        s = MagicContextSession(
-            project_root=str(tmp_path), session_id="sess-1", request_timeout_ms=400
-        )
-        try:
-            s.connect(retries=1)
-            eng = MagicContextEngine(s)
-            eng.on_session_start("sess-1")
-            d._drop_requests = True  # connected, then stalls
-            msgs = [{"role": "user", "content": "m"}]
-            assert eng.compress(msgs) == msgs  # unchanged — never break the turn
-            assert any(call.get("method") == "context.compact" for call in d.calls)
-            assert not s.connected
-        finally:
-            d.stop()
-            s.close()
+    engine.on_session_start("session-42", cwd=str(tmp_path))
+    schemas = engine.get_tool_schemas()
 
-    def test_compress_publishes_historian_signal(self, daemon, tmp_path, monkeypatch):
-        # U6: a successful compaction pass must feed the historian's
-        # signal queue so the auxiliary task has work to drain.
-        from magic_hermes.auxiliary import SignalQueue
+    assert [schema["name"] for schema in schemas] == ["ctx_search", "ctx_memory"]
+    method, params, _ = client.calls[0]
+    assert method == "bind"
+    assert params["session_id"] == "session-42"
+    assert params["project_root"] == str(tmp_path.resolve())
 
-        daemon.script(
-            "context.compact", {"messages": [{"role": "user", "content": "sum"}]}
-        )
-        s = _make_session(daemon, tmp_path, monkeypatch)
-        queue = SignalQueue()
-        eng = MagicContextEngine(s, signal_queue=queue)
-        eng.on_session_start("sess-1")
-        msgs = [{"role": "user", "content": f"m{i}"} for i in range(20)]
-        assert eng.compress(msgs) == [{"role": "user", "content": "sum"}]
-        assert queue.pending() == 1
-        (signal,) = queue.drain()
-        assert signal.session_id == "sess-1"
-        assert signal.ordinal_range == (1, 20)
-        s.close()
 
-    def test_compress_without_queue_is_quiet(self, daemon, tmp_path, monkeypatch):
-        daemon.script(
-            "context.compact", {"messages": [{"role": "user", "content": "sum"}]}
-        )
-        s = _make_session(daemon, tmp_path, monkeypatch)
-        eng = MagicContextEngine(s)  # no queue wired
-        assert eng.compress([{"role": "user", "content": "m"}]) == [
-            {"role": "user", "content": "sum"}
+def test_engine_threshold_uses_shared_config(tmp_path):
+    client = FakeClient({"bind": bind_result()})
+    engine = MagicContextEngine(client=client, project_root=tmp_path)
+    engine.context_length = 100_000
+    engine.on_session_start("threshold", cwd=str(tmp_path))
+
+    assert engine.threshold_tokens == 65_000
+    assert engine.should_compress(64_999) is False
+    assert engine.should_compress(65_000) is True
+
+    engine.update_model("replacement", 200_000)
+    assert engine.threshold_tokens == 130_000
+
+
+def test_compress_calls_historian_and_returns_validated_view(tmp_path):
+    prepared = {
+        "ready": True,
+        "system_prompt": "# Historian",
+        "prompt": "<new_messages>history</new_messages>",
+        "model": "zai/glm-4.7",
+        "timeout_ms": 1_000,
+    }
+    compacted = [
+        {"role": "system", "content": "base"},
+        {"role": "system", "content": "<session-history>summary</session-history>"},
+        {"role": "user", "content": "tail"},
+    ]
+    client = FakeClient(
+        {
+            "bind": bind_result(),
+            "historian_prepare": prepared,
+            "historian_publish": {"ok": True, "messages": compacted},
+        }
+    )
+    completions = []
+
+    def complete(**kwargs):
+        completions.append(kwargs)
+        return "<output />"
+
+    engine = MagicContextEngine(
+        client=client,
+        complete=complete,
+        project_root=tmp_path,
+        session_id="compress",
+    )
+    result = engine.compress(
+        [
+            {"role": "system", "content": "base"},
+            *[
+                {
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "content": str(index),
+                }
+                for index in range(10)
+            ],
         ]
-        s.close()
+    )
+
+    assert result == compacted
+    assert engine.compression_count == 1
+    assert completions[0]["task"] == "mc_historian"
+    assert completions[0]["system_prompt"] == "# Historian"
+
+
+def test_compress_runs_configured_two_pass_editor(tmp_path):
+    prepared = {
+        "ready": True,
+        "system_prompt": "# Historian",
+        "prompt": "<new_messages>history</new_messages>",
+        "model": "zai/glm-4.7",
+        "timeout_ms": 1_000,
+        "two_pass": True,
+    }
+    compacted = [
+        {"role": "system", "content": "<session-history>edited</session-history>"},
+        {"role": "user", "content": "tail"},
+    ]
+    publish_calls = []
+
+    def publish(params):
+        publish_calls.append(params)
+        if params.get("editor_pass"):
+            return {"ok": True, "messages": compacted}
+        return {
+            "ok": False,
+            "needs_editor": True,
+            "editor_system_prompt": "# Historian Editor",
+            "editor_prompt": "Edit the validated draft",
+        }
+
+    client = FakeClient(
+        {
+            "bind": bind_result(),
+            "historian_prepare": prepared,
+            "historian_publish": publish,
+        }
+    )
+    completions = []
+
+    def complete(**kwargs):
+        completions.append(kwargs)
+        return "edited" if len(completions) == 2 else "draft"
+
+    engine = MagicContextEngine(
+        client=client,
+        complete=complete,
+        project_root=tmp_path,
+        session_id="two-pass",
+    )
+
+    result = engine.compress(
+        [
+            {"role": "system", "content": "base"},
+            *[
+                {
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "content": str(index),
+                }
+                for index in range(10)
+            ],
+        ]
+    )
+
+    assert result == compacted
+    assert [call["system_prompt"] for call in completions] == [
+        "# Historian",
+        "# Historian Editor",
+    ]
+    assert [call["output"] for call in publish_calls] == ["draft", "edited"]
+    assert publish_calls[1]["editor_pass"] is True
+
+
+def test_compress_fails_open_on_host_completion_error(tmp_path):
+    original = [
+        {"role": "system", "content": "base"},
+        *[
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": str(index),
+            }
+            for index in range(10)
+        ],
+    ]
+    client = FakeClient(
+        {
+            "bind": bind_result(),
+            "historian_prepare": {
+                "ready": True,
+                "system_prompt": "# Historian",
+                "prompt": "history",
+            },
+        }
+    )
+
+    def complete(**_kwargs):
+        raise LookupError("provider failed")
+
+    engine = MagicContextEngine(
+        client=client,
+        complete=complete,
+        project_root=tmp_path,
+        session_id="fail-open",
+    )
+
+    assert engine.compress(original) is original
+    assert engine.compression_count == 0
+
+
+def test_tool_result_is_json_and_passes_current_messages(tmp_path):
+    client = FakeClient(
+        {
+            "bind": bind_result(),
+            "tool": {"text": "found", "is_error": False},
+        }
+    )
+    engine = MagicContextEngine(
+        client=client,
+        project_root=tmp_path,
+        session_id="tools",
+    )
+    messages = [{"role": "user", "content": "find it"}]
+
+    result = json.loads(
+        engine.handle_tool_call(
+            "ctx_search",
+            {"query": "it"},
+            messages=messages,
+        )
+    )
+
+    assert result == {"content": "found"}
+    tool_call = next(call for call in client.calls if call[0] == "tool")
+    assert tool_call[1]["messages"] == messages

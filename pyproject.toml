@@ -1,17 +1,20 @@
 [project]
 name = "magic-hermes"
-version = "0.1.0.dev0"
-description = "Magic Context connector plugin for hermes-agent (client to the subc daemon)"
+version = "0.2.0.dev0"
+description = "Thin Hermes connector for the upstream Magic Context runtime"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = []
 
 [project.entry-points."hermes_agent.plugins"]
-magic_hermes = "magic_hermes.plugin:register"
+magic-hermes = "magic_hermes.plugin"
+
+[project.entry-points."hermes_agent.memory_providers"]
+magic_context = "magic_hermes.memory_provider:MagicContextMemoryProvider"
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+dev = ["build", "pytest", "ruff"]
 
 [build-system]
 requires = ["hatchling"]
@@ -19,3 +22,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/magic_hermes"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/magic_hermes/bridge/loader.mjs" = "magic_hermes/bridge/loader.mjs"
+"src/magic_hermes/bridge/runtime.mjs" = "magic_hermes/bridge/runtime.mjs"
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

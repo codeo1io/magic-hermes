@@ -1,218 +1,273 @@
-"""Hermes ``MemoryProvider`` adapter backed by the Magic Context daemon.
-
-Implements the hermes-agent ``agent.memory_provider.MemoryProvider``
-interface as a thin connector: durable memories and search queries are
-forwarded to the shared Magic Context store over the subc session; nothing
-is persisted locally.
-"""
+"""Exclusive Hermes memory provider backed by upstream Magic Context."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any
 
-logger = logging.getLogger(__name__)
+from .runtime import (
+    RuntimeClient,
+    RuntimeErrorBase,
+    runtime_available,
+    runtime_unavailable_reason,
+)
 
-# Method names routed to the shared mc-module runtime.
-_METHOD_SEARCH = "memory.search"
-_METHOD_WRITE = "memory.write"
-_METHOD_LIST = "memory.list"
-_METHOD_ARCHIVE = "memory.archive"
-_METHOD_NOTES = "notes.status"
+log = logging.getLogger(__name__)
 
-_SYSTEM_BLOCK_HEADER = "## Project Memory"
+try:
+    from agent.memory_provider import (
+        MemoryProvider as _MemoryProviderBase,
+    )
+    from agent.memory_provider import (
+        RecallStatus,
+    )
+except ImportError:  # pragma: no cover - Hermes is absent in isolated unit tests.
+    _MemoryProviderBase = object
+    RecallStatus = None  # type: ignore[assignment,misc]
 
 
-class MagicContextMemoryProvider:
-    """Exclusive hermes memory provider served by Magic Context.
+class MagicContextMemoryProvider(_MemoryProviderBase):
+    """Expose Magic Context as Hermes' one selected external memory backend."""
 
-    The provider is created with a ``session_factory`` returning a live
-    :class:`~magic_hermes.session.MagicContextSession`. When the daemon is
-    unavailable (``is_available()`` false or session open fails) every
-    surface degrades gracefully — empty prompt block, no-op writes — so a
-    down daemon never breaks a hermes session.
-    """
+    def __init__(
+        self,
+        *,
+        client: RuntimeClient | None = None,
+        project_root: str | os.PathLike[str] | None = None,
+    ) -> None:
+        self._client = client or RuntimeClient()
+        self._project_root = str(Path(project_root or Path.cwd()).resolve())
+        self._session_id = "magic-hermes-memory-bootstrap"
+        self._bound_identity: tuple[str, str] | None = None
+        self._tool_schemas: list[dict[str, Any]] = []
+        self._cache_lock = threading.Lock()
+        self._cached_context: dict[str, tuple[str, int]] = {}
+        self._last_recall_count = 0
+        self._background: set[threading.Thread] = set()
+        self._shutdown = threading.Event()
 
-    name = "magic-context"
-
-    def __init__(self, session_factory) -> None:
-        self._session_factory = session_factory
-        self._session = None
-        self._session_id: str = ""
-        self._lock = threading.Lock()
-        self._memories: Optional[List[Dict[str, Any]]] = None
-
-    # -- lifecycle -----------------------------------------------------
+    @property
+    def name(self) -> str:
+        return "magic_context"
 
     def is_available(self) -> bool:
-        try:
-            self._ensure_session()
-            return True
-        except Exception:
+        """Perform local dependency checks only, as required by Hermes."""
+
+        return runtime_available()
+
+    def unavailable_reason(self) -> str:
+        return runtime_unavailable_reason()
+
+    def initialize(self, session_id: str, **kwargs: Any) -> None:
+        self._shutdown.clear()
+        self._session_id = str(session_id)
+        root = kwargs.get("project_root") or kwargs.get("cwd")
+        if root:
+            self._project_root = str(Path(root).resolve())
+        else:
+            self._project_root = str(Path.cwd().resolve())
+        self._bound_identity = None
+        if not self._bind():
+            reason = runtime_unavailable_reason() or "Magic Context bind failed"
+            raise RuntimeError(reason)
+        self._refresh_context(self._session_id)
+
+    def _bind(self) -> bool:
+        if self._shutdown.is_set():
             return False
-
-    def initialize(self, session_id: str, **kwargs) -> None:
-        self._session_id = session_id
+        identity = (self._session_id, self._project_root)
+        if self._bound_identity == identity:
+            return True
         try:
-            self._refresh_memories()
-        except Exception:
-            logger.warning("magic-context: initial memory load failed", exc_info=True)
-
-    def shutdown(self) -> None:
-        with self._lock:
-            session, self._session = self._session, None
-        if session is not None:
-            try:
-                session.close()
-            except Exception:
-                pass
-
-    # -- system prompt + prefetch --------------------------------------
+            self._client.call(
+                "bind",
+                {
+                    "session_id": self._session_id,
+                    "project_root": self._project_root,
+                },
+                timeout=60,
+            )
+        except RuntimeErrorBase:
+            log.warning("Magic Context memory provider bind failed", exc_info=True)
+            return False
+        self._bound_identity = identity
+        # The context engine owns every ctx_* tool, including ctx_memory.
+        # This provider supplies Hermes' standard recall/injection lifecycle.
+        self._tool_schemas = []
+        return True
 
     def system_prompt_block(self) -> str:
-        memories = self._cached_memories() or []
-        if not memories:
-            return ""
-        lines = [_SYSTEM_BLOCK_HEADER]
-        for mem in memories:
-            mid = mem.get("id", "?")
-            text = str(mem.get("content", mem.get("text", ""))).strip()
-            cat = mem.get("category")
-            line = f"- #{mid}: {text}"
-            if cat:
-                line = f"- #{mid} ({cat}): {text}"
-            lines.append(line)
-        return "\n".join(lines)
+        return (
+            "Magic Context supplies durable project memories in a "
+            "<project-memory> block. Use ctx_memory for intentional writes, "
+            "updates, merges, retrieval by id, and archival."
+        )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        try:
-            self._ensure_session()
-            result = self._session.call(_METHOD_SEARCH, {"query": query, "limit": 5})
-        except Exception:
-            return ""
-        return _format_search_block(query, result)
+        del query
+        key = session_id or self._session_id
+        with self._cache_lock:
+            text, count = self._cached_context.get(key, ("", 0))
+            self._last_recall_count = count
+            return text
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        # Fire-and-forget prefetch is unnecessary: search is a single fast
-        # daemon round-trip over loopback.
-        pass
+        del query
+        self._spawn(self._refresh_context, session_id or self._session_id)
 
-    # -- tools ----------------------------------------------------------
+    def recall_status(self):
+        if not self._last_recall_count or RecallStatus is None:
+            return None
+        return RecallStatus(
+            provider_label="Magic Context",
+            count=self._last_recall_count,
+        )
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "name": "ctx_memory",
-                "description": (
-                    "Manage durable project memories. Actions: write (new "
-                    "memory), search (ranked recall), list (all), archive "
-                    "(retire by id)."
-                ),
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["write", "search", "list", "archive"],
-                        },
-                        "content": {"type": "string"},
-                        "category": {"type": "string"},
-                        "query": {"type": "string"},
-                        "ids": {"type": "array", "items": {"type": "integer"}},
-                    },
-                    "required": ["action"],
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: list[dict[str, Any]] | None = None,
+    ) -> None:
+        del user_content, assistant_content
+        if not messages:
+            return
+        target = session_id or self._session_id
+        self._spawn(self._observe, target, list(messages))
+
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
+        self._bind()
+        return list(self._tool_schemas)
+
+    def handle_tool_call(
+        self, tool_name: str, args: dict[str, Any], **kwargs: Any
+    ) -> str:
+        if not self._bind():
+            return json.dumps({"error": "Magic Context runtime is unavailable"})
+        try:
+            result = self._client.call(
+                "tool",
+                {
+                    "session_id": self._session_id,
+                    "name": tool_name,
+                    "arguments": args,
+                    "messages": kwargs.get("messages") or [],
                 },
-            }
-        ]
+                timeout=60,
+            )
+        except RuntimeErrorBase as exc:
+            return json.dumps({"error": str(exc)})
+        payload: dict[str, Any] = {"content": result.get("text", "")}
+        if result.get("is_error"):
+            payload["error"] = True
+        self._spawn(self._refresh_context, self._session_id)
+        return json.dumps(payload)
 
-    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        if tool_name != "ctx_memory":
-            return json.dumps({"error": f"unknown tool {tool_name}"})
-        action = args.get("action", "")
+    def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
+        if self._bind() and messages:
+            self._observe(self._session_id, messages)
+            self._refresh_context(self._session_id)
+        return self.prefetch("", session_id=self._session_id)
+
+    def on_session_end(self, messages: list[dict[str, Any]]) -> None:
+        if self._bind() and messages:
+            self._observe(self._session_id, messages)
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        del parent_session_id, reset, rewound
+        self._session_id = str(new_session_id)
+        root = kwargs.get("project_root") or kwargs.get("cwd")
+        if root:
+            self._project_root = str(Path(root).resolve())
+        self._bound_identity = None
+        if self._bind():
+            self._refresh_context(self._session_id)
+
+    def shutdown(self) -> None:
+        self._shutdown.set()
+        self._client.close()
+
+    def _observe(
+        self, session_id: str, messages: list[dict[str, Any]]
+    ) -> None:
+        if self._shutdown.is_set() or session_id != self._session_id:
+            return
         try:
-            self._ensure_session()
-            if action == "write":
-                result = self._session.call(
-                    _METHOD_WRITE,
-                    {
-                        "content": args.get("content", ""),
-                        "category": args.get("category"),
-                    },
-                )
-                self._refresh_memories()
-            elif action == "search":
-                result = self._session.call(
-                    _METHOD_SEARCH, {"query": args.get("query", ""), "limit": 10}
-                )
-            elif action == "list":
-                result = self._session.call(_METHOD_LIST, {})
-            elif action == "archive":
-                result = self._session.call(
-                    _METHOD_ARCHIVE, {"ids": args.get("ids", [])}
-                )
-                self._refresh_memories()
-            else:
-                return json.dumps({"error": f"unknown action {action}"})
-        except Exception as exc:
-            return json.dumps({"error": f"magic-context daemon unavailable: {exc}"})
-        return json.dumps(result, default=str)
+            self._client.call(
+                "observe",
+                {"session_id": session_id, "messages": messages},
+                timeout=30,
+            )
+        except RuntimeErrorBase:
+            log.debug("Magic Context memory observation failed", exc_info=True)
 
-    # -- session events --------------------------------------------------
-
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        # Persistence is continuous (daemon-side); no end-of-session flush.
-        pass
-
-    def on_memory_write(self, text: str, **kwargs) -> None:
+    def _refresh_context(self, session_id: str) -> None:
+        if (
+            self._shutdown.is_set()
+            or session_id != self._session_id
+            or not self._bind()
+        ):
+            return
         try:
-            self._ensure_session()
-            self._session.call(_METHOD_WRITE, {"content": text})
-            self._refresh_memories()
-        except Exception:
-            logger.warning("magic-context: memory write failed", exc_info=True)
-
-    # -- helpers ---------------------------------------------------------
-
-    def _ensure_session(self):
-        with self._lock:
-            if self._session is None:
-                self._session = self._session_factory()
-            session = self._session
-        # A session that has never connected (e.g. the plugin's shared
-        # session) must actually reach the daemon before we call it usable.
-        if getattr(session, "connected", True) is False:
-            session.connect()
-        return session
-
-    def _refresh_memories(self) -> None:
-        self._ensure_session()
-        result = self._session.call(_METHOD_LIST, {})
-        with self._lock:
-            self._memories = (
-                result.get("memories", []) if isinstance(result, dict) else []
+            result = self._client.call(
+                "memory_context",
+                {"session_id": session_id},
+                timeout=30,
+            )
+        except RuntimeErrorBase:
+            log.debug("Magic Context memory prefetch failed", exc_info=True)
+            return
+        with self._cache_lock:
+            self._cached_context[session_id] = (
+                str(result.get("text") or ""),
+                int(result.get("count") or 0),
             )
 
-    def _cached_memories(self) -> Optional[List[Dict[str, Any]]]:
-        if self._memories is None:
+    def _spawn(self, target, *args: Any) -> None:
+        if self._shutdown.is_set():
+            return
+
+        def run() -> None:
             try:
-                self._refresh_memories()
-            except Exception:
-                return []
-        with self._lock:
-            return list(self._memories or [])
+                if not self._shutdown.is_set():
+                    target(*args)
+            finally:
+                with self._cache_lock:
+                    self._background.discard(thread)
+
+        thread = threading.Thread(
+            target=run,
+            name="magic-context-memory",
+            daemon=True,
+        )
+        with self._cache_lock:
+            self._background.add(thread)
+        thread.start()
 
 
-def _format_search_block(query: str, result: Any) -> str:
-    if not isinstance(result, dict):
-        return ""
-    hits = result.get("hits") or result.get("results") or []
-    if not hits:
-        return ""
-    lines = [f"Memories relevant to: {query!r}"]
-    for hit in hits:
-        text = str(hit.get("text", hit.get("content", ""))).strip()
-        if text:
-            lines.append(f"- {text}")
-    return "\n".join(lines)
+def register(ctx) -> MagicContextMemoryProvider:
+    """Entry-point callback supported by Hermes' exclusive provider loader."""
+
+    provider = MagicContextMemoryProvider()
+    register_provider = getattr(ctx, "register_memory_provider", None)
+    if register_provider is None:
+        raise RuntimeError("Hermes memory provider context is missing registration")
+    register_provider(provider)
+    return provider
+
+
+__all__ = ["MagicContextMemoryProvider", "register"]

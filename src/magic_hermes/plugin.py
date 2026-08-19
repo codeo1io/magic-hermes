@@ -1,93 +1,180 @@
-"""Hermes plugin entry point for magic-hermes.
-
-Composes the U1-U6 adapters onto hermes' native plugin surfaces:
-
-    register_context_engine(engine)   -> compaction / session-history
-    register_tool(...)                -> ctx_search/expand/reduce/note
-    register_hook / register_middleware -> session lifecycle, reduction
-    hermes memory config surface      -> persistent memories
-    auxiliary task API                -> mc_historian / mc_dreamer
-
-Fail-closed: when no subc daemon is discoverable, load() returns a disabled
-registration instead of raising — hermes keeps its native compressor.
-"""
+"""Hermes plugin entry point for the Magic Context connector."""
 
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
+from typing import Any
 
-from .discovery import discover_connection_file
-from .session import MagicContextSession
+from .engine import MagicContextEngine
+from .jsonc import load_jsonc
+from .runtime import RuntimeClient, runtime_available, runtime_unavailable_reason
 
 log = logging.getLogger(__name__)
 
-PLUGIN_API_VERSION = "0.1"
+PLUGIN_API_VERSION = "0.2"
 
 
 def register(ctx):
-    """Entry point for hermes plugin discovery.
+    """Register the context engine and its host-routed auxiliary LLM tasks."""
 
-    hermes calls ``register(ctx)`` for every discovered plugin (directory
-    ``plugin.yaml`` manifests and pip entry points in the
-    ``hermes_agent.plugins`` group both land here). ``load`` stays
-    keyword-friendly for tests and direct embedding.
-    """
     return load(ctx)
 
 
-def load(ctx, *, project_root: str | None = None, session_id: str | None = None):
-    """Register Magic Context surfaces on a hermes plugin context.
+def load(
+    ctx,
+    *,
+    project_root: str | os.PathLike[str] | None = None,
+    session_id: str | None = None,
+):
+    """Compose Magic Context onto Hermes' native plugin surfaces."""
 
-    ``ctx`` is hermes' plugin registration context exposing
-    register_context_engine / register_tool / register_hook /
-    register_memory_provider / register_auxiliary_task (exact names are
-    resolved defensively — see _register).
-    """
-    if discover_connection_file() is None:
-        log.warning(
-            "magic-hermes: no subc daemon connection file found; "
-            "plugin disabled, hermes native context engine stays active"
-        )
-        return {"enabled": False, "reason": "no-subc-daemon"}
+    if not runtime_available():
+        reason = runtime_unavailable_reason()
+        log.warning("magic-hermes is disabled: %s", reason)
+        return {"enabled": False, "reason": reason}
 
-    session = MagicContextSession(project_root=project_root, session_id=session_id)
-    registered = {"enabled": True}
-
-    from .auxiliary import (
-        register as register_auxiliary,
+    root = str(Path(project_root or Path.cwd()).resolve())
+    shared_config = load_jsonc()
+    historian_value = shared_config.get("historian")
+    dreamer_value = shared_config.get("dreamer")
+    historian = historian_value if isinstance(historian_value, dict) else {}
+    dreamer = dreamer_value if isinstance(dreamer_value, dict) else {}
+    historian_ref = str(historian.get("model") or "")
+    historian_provider, historian_model = _route_for_hermes(historian_ref)
+    dreamer_provider, dreamer_model = _route_for_hermes(
+        str(dreamer.get("model") or historian_ref)
     )
-    from .engine import engine_from_session
-    from .jsonc import load_jsonc
-    from .memory_provider import MagicContextMemoryProvider
-    from .tools import register_tools
 
-    config = load_jsonc() or {}
-    if getattr(ctx, "register_auxiliary_task", None) is not None:
-        queues = register_auxiliary(ctx, config)
-    else:
-        queues = {}
-    registered["auxiliary"] = queues
-    # Wire the historian signal queue into the engine so successful
-    # compaction passes reach the mc_historian auxiliary task (U6).
-    signal_queue = queues.get("mc_historian")
-
-    _register(
-        ctx, "register_context_engine", engine_from_session(session, signal_queue)
-    )
-    registered["tools"] = register_tools(ctx, session)
-    registered["memory"] = _register(
+    _register_auxiliary(
         ctx,
-        "register_memory_provider",
-        MagicContextMemoryProvider(session_factory=lambda: session),
+        "mc_historian",
+        display_name="Magic Context historian",
+        description="Compartmentalize older session history.",
+        defaults={
+            "provider": historian_provider,
+            "model": historian_model,
+            "timeout": _seconds_from_ms(
+                shared_config.get("historian_timeout_ms"),
+                default_ms=300_000,
+            ),
+        },
+    )
+    _register_auxiliary(
+        ctx,
+        "mc_dreamer",
+        display_name="Magic Context dreamer",
+        description="Curate durable Magic Context memories.",
+        defaults={
+            "provider": dreamer_provider,
+            "model": dreamer_model,
+            "timeout": 120,
+        },
     )
 
-    return registered
+    completion = _completion_callback(ctx)
+    engine = MagicContextEngine(
+        client=RuntimeClient(),
+        complete=completion,
+        project_root=root,
+        session_id=session_id,
+    )
+    register_engine = getattr(ctx, "register_context_engine", None)
+    if not callable(register_engine):
+        raise RuntimeError("Hermes plugin context has no register_context_engine API")
+    handle = register_engine(engine)
+    return {
+        "enabled": True,
+        "engine": engine,
+        "registration": handle,
+        "auxiliary": ["mc_historian", "mc_dreamer"],
+    }
 
 
-def _register(ctx, api_name: str, value):
-    fn = getattr(ctx, api_name, None)
-    if fn is None:
-        log.debug("magic-hermes: context lacks %s; skipping", api_name)
-        return False
-    fn(value)
-    return True
+def _register_auxiliary(
+    ctx,
+    key: str,
+    *,
+    display_name: str,
+    description: str,
+    defaults: dict[str, Any],
+) -> None:
+    register_task = getattr(ctx, "register_auxiliary_task", None)
+    if not callable(register_task):
+        raise RuntimeError("Hermes plugin context has no auxiliary task API")
+    register_task(
+        key,
+        display_name=display_name,
+        description=description,
+        defaults=defaults,
+    )
+
+
+def _model_for_hermes(model: str) -> str:
+    """Adapt CortexKit's Z.AI-qualified ref to Hermes' active-provider route."""
+
+    if model.startswith("zai/"):
+        return model.split("/", 1)[1]
+    if model.startswith("openai/"):
+        return model.split("/", 1)[1]
+    return model
+
+
+def _route_for_hermes(model: str) -> tuple[str, str]:
+    """Return Hermes auxiliary provider/model defaults for a CortexKit ref."""
+
+    model = model.strip()
+    normalized = _model_for_hermes(model)
+    if not normalized:
+        return "auto", ""
+    if model.startswith("openai/") or normalized.startswith("gpt-"):
+        return "openai", normalized
+    return "auto", normalized
+
+
+def _seconds_from_ms(value: Any, *, default_ms: float) -> float:
+    try:
+        milliseconds = float(value)
+    except (TypeError, ValueError):
+        milliseconds = default_ms
+    if milliseconds <= 0:
+        milliseconds = default_ms
+    return milliseconds / 1000
+
+
+def _completion_callback(ctx):
+    llm = getattr(ctx, "llm", None)
+    complete = getattr(llm, "complete", None)
+    if not callable(complete):
+        raise RuntimeError("Hermes plugin context has no ctx.llm.complete API")
+
+    def run(
+        *,
+        system_prompt: str,
+        prompt: str,
+        task: str,
+        model: str = "",
+        max_tokens: int = 8192,
+        timeout: float = 120,
+    ) -> str:
+        del model
+        result = complete(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            task=task,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            purpose=f"magic-context.{task}",
+        )
+        text = str(getattr(result, "text", "") or "")
+        if not text.strip():
+            raise RuntimeError(f"Hermes auxiliary task {task} returned no text")
+        return text
+
+    return run
+
+
+__all__ = ["PLUGIN_API_VERSION", "load", "register"]

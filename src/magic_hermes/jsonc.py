@@ -9,10 +9,12 @@ JSONC handling in the upstream TS plugins.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 from pathlib import Path
 
-_DEFAULT_PATH = Path.home() / ".config" / "cortexkit" / "magic-context.jsonc"
+log = logging.getLogger(__name__)
 
 _LINE_COMMENT = re.compile(r"//[^\n]*")
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
@@ -40,12 +42,25 @@ def strip_jsonc(text: str) -> str:
 
 
 def load_jsonc(path: Path | str | None = None) -> dict:
-    """Load a JSONC file as a plain dict. Missing file returns {}."""
-    p = Path(path) if path is not None else _DEFAULT_PATH
+    """Load a JSONC object. Missing, malformed, or non-object input returns {}."""
+    p = Path(path) if path is not None else default_config_path()
     if not p.exists():
         return {}
-    return json.loads(strip_jsonc(p.read_text(encoding="utf-8")))
+    try:
+        parsed = json.loads(strip_jsonc(p.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Could not read shared Magic Context config %s: %s", p, exc)
+        return {}
+    if not isinstance(parsed, dict):
+        log.warning("Shared Magic Context config %s is not a JSON object", p)
+        return {}
+    return parsed
 
 
 def default_config_path() -> Path:
-    return _DEFAULT_PATH
+    configured = os.environ.get("XDG_CONFIG_HOME")
+    if configured and Path(configured).is_absolute():
+        root = Path(configured)
+    else:
+        root = Path.home() / ".config"
+    return root / "cortexkit" / "magic-context.jsonc"

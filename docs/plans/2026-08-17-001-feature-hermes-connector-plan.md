@@ -10,6 +10,16 @@ date: 2026-08-17
 
 # Hermes Magic Context Connector - Plan
 
+> **Implementation correction (2026-08-18).** Inspection of the installed official
+> `@cortexkit/pi-magic-context` 0.38.x package showed that the supported Pi and
+> OpenCode path is the packaged JavaScript runtime plus the shared SQLite store,
+> not the proposed subc daemon contract. The implementation therefore uses a
+> private local-stdio Node adapter and upstream functions directly. The product
+> outcomes and “connector, not reimplementation” rule below remain authoritative;
+> daemon-specific R1/KTD1/U1/U2 mechanics and their fake-daemon tests are
+> superseded by the runtime integration gate documented in `README.md` and
+> `docs/PARITY.md`. This file is retained as the historical planning record.
+
 Product Contract unchanged from the 2026-08-17 brainstorm (scope, actors,
 success criteria carried verbatim; Requirements below assign stable R-IDs to
 the already-stated scope).

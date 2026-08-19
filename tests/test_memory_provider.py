@@ -1,137 +1,75 @@
-"""Tests for the MagicContextMemoryProvider (U5)."""
+from __future__ import annotations
 
 import json
-import threading
 
-import pytest
-
-from tests.subc.fake_daemon import FakeSubcDaemon as FakeDaemon
 from magic_hermes.memory_provider import MagicContextMemoryProvider
-from magic_hermes.session import MagicContextSession
 
 
-@pytest.fixture
-def daemon():
-    d = FakeDaemon(modules=[{"module_id": "mc.core", "ops": ["memory"]}])
-    d.script(
-        "memory.list",
-        {
-            "memories": [
-                {
-                    "id": 1,
-                    "content": "always use ruff",
-                    "category": "PROJECT_RULES",
-                },
-                {"id": 2, "content": "port 8317", "category": "CONFIG_VALUES"},
-            ]
-        },
+class FakeClient:
+    def __init__(self):
+        self.calls = []
+        self.closed = False
+
+    def call(self, method, params=None, *, timeout=None):
+        self.calls.append((method, params or {}, timeout))
+        if method == "bind":
+            return {
+                "tool_schemas": [
+                    {"name": "ctx_search", "description": "search", "parameters": {}},
+                    {"name": "ctx_memory", "description": "memory", "parameters": {}},
+                ]
+            }
+        if method == "memory_context":
+            return {"text": "<project-memory>#1: rule</project-memory>", "count": 1}
+        if method == "tool":
+            return {"text": "Saved memory [ID: 2].", "is_error": False}
+        return {}
+
+    def close(self):
+        self.closed = True
+
+
+def test_provider_binds_and_leaves_tools_to_context_engine(tmp_path):
+    client = FakeClient()
+    provider = MagicContextMemoryProvider(client=client, project_root=tmp_path)
+
+    provider.initialize("memory-session", cwd=str(tmp_path))
+
+    assert provider.name == "magic_context"
+    assert provider.get_tool_schemas() == []
+    assert provider.prefetch("anything") == (
+        "<project-memory>#1: rule</project-memory>"
     )
-    d.script("memory.search", {"hits": [{"id": 2, "text": "port 8317"}]})
-    d.script("memory.write", {"ok": True, "id": 3})
-    d.script("memory.archive", {"ok": True})
-    yield d
-    d.stop()
 
 
-@pytest.fixture
-def provider(daemon, tmp_path, monkeypatch):
-    monkeypatch.setenv("SUBC_CONNECTION_FILE", daemon.connection_file(tmp_path))
+def test_provider_dispatches_official_memory_tool(tmp_path):
+    client = FakeClient()
+    provider = MagicContextMemoryProvider(client=client, project_root=tmp_path)
+    provider.initialize("memory-tools", cwd=str(tmp_path))
 
-    def _factory():
-        s = MagicContextSession(project_root=str(tmp_path), session_id="sess-1")
-        s.connect()
-        return s
-
-    p = MagicContextMemoryProvider(session_factory=_factory)
-    yield p
-    p.shutdown()
-
-
-class TestLifecycle:
-    def test_available_when_daemon_up(self, provider):
-        assert provider.is_available() is True
-
-    def test_available_connects_lazy_session(self):
-        class LazySession:
-            connected = False
-
-            def connect(self):
-                self.connected = True
-
-        session = LazySession()
-        p = MagicContextMemoryProvider(session_factory=lambda: session)
-
-        assert p.is_available() is True
-        assert session.connected is True
-
-    def test_unavailable_when_connection_fails(self):
-        class UnavailableSession:
-            connected = False
-
-            def connect(self):
-                raise ConnectionError("down")
-
-        p = MagicContextMemoryProvider(session_factory=UnavailableSession)
-        assert p.is_available() is False
-
-    def test_initialize_loads_memories(self, provider, daemon):
-        provider.initialize("sess-1")
-        block = provider.system_prompt_block()
-        assert "## Project Memory" in block
-        assert "#1 (PROJECT_RULES): always use ruff" in block
-
-    def test_empty_block_when_daemon_has_no_memories(self, provider):
-        provider.initialize("s")
-        provider._memories = []
-        assert provider.system_prompt_block() == ""
-
-
-class TestPrefetch:
-    def test_prefetch_formats_hits(self, provider):
-        block = provider.prefetch("what port")
-        assert "port 8317" in block
-
-    def test_prefetch_swallows_errors(self):
-        p = MagicContextMemoryProvider(
-            session_factory=lambda: (_ for _ in ()).throw(ConnectionError("down"))
+    result = json.loads(
+        provider.handle_tool_call(
+            "ctx_memory",
+            {
+                "action": "write",
+                "category": "PROJECT_RULES",
+                "content": "Use deterministic ids.",
+            },
         )
-        assert p.prefetch("q") == ""
+    )
+
+    assert result == {"content": "Saved memory [ID: 2]."}
+    call = next(item for item in client.calls if item[0] == "tool")
+    assert call[1]["session_id"] == "memory-tools"
 
 
-class TestTools:
-    def test_write_action(self, provider, daemon):
-        provider.initialize("s")
-        out = json.loads(
-            provider.handle_tool_call(
-                "ctx_memory", {"action": "write", "content": "new fact"}
-            )
-        )
-        assert out["ok"] is True
-        seen = [r for r in daemon.requests_seen if r.get("method") == "memory.write"]
-        assert seen and seen[0]["params"]["content"] == "new fact"
+def test_provider_shutdown_owns_only_its_client(tmp_path):
+    client = FakeClient()
+    provider = MagicContextMemoryProvider(client=client, project_root=tmp_path)
 
-    def test_search_action(self, provider):
-        out = json.loads(
-            provider.handle_tool_call(
-                "ctx_memory", {"action": "search", "query": "port"}
-            )
-        )
-        assert out == {"hits": [{"id": 2, "text": "port 8317"}]}
+    provider.shutdown()
+    call_count = len(client.calls)
+    provider.queue_prefetch("ignored after shutdown")
 
-    def test_unknown_tool(self, provider):
-        out = json.loads(provider.handle_tool_call("other", {}))
-        assert "error" in out
-
-    def test_daemon_error_returns_json_error(self):
-        def boom():
-            raise ConnectionError("down")
-
-        p = MagicContextMemoryProvider(session_factory=boom)
-        out = json.loads(
-            p.handle_tool_call("ctx_memory", {"action": "search", "query": "x"})
-        )
-        assert "unavailable" in out["error"]
-
-    def test_schemas_present(self, provider):
-        schemas = provider.get_tool_schemas()
-        assert schemas[0]["name"] == "ctx_memory"
+    assert client.closed is True
+    assert len(client.calls) == call_count

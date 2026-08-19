@@ -1,3 +1,8 @@
 name: magic-hermes
-version: 0.1.0.dev0
-description: "Magic Context connector for hermes-agent: persistent memory, background compaction, and ctx_* tools backed by the shared cortexkit subc daemon."
+version: 0.2.0.dev0
+description: "Hermes connector for the official Magic Context runtime, shared store, memory, history, and ctx_* tools."
+manifest_version: 2
+api_version: 1
+kind: standalone
+external_dependencies:
+  - node
