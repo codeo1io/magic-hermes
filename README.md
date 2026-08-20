@@ -61,12 +61,18 @@ runtime.
 ## Install
 
 Install a published wheel from the GitHub Releases page into the Python environment
-used by Hermes. Release notes contain the exact command for that version; the form is:
+used by Hermes. This repository is currently private, so authorized users should use
+an authenticated GitHub CLI session to download the wheel first:
 
 ```bash
+gh release download vX.Y.Z --repo codeo1io/magic-hermes \
+  --pattern 'magic_hermes-X.Y.Z-py3-none-any.whl'
 uv pip install --python /path/to/hermes/venv/bin/python --no-deps \
-  https://github.com/codeo1io/magic-hermes/releases/download/vX.Y.Z/magic_hermes-X.Y.Z-py3-none-any.whl
+  magic_hermes-X.Y.Z-py3-none-any.whl
 ```
+
+If the repository is later made public, release notes automatically switch to a
+direct wheel URL suitable for `pip install`/`uv pip install`.
 
 For development, install the repository directly instead:
 

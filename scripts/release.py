@@ -257,6 +257,26 @@ def commit_and_tag(version: str, tag: str, default_branch: str) -> None:
     run("git", "push", "origin", tag)
 
 
+def install_notes(version: str, tag: str, visibility: str) -> str:
+    wheel = f"magic_hermes-{version}-py3-none-any.whl"
+    if visibility.upper() == "PUBLIC":
+        install_command = (
+            f"pip install https://github.com/codeo1io/magic-hermes/releases/download/"
+            f"{tag}/{wheel}"
+        )
+    else:
+        install_command = (
+            f"gh release download {tag} --repo codeo1io/magic-hermes "
+            f"--pattern '{wheel}'\n"
+            f"pip install {wheel}"
+        )
+    return (
+        f"## Install\n\n```bash\n{install_command}\n```\n\n"
+        "Magic Context must also be installed in a supported Pi/OpenCode location "
+        "or exposed with `MAGIC_CONTEXT_PACKAGE_ROOT`.\n"
+    )
+
+
 def publish_release(
     version: str,
     tag: str,
@@ -266,15 +286,17 @@ def publish_release(
     if release_exists(tag):
         print(f"GitHub release {tag} already exists; nothing to publish")
         return
-    install_command = (
-        f"pip install https://github.com/codeo1io/magic-hermes/releases/download/{tag}/"
-        f"magic_hermes-{version}-py3-none-any.whl"
+    visibility = run(
+        "gh",
+        "repo",
+        "view",
+        "--json",
+        "visibility",
+        "--jq",
+        ".visibility",
+        capture=True,
     )
-    notes = (
-        f"## Install\n\n```bash\n{install_command}\n```\n\n"
-        "Magic Context must also be installed in a supported Pi/OpenCode location "
-        "or exposed with `MAGIC_CONTEXT_PACKAGE_ROOT`.\n"
-    )
+    notes = install_notes(version, tag, visibility)
     run(
         "gh",
         "release",

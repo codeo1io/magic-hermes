@@ -46,6 +46,20 @@ def test_release_semver_only_accepts_three_numeric_components():
     assert not release.SEMVER.fullmatch("0.2.0-rc1")
 
 
+def test_install_notes_use_authenticated_download_for_private_repo():
+    notes = release.install_notes("0.2.0", "v0.2.0", "PRIVATE")
+    assert "gh release download v0.2.0" in notes
+    assert "pip install magic_hermes-0.2.0-py3-none-any.whl" in notes
+
+
+def test_install_notes_use_direct_url_for_public_repo():
+    notes = release.install_notes("0.2.0", "v0.2.0", "PUBLIC")
+    assert (
+        "pip install https://github.com/codeo1io/magic-hermes/releases/download/"
+        in notes
+    )
+
+
 def test_replace_once_requires_matching_version_line(tmp_path):
     path = tmp_path / "sample.txt"
     path.write_text("name = nope\n", encoding="utf-8")
