@@ -37,7 +37,7 @@ def run(*args: str, capture: bool = False, env: dict[str, str] | None = None) ->
         detail = (result.stderr or result.stdout or "").strip()
         suffix = f"\n{detail}" if detail else ""
         raise ReleaseError(f"command failed: {' '.join(args)}{suffix}")
-    return (result.stdout or "").strip()
+    return (result.stdout or "").rstrip()
 
 
 def current_version() -> str:
