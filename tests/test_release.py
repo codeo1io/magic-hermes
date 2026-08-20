@@ -46,6 +46,32 @@ def test_release_semver_only_accepts_three_numeric_components():
     assert not release.SEMVER.fullmatch("0.2.0-rc1")
 
 
+def test_next_patch_version_increments_only_patch_component():
+    assert release.next_patch_version("0.2.0") == "0.2.1"
+    assert release.next_patch_version("12.34.56") == "12.34.57"
+
+
+def test_release_allows_magic_context_sync_changes_before_patch_bump(monkeypatch):
+    monkeypatch.setattr(
+        release,
+        "git_output",
+        lambda *args: (
+            " M package.json\n M package-lock.json\n"
+            " M src/magic_hermes/magic_context_compat.json"
+        ),
+    )
+    monkeypatch.setattr(release, "current_version", lambda: "0.2.0")
+
+    release.ensure_clean_or_release_version("0.2.1")
+
+
+def test_release_rejects_unrelated_dirty_paths(monkeypatch):
+    monkeypatch.setattr(release, "git_output", lambda *args: " M README.md")
+
+    with pytest.raises(release.ReleaseError, match="outside the release transaction"):
+        release.ensure_clean_or_release_version("0.2.1")
+
+
 def test_install_notes_use_authenticated_download_for_private_repo():
     notes = release.install_notes("0.2.0", "v0.2.0", "PRIVATE")
     assert "gh release download v0.2.0" in notes

@@ -14,6 +14,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+VERSION_FILES = {
+    "pyproject.toml",
+    "plugin.yaml",
+    "src/magic_hermes/__init__.py",
+}
+MAGIC_CONTEXT_SYNC_FILES = {
+    "package.json",
+    "package-lock.json",
+    "src/magic_hermes/magic_context_compat.json",
+}
 
 
 class ReleaseError(RuntimeError):
@@ -120,24 +130,37 @@ def git_output(*args: str) -> str:
     return run("git", *args, capture=True)
 
 
+def next_patch_version(version: str) -> str:
+    match = SEMVER.fullmatch(version)
+    if match is None:
+        raise ReleaseError(f"current version must be X.Y.Z, got {version!r}")
+    major, minor, patch = (int(part) for part in match.groups())
+    return f"{major}.{minor}.{patch + 1}"
+
+
 def ensure_clean_or_release_version(version: str) -> None:
     status = git_output("status", "--porcelain")
     if not status:
         return
-    allowed = {
-        "pyproject.toml",
-        "plugin.yaml",
-        "src/magic_hermes/__init__.py",
-    }
+
+    allowed = VERSION_FILES | MAGIC_CONTEXT_SYNC_FILES
     dirty = set()
     for line in status.splitlines():
         path = line[3:].strip()
         if " -> " in path:
             path = path.split(" -> ", 1)[1]
         dirty.add(path)
-    if not dirty.issubset(allowed) or current_version() != version:
+
+    disallowed = dirty - allowed
+    if disallowed:
         raise ReleaseError(
-            "working tree must be clean before starting a release; "
+            "working tree contains changes outside the release transaction; "
+            f"dirty paths: {', '.join(sorted(dirty))}"
+        )
+
+    if dirty & VERSION_FILES and current_version() != version:
+        raise ReleaseError(
+            "release metadata is already modified for a different version; "
             f"dirty paths: {', '.join(sorted(dirty))}"
         )
 
@@ -231,13 +254,7 @@ def commit_and_tag(version: str, tag: str, default_branch: str) -> None:
         if current_version() != version:
             set_version(version)
         assert_versions(version)
-        run(
-            "git",
-            "add",
-            "pyproject.toml",
-            "plugin.yaml",
-            "src/magic_hermes/__init__.py",
-        )
+        run("git", "add", *sorted(VERSION_FILES | MAGIC_CONTEXT_SYNC_FILES))
         staged = git_output("diff", "--cached", "--name-only")
         if staged:
             run("git", "commit", "-m", f"release: {tag}")
@@ -246,6 +263,12 @@ def commit_and_tag(version: str, tag: str, default_branch: str) -> None:
         ):
             raise ReleaseError(
                 "release version is set but no matching release commit exists"
+            )
+
+        remaining = git_output("status", "--porcelain")
+        if remaining:
+            raise ReleaseError(
+                "release commit left uncommitted changes behind:\n" + remaining
             )
         run("git", "tag", "-a", tag, "-m", f"Magic-Hermes {tag}")
 
@@ -314,14 +337,28 @@ def publish_release(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("version", help="release version in X.Y.Z form")
+    parser.add_argument("version", nargs="?", help="release version in X.Y.Z form")
+    parser.add_argument(
+        "--next-patch",
+        action="store_true",
+        help="release the next patch version based on current project metadata",
+    )
     parser.add_argument(
         "--build-only",
         action="store_true",
         help="validate and build artifacts without committing, tagging, or publishing",
     )
     args = parser.parse_args()
-    version = args.version.removeprefix("v")
+
+    if args.next_patch and args.version:
+        parser.error("version and --next-patch are mutually exclusive")
+    if args.next_patch:
+        version = next_patch_version(current_version())
+    elif args.version:
+        version = args.version.removeprefix("v")
+    else:
+        parser.error("version or --next-patch is required")
+
     if not SEMVER.fullmatch(version):
         parser.error("version must use X.Y.Z form")
     tag = f"v{version}"

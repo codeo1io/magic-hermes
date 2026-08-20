@@ -177,29 +177,36 @@ The adapter accepts only the major/minor series recorded in
 the official Pi module. The repo-level `package.json`/`package-lock.json` pin the
 exact upstream release used for validation. `.github/workflows/sync-magic-context.yml`
 checks for new core `vX.Y.Z` releases every 15 minutes (and also supports immediate
-`repository_dispatch`), waits for the matching npm publication, updates the pin and
-compatibility manifest, runs the full Python/Node/build gate, and pushes the update
-only when every check succeeds. A missing dependency or unvalidated series is
-reported before the adapter starts. Runtime and host-LLM failures during compaction
-fail open: the current Hermes transcript is returned unchanged.
+`repository_dispatch`), waits for the matching npm publication, and processes the
+oldest unseen core release first so intermediate releases are never skipped. Each
+validated upstream release updates the dependency pin and compatibility manifest,
+increments the Magic-Hermes patch version (for example `0.2.0` to `0.2.1`), runs the
+full Python/Node/build gate, commits and tags the release, and publishes the wheel,
+sdist, and checksums as a GitHub release. A missing dependency or unvalidated series
+is reported before the adapter starts. Runtime and host-LLM failures during
+compaction fail open: the current Hermes transcript is returned unchanged.
 
 Detailed supported behavior and deliberate host-shaped differences are recorded
 in [docs/PARITY.md](docs/PARITY.md).
 
 ## Publishing a release
 
-Maintainers can publish a complete GitHub release with one command:
+Maintainers can publish a complete GitHub release with an explicit version or ask
+for the next patch version:
 
 ```bash
 .venv/bin/python scripts/release.py X.Y.Z
+.venv/bin/python scripts/release.py --next-patch
 ```
 
-The release script requires a clean, synchronized default branch and authenticated
-`gh`. It synchronizes the Python package/plugin versions, installs the repo-pinned
-Magic Context npm dependency, runs the complete test/lint/Node/build gate, produces
-wheel and sdist artifacts plus `SHA256SUMS`, commits `release: vX.Y.Z`, creates and
-pushes an annotated tag, and creates the GitHub release with the artifacts attached.
-It refuses to publish when validation fails.
+The release script requires a synchronized default branch and authenticated `gh`.
+It accepts only release metadata and Magic Context synchronization changes in the
+release transaction, synchronizes the Python package/plugin versions, installs the
+repo-pinned Magic Context npm dependency, runs the complete test/lint/Node/build
+gate, produces wheel and sdist artifacts plus `SHA256SUMS`, commits `release: vX.Y.Z`,
+creates and pushes an annotated tag, and creates the GitHub release with the
+artifacts attached. It refuses to publish when validation fails or unrelated working
+tree changes are present.
 
 ## License
 
