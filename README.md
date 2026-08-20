@@ -20,11 +20,18 @@ until their private adapter surface has been reviewed.
 - Hermes loads `MagicContextEngine` as the selected context engine.
 - Hermes loads `MagicContextMemoryProvider` as the exclusive external memory
   provider.
-- Each Python component owns a private, lazy Node adapter process. Calls use
-  newline-delimited JSON over local stdio and are serialized; mutation calls are
-  never replayed after a transport failure.
+- Each Python component owns a private, lazy Node adapter process. Top-level
+  requests use newline-delimited JSON over local stdio and remain serialized;
+  host callbacks may run concurrently so an upstream Dreamer timeout can cancel
+  an in-flight Hermes child. Mutation calls are never replayed after a transport
+  failure.
 - The Node adapter loads the installed official Pi package, changes only the
-  harness identity to `hermes`, and delegates behavior to upstream functions.
+  harness identity to `hermes`, and delegates context policy, scheduling,
+  rendering, tools, Dreamer state, validation, embeddings, and SQLite behavior
+  to upstream functions.
+- The ContextEngine is the sole request-render owner. The Hermes MemoryProvider
+  participates in lifecycle/status integration but does not inject a duplicate
+  project-memory block.
 - Pi, OpenCode, and Hermes use the same Magic Context SQLite store and JSONC
   configuration.
 
@@ -89,8 +96,7 @@ JSONC file. magic-hermes does not introduce a second configuration source.
 ## Exposed tools
 
 The context engine exposes the five tools registered by the installed upstream
-runtime. The unsupported smart-note condition field is removed from `ctx_note`
-because Hermes does not run the upstream condition evaluator:
+runtime, including the complete smart-note `surface_condition` contract:
 
 - `ctx_search`
 - `ctx_expand`
@@ -98,23 +104,33 @@ because Hermes does not run the upstream condition evaluator:
 - `ctx_note`
 - `ctx_memory`
 
-The memory provider deliberately registers no duplicate tools. It supplies
-Hermes' standard budgeted `<project-memory>` injection while the context engine
-owns all `ctx_*` dispatch.
+The MemoryProvider deliberately registers no duplicate tools or policy prompt.
+The ContextEngine owns `ctx_*` dispatch and upstream m[0]/m[1] rendering.
 
-## Compaction and auxiliary LLMs
+## Compaction, historian, and Dreamer
 
-At the configured upstream threshold, Hermes invokes the Magic Context historian
-through the `mc_historian` auxiliary route. The connector uses the official
-historian prompt, parser, validator, repair prompt, optional two-pass editor,
-compartment decay, fact promotion, event storage, and user-observation candidate
-storage. Invalid output fails open to the unchanged transcript.
+Magic Context—not a second Hermes compressor—owns context policy. Its upstream
+scheduler evaluates percentage/absolute pressure, cache TTL, protected tail, and
+other supported triggers. Normal completed turns schedule historian work in the
+background through the `mc_historian` auxiliary route; manual `/compress` and
+emergency preflight use the same upstream historian synchronously. The official
+chunking, prompts, parser, validator, repair/editor passes, compartment storage,
+queued reductions, facts/events, note triggers, primer candidates, and embedding
+side effects are preserved. Invalid output fails open to the current transcript.
 
-When the upstream `curate` task has a non-empty schedule, `mc_dreamer`
-provides a conservative Hermes-hosted curate pass at a real session boundary.
-The complete
-Pi/OpenCode scheduled dream-task suite is not reproduced; see
-[docs/PARITY.md](docs/PARITY.md).
+Do **not** set Hermes `compression.enabled: false` to imitate OpenCode's setup.
+OpenCode disables a separate built-in compactor; Hermes selects exactly one
+ContextEngine, so its compression setting remains the host permission gate for the
+selected Magic Context engine.
+
+Dreamer uses the upstream task planner, gates, schedules, backlogs, leases,
+retries, and all twelve 0.38.x task implementations. When a task needs an agent,
+the adapter supplies a real Hermes public subagent as the host execution primitive;
+Magic Context remains authoritative for task policy and durable state. Agentic work
+that becomes due while Hermes is completely idle is picked up on the next active
+Hermes lifecycle turn without advancing the upstream due state prematurely. See
+[docs/PARITY.md](docs/PARITY.md) for the task-by-task evidence and host-shaped
+boundaries.
 
 ## Verification
 
@@ -128,10 +144,15 @@ node --check src/magic_hermes/bridge/runtime.mjs
 python -m build
 ```
 
-The integration test uses a temporary real Magic Context database and proves
-indexing, all five tool schemas, memory and note persistence, historian
-validation, two-pass fallback, compartment/event publication, decayed rendering,
-search, and expansion after a runtime restart.
+The suite uses temporary real Magic Context databases and the installed 0.38.x
+runtime. It covers all five tool contracts, upstream m[0]/m[1] rendering,
+cache-safe reductions, temporal/auto-search behavior, historian scheduling and
+publication, lease renewal, rich `ctx_expand` after restart, branch/rewind
+reconciliation, all twelve Dreamer task state machines, smart-note sandboxing,
+mural generation, real OpenAI-compatible embedding production/model rotation,
+and upstream Git indexing. Separate host E2Es exercise normal `hermes chat`,
+optimized `hermes -z`, gateway-style agent construction, background historian
+execution, and real Hermes Dreamer child delegation.
 
 ## Compatibility and failure behavior
 

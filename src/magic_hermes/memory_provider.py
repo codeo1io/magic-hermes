@@ -101,19 +101,31 @@ class MagicContextMemoryProvider(_MemoryProviderBase):
         return True
 
     def system_prompt_block(self) -> str:
-        return (
-            "Magic Context supplies durable project memories in a "
-            "<project-memory> block. Use ctx_memory for intentional writes, "
-            "updates, merges, retrieval by id, and archival."
-        )
+        """Return no independent guidance; upstream MC owns prompt policy.
+
+        The ContextEngine injects `buildMagicContextBlock()` from the shared
+        CortexKit config on each request. A second Hermes-memory-provider block
+        would drift from `prompt_surface`, language, compaction and smart-note
+        settings and would break prompt-cache prefix parity.
+        """
+
+        return ""
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Report recall status without duplicating MC's request-time m[0].
+
+        The ContextEngine is the sole Magic Context render owner and injects the
+        upstream m[0]/m[1] payload (memory, docs/profile, history, mural). Hermes'
+        MemoryManager would otherwise wrap this same project memory into the live
+        user message before select_context(), producing two independent copies.
+        """
+
         del query
         key = session_id or self._session_id
         with self._cache_lock:
-            text, count = self._cached_context.get(key, ("", 0))
+            _text, count = self._cached_context.get(key, ("", 0))
             self._last_recall_count = count
-            return text
+        return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         del query

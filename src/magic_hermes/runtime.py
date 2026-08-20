@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import importlib.resources
 import json
 import logging
@@ -11,6 +12,8 @@ import select
 import shutil
 import subprocess
 import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -171,6 +174,9 @@ def runtime_unavailable_reason(
     return ""
 
 
+HostCallback = Callable[[str, dict[str, Any]], Any]
+
+
 class RuntimeClient:
     """Serialize JSON-line calls to one lazily-started Node process.
 
@@ -184,11 +190,20 @@ class RuntimeClient:
         package_root: str | os.PathLike[str] | None = None,
         db_path: str | os.PathLike[str] | None = None,
         timeout: float = 130.0,
+        callback_handler: HostCallback | None = None,
     ) -> None:
         self.package_root = Path(package_root).resolve() if package_root else None
         self.db_path = Path(db_path).resolve() if db_path else None
         self.timeout = timeout
+        self.callback_handler = callback_handler
         self._lock = threading.Lock()
+        # Host callbacks may execute for minutes (Dreamer child agents).  Keep
+        # stdin writes independently serialized so the main reader can accept a
+        # second callback (for example abort) while the first callback is still
+        # running on another thread.
+        self._stdin_lock = threading.Lock()
+        self._callback_threads_lock = threading.Lock()
+        self._callback_threads: set[threading.Thread] = set()
         self._process: subprocess.Popen[str] | None = None
         self._next_id = 1
         self._stderr_thread: threading.Thread | None = None
@@ -200,6 +215,7 @@ class RuntimeClient:
             package_root=self.package_root,
             db_path=self.db_path,
             timeout=self.timeout,
+            callback_handler=self.callback_handler,
         )
         memo[id(self)] = copied
         return copied
@@ -262,6 +278,92 @@ class RuntimeClient:
             process = self._start()
         return process
 
+    def _write_payload(
+        self,
+        process: subprocess.Popen[str],
+        payload: dict[str, Any],
+        *,
+        context: str,
+    ) -> None:
+        if process.stdin is None:
+            raise RuntimeProtocolError("Runtime stdin is unavailable")
+        try:
+            with self._stdin_lock:
+                process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+                process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            self._dispose(process)
+            raise RuntimeProtocolError(
+                f"Runtime failed while {context}; request was not replayed"
+            ) from exc
+
+    def _dispatch_host_callback(
+        self,
+        process: subprocess.Popen[str],
+        callback_id: Any,
+        callback_method: str,
+        callback_params: dict[str, Any],
+    ) -> None:
+        current = threading.current_thread()
+        reply: dict[str, Any] = {
+            "type": "host_callback_result",
+            "callback_id": callback_id,
+        }
+        try:
+            if self.callback_handler is None:
+                raise RuntimeError(f"No host callback handler for {callback_method}")
+            reply["result"] = self.callback_handler(callback_method, callback_params)
+        except Exception as exc:  # callback errors are returned to MC
+            reply["error"] = {
+                "message": str(exc),
+                "type": type(exc).__name__,
+            }
+        try:
+            self._write_payload(
+                process,
+                reply,
+                context=f"replying to host callback {callback_method}",
+            )
+        except RuntimeProtocolError:
+            log.debug(
+                "Magic Context host callback reply failed for %s",
+                callback_method,
+                exc_info=True,
+            )
+        finally:
+            with self._callback_threads_lock:
+                self._callback_threads.discard(current)
+
+    def _start_host_callback(
+        self,
+        process: subprocess.Popen[str],
+        callback_id: Any,
+        callback_method: str,
+        callback_params: dict[str, Any],
+    ) -> None:
+        # Hermes binds public parent-agent and profile/session state through
+        # ContextVars for the duration of an active turn. New Python threads do
+        # not inherit that state automatically, so preserve the current context
+        # when dispatching a concurrent host callback. This keeps Dreamer child
+        # launches attached to the real active Hermes parent while still allowing
+        # an abort callback to run concurrently with a long prompt callback.
+        execution_context = contextvars.copy_context()
+        worker = threading.Thread(
+            target=execution_context.run,
+            args=(
+                self._dispatch_host_callback,
+                process,
+                callback_id,
+                callback_method,
+                callback_params,
+            ),
+            name=f"magic-hermes-host-callback-{callback_method[:24]}",
+            daemon=True,
+        )
+        with self._callback_threads_lock:
+            self._callback_threads.add(worker)
+        worker.start()
+
     def call(
         self,
         method: str,
@@ -284,59 +386,77 @@ class RuntimeClient:
                 "params": params or {},
             }
 
-            try:
-                process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
-                process.stdin.flush()
-            except (BrokenPipeError, OSError) as exc:
-                self._dispose(process)
-                raise RuntimeProtocolError(
-                    f"Runtime failed while sending {method}; request was not replayed"
-                ) from exc
+            self._write_payload(
+                process,
+                payload,
+                context=f"sending {method}",
+            )
 
             wait_for = self.timeout if timeout is None else timeout
-            ready, _, _ = select.select([process.stdout], [], [], wait_for)
-            if not ready:
-                self._dispose(process)
-                raise RuntimeProtocolError(
-                    f"Runtime timed out after {wait_for:.1f}s during {method}; "
-                    "request was not replayed"
-                )
+            deadline = time.monotonic() + wait_for
+            while True:
+                remaining = max(0.0, deadline - time.monotonic())
+                ready, _, _ = select.select([process.stdout], [], [], remaining)
+                if not ready:
+                    self._dispose(process)
+                    raise RuntimeProtocolError(
+                        f"Runtime timed out after {wait_for:.1f}s during {method}; "
+                        "request was not replayed"
+                    )
 
-            line = process.stdout.readline()
-            if not line:
-                code = process.poll()
-                self._dispose(process)
-                raise RuntimeProtocolError(
-                    f"Runtime exited during {method} with status {code}; "
-                    "request was not replayed"
-                )
+                line = process.stdout.readline()
+                if not line:
+                    code = process.poll()
+                    self._dispose(process)
+                    raise RuntimeProtocolError(
+                        f"Runtime exited during {method} with status {code}; "
+                        "request was not replayed"
+                    )
 
-            try:
-                response = json.loads(line)
-            except json.JSONDecodeError as exc:
-                self._dispose(process)
-                raise RuntimeProtocolError(
-                    f"Runtime returned invalid JSON during {method}"
-                ) from exc
+                try:
+                    response = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    self._dispose(process)
+                    raise RuntimeProtocolError(
+                        f"Runtime returned invalid JSON during {method}"
+                    ) from exc
 
-            if not isinstance(response, dict):
-                self._dispose(process)
-                raise RuntimeProtocolError(
-                    f"Runtime returned a non-object JSON response during {method}"
-                )
-            if response.get("id") != request_id:
-                self._dispose(process)
-                raise RuntimeProtocolError(
-                    f"Runtime response id mismatch during {method}"
-                )
-            error = response.get("error")
-            if error:
-                if isinstance(error, dict):
-                    message = error.get("message") or "unknown runtime error"
-                else:
-                    message = str(error)
-                raise RuntimeProtocolError(f"{method}: {message}")
-            return response.get("result")
+                if not isinstance(response, dict):
+                    self._dispose(process)
+                    raise RuntimeProtocolError(
+                        f"Runtime returned a non-object JSON response during {method}"
+                    )
+
+                if response.get("type") == "host_callback":
+                    callback_id = response.get("callback_id")
+                    callback_method = str(response.get("method") or "")
+                    callback_params = response.get("params")
+                    if not isinstance(callback_params, dict):
+                        callback_params = {}
+                    # Do not block the stdout reader on a long host callback.
+                    # Upstream Dreamer may emit a second callback (abort) while
+                    # the child launch callback is still executing.
+                    self._start_host_callback(
+                        process,
+                        callback_id,
+                        callback_method,
+                        callback_params,
+                    )
+                    continue
+
+                if response.get("id") != request_id:
+                    self._dispose(process)
+                    raise RuntimeProtocolError(
+                        f"Runtime response id mismatch during {method}"
+                    )
+                error = response.get("error")
+                if error:
+                    if isinstance(error, dict):
+                        message = error.get("message") or "unknown runtime error"
+                    else:
+                        message = str(error)
+                    raise RuntimeProtocolError(f"{method}: {message}")
+                return response.get("result")
 
     def close(self) -> None:
         """Terminate this client's private runtime process."""

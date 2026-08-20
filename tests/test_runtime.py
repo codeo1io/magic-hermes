@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextvars
 import io
 import json
+import threading
 
 import pytest
 
@@ -122,3 +124,75 @@ def test_runtime_normalizes_non_object_error_payload(monkeypatch):
 
     with pytest.raises(runtime.RuntimeProtocolError, match="hello: bridge exploded"):
         client.call("hello")
+
+
+def test_runtime_dispatches_abort_callback_while_prompt_callback_is_running(
+    monkeypatch, tmp_path
+):
+    """A second host callback must not wait behind a long first callback."""
+
+    script = tmp_path / "runtime.mjs"
+    script.write_text(
+        r'''
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+let requestId = null;
+let slow = null;
+let abort = null;
+function emit(value) { process.stdout.write(JSON.stringify(value) + "\n"); }
+function maybeFinish() {
+  if (requestId !== null && slow !== null && abort !== null) {
+    emit({ id: requestId, result: { slow, abort } });
+  }
+}
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === "host_callback_result") {
+    if (msg.callback_id === "slow") slow = msg.result;
+    if (msg.callback_id === "abort") abort = msg.result;
+    maybeFinish();
+    return;
+  }
+  requestId = msg.id;
+  emit({ type: "host_callback", callback_id: "slow", method: "slow", params: {} });
+  setTimeout(() => emit({
+    type: "host_callback", callback_id: "abort", method: "abort", params: {}
+  }), 20);
+});
+''',
+        encoding="utf-8",
+    )
+    package_root = tmp_path / "pi-magic-context"
+    (package_root / "dist").mkdir(parents=True)
+    (package_root / "package.json").write_text(
+        json.dumps({"version": "0.38.0"}), encoding="utf-8"
+    )
+    (package_root / "dist" / "index.js").write_text("", encoding="utf-8")
+    monkeypatch.setattr(runtime, "runtime_script_path", lambda: script)
+    monkeypatch.setattr(runtime.shutil, "which", lambda _name: "/usr/bin/node")
+
+    abort_seen = threading.Event()
+    active_parent = contextvars.ContextVar(
+        "test_runtime_active_parent", default="missing"
+    )
+
+    def callback(method, _params):
+        marker = active_parent.get()
+        if method == "abort":
+            abort_seen.set()
+            return {"accepted": True, "parent": marker}
+        if method == "slow":
+            return {"saw_abort": abort_seen.wait(1.0), "parent": marker}
+        raise AssertionError(method)
+
+    with runtime.RuntimeClient(
+        package_root=package_root, timeout=3, callback_handler=callback
+    ) as client:
+        token = active_parent.set("bound-parent")
+        try:
+            result = client.call("probe", timeout=3)
+        finally:
+            active_parent.reset(token)
+
+    assert result["abort"] == {"accepted": True, "parent": "bound-parent"}
+    assert result["slow"] == {"saw_abort": True, "parent": "bound-parent"}

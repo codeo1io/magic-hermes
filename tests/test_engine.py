@@ -14,6 +14,7 @@ class FakeClient:
 
     def __deepcopy__(self, memo):
         copied = type(self)(self.responses)
+        copied.calls = self.calls
         memo[id(self)] = copied
         return copied
 
@@ -96,18 +97,29 @@ def test_engine_binds_real_session_and_excludes_memory_tool(tmp_path):
     assert params["project_root"] == str(tmp_path.resolve())
 
 
-def test_engine_threshold_uses_shared_config(tmp_path):
-    client = FakeClient({"bind": bind_result()})
+def test_engine_host_gate_uses_upstream_emergency_pressure(tmp_path):
+    def pressure(params):
+        limit = int(params.get("context_length") or 0)
+        tokens = int(params.get("input_tokens") or 0)
+        return {
+            "should_block": bool(limit and tokens / limit >= 0.95),
+            "emergency_percentage": 95,
+        }
+
+    client = FakeClient({"bind": bind_result(), "pressure_state": pressure})
     engine = MagicContextEngine(client=client, project_root=tmp_path)
     engine.context_length = 100_000
     engine.on_session_start("threshold", cwd=str(tmp_path))
 
-    assert engine.threshold_tokens == 65_000
+    # The shared MC execute threshold (65 in bind_result) is no longer copied
+    # into Hermes. Hermes only blocks at MC's upstream emergency band.
+    assert engine.threshold_tokens == 95_000
     assert engine.should_compress(64_999) is False
-    assert engine.should_compress(65_000) is True
+    assert engine.should_compress(94_999) is False
+    assert engine.should_compress(95_000) is True
 
     engine.update_model("replacement", 200_000)
-    assert engine.threshold_tokens == 130_000
+    assert engine.threshold_tokens == 190_000
 
 
 def test_compress_calls_historian_and_returns_validated_view(tmp_path):
@@ -126,8 +138,14 @@ def test_compress_calls_historian_and_returns_validated_view(tmp_path):
     client = FakeClient(
         {
             "bind": bind_result(),
+            "historian_decide": {
+                "should_fire": True,
+                "reason": "trigger",
+                "boundary_snapshot": {"offset": 1, "eligibleEndOrdinal": 8},
+            },
             "historian_prepare": prepared,
             "historian_publish": {"ok": True, "messages": compacted},
+            "render_context": {"messages": compacted},
         }
     )
     completions = []
@@ -190,8 +208,14 @@ def test_compress_runs_configured_two_pass_editor(tmp_path):
     client = FakeClient(
         {
             "bind": bind_result(),
+            "historian_decide": {
+                "should_fire": True,
+                "reason": "trigger",
+                "boundary_snapshot": {"offset": 1, "eligibleEndOrdinal": 8},
+            },
             "historian_prepare": prepared,
             "historian_publish": publish,
+            "render_context": {"messages": compacted},
         }
     )
     completions = []
@@ -243,6 +267,11 @@ def test_compress_fails_open_on_host_completion_error(tmp_path):
     client = FakeClient(
         {
             "bind": bind_result(),
+            "historian_decide": {
+                "should_fire": True,
+                "reason": "trigger",
+                "boundary_snapshot": {"offset": 1, "eligibleEndOrdinal": 8},
+            },
             "historian_prepare": {
                 "ready": True,
                 "system_prompt": "# Historian",
@@ -263,6 +292,66 @@ def test_compress_fails_open_on_host_completion_error(tmp_path):
 
     assert engine.compress(original) is original
     assert engine.compression_count == 0
+
+
+def test_select_context_keeps_upstream_tag_transform_without_compartments(tmp_path):
+    original = [{"role": "user", "content": "hello"}]
+    tagged = [{"role": "user", "content": "§1§ hello"}]
+    client = FakeClient(
+        {
+            "bind": bind_result(),
+            "render_context": {
+                "messages": tagged,
+                "history": "",
+                "scheduler_decision": "defer",
+            },
+        }
+    )
+    engine = MagicContextEngine(
+        client=client,
+        project_root=tmp_path,
+        session_id="render-tags",
+    )
+
+    assert engine.select_context(original) == tagged
+
+
+def test_on_turn_complete_uses_upstream_trigger_to_schedule_background_historian(
+    monkeypatch, tmp_path
+):
+    boundary = {"offset": 1, "eligibleEndOrdinal": 8}
+    client = FakeClient(
+        {
+            "bind": bind_result(),
+            "observe": {"raw_message_count": 10},
+            "historian_decide": {
+                "should_fire": True,
+                "reason": "projected_headroom",
+                "boundary_snapshot": boundary,
+            },
+        }
+    )
+    engine = MagicContextEngine(
+        client=client,
+        complete=lambda **_kwargs: "unused",
+        project_root=tmp_path,
+        session_id="async-trigger",
+    )
+    scheduled = []
+
+    def capture(messages, snapshot):
+        scheduled.append((messages, snapshot))
+        return True
+
+    monkeypatch.setattr(engine, "_schedule_historian", capture)
+    monkeypatch.setattr(engine, "_schedule_dreamer", lambda: False)
+    messages = [{"role": "user", "content": "turn"}]
+
+    engine.on_turn_complete(messages)
+
+    assert scheduled == [(messages, boundary)]
+    methods = [method for method, _params, _timeout in client.calls]
+    assert methods[-2:] == ["observe", "historian_decide"]
 
 
 def test_tool_result_is_json_and_passes_current_messages(tmp_path):

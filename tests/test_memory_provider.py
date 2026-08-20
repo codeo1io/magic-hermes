@@ -37,9 +37,10 @@ def test_provider_binds_and_leaves_tools_to_context_engine(tmp_path):
 
     assert provider.name == "magic_context"
     assert provider.get_tool_schemas() == []
-    assert provider.prefetch("anything") == (
-        "<project-memory>#1: rule</project-memory>"
-    )
+    # The ContextEngine owns upstream m[0]/m[1] rendering, so the MemoryProvider
+    # tracks recall status but must not inject a duplicate memory block.
+    assert provider.prefetch("anything") == ""
+    assert provider._last_recall_count == 1
 
 
 def test_provider_dispatches_official_memory_tool(tmp_path):
