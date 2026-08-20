@@ -1,0 +1,53 @@
+from __future__ import annotations
+
+import re
+
+import pytest
+
+import scripts.release as release
+
+
+def test_set_version_updates_all_package_metadata(monkeypatch, tmp_path):
+    (tmp_path / "src" / "magic_hermes").mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "magic-hermes"\nversion = "0.2.0.dev0"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "plugin.yaml").write_text(
+        "name: magic-hermes\nversion: 0.2.0.dev0\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "magic_hermes" / "__init__.py").write_text(
+        '__version__ = "0.2.0.dev0"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+
+    release.set_version("1.2.3")
+    release.assert_versions("1.2.3")
+
+    assert 'version = "1.2.3"' in (tmp_path / "pyproject.toml").read_text()
+    assert "version: 1.2.3" in (tmp_path / "plugin.yaml").read_text()
+    assert '__version__ = "1.2.3"' in (
+        tmp_path / "src" / "magic_hermes" / "__init__.py"
+    ).read_text()
+
+
+def test_set_version_rejects_non_release_version():
+    with pytest.raises(release.ReleaseError, match=r"X\.Y\.Z"):
+        release.set_version("0.2.0.dev0")
+
+
+def test_release_semver_only_accepts_three_numeric_components():
+    assert release.SEMVER.fullmatch("0.2.0")
+    assert release.SEMVER.fullmatch("12.34.56")
+    assert not release.SEMVER.fullmatch("v0.2.0")
+    assert not release.SEMVER.fullmatch("0.2")
+    assert not release.SEMVER.fullmatch("0.2.0-rc1")
+
+
+def test_replace_once_requires_matching_version_line(tmp_path):
+    path = tmp_path / "sample.txt"
+    path.write_text("name = nope\n", encoding="utf-8")
+    with pytest.raises(release.ReleaseError, match="could not update version"):
+        release.replace_once(path, re.escape('version = "old"'), 'version = "new"')

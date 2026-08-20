@@ -60,7 +60,15 @@ runtime.
 
 ## Install
 
-Install the repository into the Python environment used by Hermes. For example:
+Install a published wheel from the GitHub Releases page into the Python environment
+used by Hermes. Release notes contain the exact command for that version; the form is:
+
+```bash
+uv pip install --python /path/to/hermes/venv/bin/python --no-deps \
+  https://github.com/codeo1io/magic-hermes/releases/download/vX.Y.Z/magic_hermes-X.Y.Z-py3-none-any.whl
+```
+
+For development, install the repository directly instead:
 
 ```bash
 uv pip install --python /path/to/hermes/venv/bin/python --no-deps -e .
@@ -171,6 +179,21 @@ fail open: the current Hermes transcript is returned unchanged.
 
 Detailed supported behavior and deliberate host-shaped differences are recorded
 in [docs/PARITY.md](docs/PARITY.md).
+
+## Publishing a release
+
+Maintainers can publish a complete GitHub release with one command:
+
+```bash
+.venv/bin/python scripts/release.py X.Y.Z
+```
+
+The release script requires a clean, synchronized default branch and authenticated
+`gh`. It synchronizes the Python package/plugin versions, installs the repo-pinned
+Magic Context npm dependency, runs the complete test/lint/Node/build gate, produces
+wheel and sdist artifacts plus `SHA256SUMS`, commits `release: vX.Y.Z`, creates and
+pushes an annotated tag, and creates the GitHub release with the artifacts attached.
+It refuses to publish when validation fails.
 
 ## License
 
