@@ -1,0 +1,119 @@
+name: Sync Magic Context release
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Magic Context core version (for example 0.39.0); blank means latest core release"
+        required: false
+        type: string
+  repository_dispatch:
+    types: [magic-context-release]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-magic-context-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Resolve latest Magic Context core release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version || github.event.client_payload.version || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_VERSION" ]]; then
+            version="${REQUESTED_VERSION#v}"
+            tag="v${version}"
+          else
+            tag="$(
+              gh api 'repos/cortexkit/magic-context/releases?per_page=100' \
+                --jq 'first(.[] | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$")))'
+            )"
+            if [[ -z "$tag" ]]; then
+              echo "No Magic Context core release tag found" >&2
+              exit 1
+            fi
+            version="${tag#v}"
+          fi
+
+          published="$(npm view "@cortexkit/pi-magic-context@${version}" version --json 2>/dev/null | tr -d '"' || true)"
+          if [[ "$published" != "$version" ]]; then
+            echo "Core release ${tag} exists but npm package ${version} is not published yet; next poll will retry."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          current="$(python -c 'import json; print(json.load(open("src/magic_hermes/magic_context_compat.json"))["tested_version"])')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          if [[ "$current" == "$version" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Synchronize dependency metadata
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true'
+        run: |
+          python scripts/sync_magic_context_release.py \
+            --version "${{ steps.release.outputs.version }}" \
+            --release-tag "${{ steps.release.outputs.tag }}"
+          npm install --ignore-scripts --no-audit --no-fund
+          python scripts/sync_magic_context_release.py --check
+
+      - name: Install Python development dependencies
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true'
+        run: python -m pip install -e '.[dev]'
+
+      - name: Validate candidate release
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true'
+        env:
+          MAGIC_CONTEXT_PACKAGE_ROOT: ${{ github.workspace }}/node_modules/@cortexkit/pi-magic-context
+        run: |
+          python -m pytest -q
+          ruff check src tests scripts
+          node --check src/magic_hermes/bridge/loader.mjs
+          node --check src/magic_hermes/bridge/runtime.mjs
+          python -m build
+
+      - name: Commit validated release to default branch
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          default_branch="$DEFAULT_BRANCH"
+          test -n "$default_branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json src/magic_hermes/magic_context_compat.json
+          git commit -m "chore: sync Magic Context v${VERSION}"
+          git fetch origin "$default_branch"
+          git rebase "origin/${default_branch}"
+          git push origin "HEAD:${default_branch}"

@@ -9,7 +9,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from magic_hermes.runtime import RuntimeClient, runtime_available
+from magic_hermes.runtime import (
+    RuntimeClient,
+    runtime_available,
+    supported_magic_context_series,
+)
 
 pytestmark = pytest.mark.skipif(
     not runtime_available(),
@@ -81,7 +85,8 @@ def test_official_runtime_indexes_tools_memories_and_compartments(tmp_path):
     db_path = tmp_path / "context.db"
     with RuntimeClient(db_path=db_path, timeout=60) as client:
         hello = client.call("hello")
-        assert hello["package_version"].startswith("0.38.")
+        major, minor = supported_magic_context_series()
+        assert hello["package_version"].startswith(f"{major}.{minor}.")
         assert hello["harness"] == "hermes"
 
         bound = client.call(

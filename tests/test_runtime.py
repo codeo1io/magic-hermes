@@ -10,6 +10,21 @@ import pytest
 import magic_hermes.runtime as runtime
 
 
+def _supported_version(patch: int = 0) -> str:
+    major, minor = runtime.supported_magic_context_series()
+    return f"{major}.{minor}.{patch}"
+
+
+def _next_series_version() -> str:
+    major, minor = runtime.supported_magic_context_series()
+    return f"{major}.{minor + 1}.0"
+
+
+def _supported_series_text() -> str:
+    major, minor = runtime.supported_magic_context_series()
+    return f"{major}.{minor}.x"
+
+
 def _local_runtime(monkeypatch, tmp_path, version):
     script = tmp_path / "runtime.mjs"
     script.write_text("", encoding="utf-8")
@@ -30,34 +45,44 @@ def _local_runtime(monkeypatch, tmp_path, version):
 
 
 def test_runtime_available_for_supported_upstream_series(monkeypatch, tmp_path):
-    _local_runtime(monkeypatch, tmp_path, "0.38.7")
+    _local_runtime(monkeypatch, tmp_path, _supported_version(7))
 
     assert runtime.runtime_available() is True
     assert runtime.runtime_unavailable_reason() == ""
 
 
 def test_runtime_accepts_supported_prerelease(monkeypatch, tmp_path):
-    _local_runtime(monkeypatch, tmp_path, "0.38.0-beta.1+build.2")
+    _local_runtime(
+        monkeypatch,
+        tmp_path,
+        runtime.tested_magic_context_version().split("+")[0].split("-")[0]
+        + "-beta.1+build.2",
+    )
 
     assert runtime.runtime_available() is True
 
 
 def test_runtime_rejects_unreviewed_upstream_series(monkeypatch, tmp_path):
-    _local_runtime(monkeypatch, tmp_path, "0.39.0")
+    _local_runtime(monkeypatch, tmp_path, _next_series_version())
 
     assert runtime.runtime_available() is False
-    assert "requires the 0.38.x series" in runtime.runtime_unavailable_reason()
+    reason = runtime.runtime_unavailable_reason()
+    assert f"requires the {_supported_series_text()} series" in reason
 
 
 def test_runtime_rejects_malformed_supported_series(monkeypatch, tmp_path):
-    _local_runtime(monkeypatch, tmp_path, "0.38.bad")
+    major, minor = runtime.supported_magic_context_series()
+    _local_runtime(monkeypatch, tmp_path, f"{major}.{minor}.bad")
 
     assert runtime.runtime_available() is False
-    assert "requires the 0.38.x series" in runtime.runtime_unavailable_reason()
+    reason = runtime.runtime_unavailable_reason()
+    assert f"requires the {_supported_series_text()} series" in reason
 
 
 def test_runtime_rejects_unreadable_package_version(monkeypatch, tmp_path):
-    package_root = _local_runtime(monkeypatch, tmp_path, "0.38.0")
+    package_root = _local_runtime(
+        monkeypatch, tmp_path, runtime.tested_magic_context_version()
+    )
     (package_root / "package.json").write_text("{", encoding="utf-8")
 
     assert runtime.runtime_available() is False
@@ -65,7 +90,7 @@ def test_runtime_rejects_unreadable_package_version(monkeypatch, tmp_path):
 
 
 def test_explicit_package_root_is_preflighted_before_spawn(monkeypatch, tmp_path):
-    package_root = _local_runtime(monkeypatch, tmp_path, "0.39.0")
+    package_root = _local_runtime(monkeypatch, tmp_path, _next_series_version())
     dist = package_root / "dist"
     dist.mkdir()
     (dist / "index.js").write_text("", encoding="utf-8")
@@ -78,11 +103,9 @@ def test_explicit_package_root_is_preflighted_before_spawn(monkeypatch, tmp_path
     monkeypatch.setattr(runtime.subprocess, "Popen", unexpected_spawn)
     client = runtime.RuntimeClient(package_root=package_root)
 
-    with pytest.raises(
-        runtime.RuntimeUnavailable,
-        match=r"requires the 0\.38\.x series",
-    ):
+    with pytest.raises(runtime.RuntimeUnavailable) as exc_info:
         client._start()
+    assert f"requires the {_supported_series_text()} series" in str(exc_info.value)
 
 
 class _FakeProcess:
@@ -165,7 +188,8 @@ rl.on("line", (line) => {
     package_root = tmp_path / "pi-magic-context"
     (package_root / "dist").mkdir(parents=True)
     (package_root / "package.json").write_text(
-        json.dumps({"version": "0.38.0"}), encoding="utf-8"
+        json.dumps({"version": runtime.tested_magic_context_version()}),
+        encoding="utf-8",
     )
     (package_root / "dist" / "index.js").write_text("", encoding="utf-8")
     monkeypatch.setattr(runtime, "runtime_script_path", lambda: script)

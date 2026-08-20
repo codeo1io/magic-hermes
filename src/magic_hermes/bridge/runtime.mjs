@@ -8,7 +8,19 @@ import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
 const CONTEXT_MARKER = "<!-- magic-hermes:context -->";
-const SUPPORTED_SERIES = [0, 38];
+const compat = JSON.parse(
+  readFileSync(new URL("../magic_context_compat.json", import.meta.url), "utf8")
+);
+const SUPPORTED_SERIES = compat.supported_series;
+const TESTED_VERSION = compat.tested_version;
+if (
+  !Array.isArray(SUPPORTED_SERIES) ||
+  SUPPORTED_SERIES.length !== 2 ||
+  !SUPPORTED_SERIES.every((part) => Number.isInteger(part) && part >= 0) ||
+  typeof TESTED_VERSION !== "string"
+) {
+  throw new Error("Invalid magic-hermes Magic Context compatibility manifest");
+}
 
 function packageCandidates() {
   const candidates = [];
@@ -57,7 +69,8 @@ function assertVersion(version) {
   ) {
     throw new Error(
       "Magic Context " + version +
-      " is unsupported; magic-hermes requires the 0.38.x series"
+      " is unsupported; magic-hermes requires the " +
+      SUPPORTED_SERIES.join(".") + ".x series (validated with " + TESTED_VERSION + ")"
     );
   }
 }

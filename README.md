@@ -11,9 +11,10 @@ algorithms.
 
 ## Status
 
-Working development preview, reviewed against
-`@cortexkit/pi-magic-context` 0.38.x. Other upstream release series are rejected
-until their private adapter surface has been reviewed.
+Working development preview. The exact upstream release exercised by this repo and
+the accepted major/minor series are recorded in
+`src/magic_hermes/magic_context_compat.json`. New Magic Context core releases are
+synchronized automatically only after the full Magic-Hermes validation gate passes.
 
 ## Architecture
 
@@ -42,7 +43,8 @@ Magic Context core.
 
 - Python 3.10 or newer
 - Node.js on `PATH`
-- `@cortexkit/pi-magic-context` 0.38.x installed in a standard Pi/OpenCode
+- `@cortexkit/pi-magic-context` from the supported series declared in
+  `src/magic_hermes/magic_context_compat.json`, installed in a standard Pi/OpenCode
   location, or `MAGIC_CONTEXT_PACKAGE_ROOT` set to its package directory
 - A Hermes build with plugin context-engine, exclusive memory-provider,
   per-turn observation, and auxiliary-task support
@@ -124,7 +126,7 @@ ContextEngine, so its compression setting remains the host permission gate for t
 selected Magic Context engine.
 
 Dreamer uses the upstream task planner, gates, schedules, backlogs, leases,
-retries, and all twelve 0.38.x task implementations. When a task needs an agent,
+retries, and the task implementations from the validated upstream release. When a task needs an agent,
 the adapter supplies a real Hermes public subagent as the host execution primitive;
 Magic Context remains authoritative for task policy and durable state. Agentic work
 that becomes due while Hermes is completely idle is picked up on the next active
@@ -134,7 +136,7 @@ boundaries.
 
 ## Verification
 
-With the official 0.38.x package installed:
+With the repo-pinned official Magic Context package installed:
 
 ```bash
 python -m pytest -q
@@ -144,7 +146,7 @@ node --check src/magic_hermes/bridge/runtime.mjs
 python -m build
 ```
 
-The suite uses temporary real Magic Context databases and the installed 0.38.x
+The suite uses temporary real Magic Context databases and the repo-pinned upstream
 runtime. It covers all five tool contracts, upstream m[0]/m[1] rendering,
 cache-safe reductions, temporal/auto-search behavior, historian scheduling and
 publication, lease renewal, rich `ctx_expand` after restart, branch/rewind
@@ -156,10 +158,16 @@ execution, and real Hermes Dreamer child delegation.
 
 ## Compatibility and failure behavior
 
-The adapter intentionally pins the reviewed 0.38.x series because it uses private
-symbols from the bundled Pi module. A missing dependency or unreviewed version is
-reported before the adapter starts. Runtime and host-LLM failures during
-compaction fail open: the current Hermes transcript is returned unchanged.
+The adapter accepts only the major/minor series recorded in
+`src/magic_hermes/magic_context_compat.json` because it uses private symbols from
+the official Pi module. The repo-level `package.json`/`package-lock.json` pin the
+exact upstream release used for validation. `.github/workflows/sync-magic-context.yml`
+checks for new core `vX.Y.Z` releases every 15 minutes (and also supports immediate
+`repository_dispatch`), waits for the matching npm publication, updates the pin and
+compatibility manifest, runs the full Python/Node/build gate, and pushes the update
+only when every check succeeds. A missing dependency or unvalidated series is
+reported before the adapter starts. Runtime and host-LLM failures during compaction
+fail open: the current Hermes transcript is returned unchanged.
 
 Detailed supported behavior and deliberate host-shaped differences are recorded
 in [docs/PARITY.md](docs/PARITY.md).

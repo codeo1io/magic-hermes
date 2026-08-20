@@ -1,6 +1,7 @@
 # Magic Hermes parity map
 
-This document compares magic-hermes with `@cortexkit/pi-magic-context` 0.38.x.
+This document compares magic-hermes with the validated `@cortexkit/pi-magic-context`
+release and series recorded in `src/magic_hermes/magic_context_compat.json`.
 The connector's rule is simple: Magic Context owns context policy and durable
 state; Hermes supplies lifecycle events, model execution, tool-capable children,
 and request presentation through public integration rails.
@@ -50,7 +51,7 @@ marked N/A rather than reimplemented.
 | Git commit indexing | Full | Upstream Git sweep owns commit/FTS indexing; semantic commit vectors follow the configured embedding provider. |
 | Stale embedding GC | Full | Upstream identity-generation sweep runs during maintenance; its grace-period semantics are preserved. |
 | `compaction.enabled=false` | Full | Upstream knowledge-only behavior: no MC context-window mutation/historian/reduction/temporal/auto-search work, while docs/profile/project-memory injection and searchable durable knowledge remain available. |
-| Pi synthetic `todowrite` | N/A | Upstream 0.38 documents this as Pi-only and says to disable it when the host has its own todo extension. Hermes uses its native todo rail; magic-hermes does not create a competing todo state machine. |
+| Pi synthetic `todowrite` | N/A | The validated upstream release documents this as Pi-only and says to disable it when the host has its own todo extension. Hermes uses its native todo rail; magic-hermes does not create a competing todo state machine. |
 | Pi/OpenCode status line / command UI | N/A | Presentation-only host UI. Functional state is available through normal Hermes tooling/logging and the runtime doctor. |
 
 ## Lifecycle and scheduling differences
@@ -117,8 +118,10 @@ that list rather than replacing it.
 
 ## Compatibility boundary
 
-magic-hermes intentionally accepts only the reviewed 0.38.x upstream series. The
-published Magic Context package does not expose a stable connector API, so the
-Node loader exposes the minimum reviewed private symbols required by the adapter.
-Python preflight and the runtime doctor reject missing or unreviewed surfaces before
-normal use.
+magic-hermes intentionally accepts only the upstream series recorded in
+`src/magic_hermes/magic_context_compat.json`. The published Magic Context package
+does not expose a stable connector API, so the Node loader exposes the minimum
+validated private symbols required by the adapter. The release-sync workflow may
+advance that series only after the full integration and build gate passes against the
+new exact npm release. Python preflight and the runtime doctor reject missing or
+unvalidated surfaces before normal use.

@@ -19,11 +19,47 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-_SUPPORTED_MAGIC_CONTEXT_SERIES = (0, 38)
 _SEMVER = re.compile(
     r"^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)"
     r"(?:-[0-9A-Za-z.-]+)?(?:[+][0-9A-Za-z.-]+)?$"
 )
+
+
+def _load_magic_context_compat() -> dict[str, Any]:
+    resource = importlib.resources.files("magic_hermes").joinpath(
+        "magic_context_compat.json"
+    )
+    payload = json.loads(resource.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("magic_context_compat.json must contain an object")
+    series = payload.get("supported_series")
+    version = payload.get("tested_version")
+    if (
+        not isinstance(series, list)
+        or len(series) != 2
+        or not all(isinstance(part, int) and part >= 0 for part in series)
+        or not isinstance(version, str)
+        or _SEMVER.fullmatch(version) is None
+    ):
+        raise RuntimeError("magic_context_compat.json is invalid")
+    return payload
+
+
+_MAGIC_CONTEXT_COMPAT = _load_magic_context_compat()
+_SUPPORTED_MAGIC_CONTEXT_SERIES = tuple(_MAGIC_CONTEXT_COMPAT["supported_series"])
+_TESTED_MAGIC_CONTEXT_VERSION = str(_MAGIC_CONTEXT_COMPAT["tested_version"])
+
+
+def supported_magic_context_series() -> tuple[int, int]:
+    """Return the upstream major/minor series validated by this build."""
+
+    return _SUPPORTED_MAGIC_CONTEXT_SERIES
+
+
+def tested_magic_context_version() -> str:
+    """Return the exact upstream release exercised by repository validation."""
+
+    return _TESTED_MAGIC_CONTEXT_VERSION
 
 
 def _package_version(package_root: Path) -> str | None:
@@ -167,9 +203,11 @@ def runtime_unavailable_reason(
     version = _package_version(resolved_root)
     if not _is_supported_version(version):
         found = version or "an unreadable version"
+        series = ".".join(map(str, _SUPPORTED_MAGIC_CONTEXT_SERIES))
         return (
             f"@cortexkit/pi-magic-context {found} is unsupported; "
-            "magic-hermes requires the 0.38.x series."
+            f"magic-hermes requires the {series}.x series "
+            f"(validated with {_TESTED_MAGIC_CONTEXT_VERSION})."
         )
     return ""
 
@@ -502,4 +540,6 @@ __all__ = [
     "find_magic_context_package",
     "runtime_available",
     "runtime_unavailable_reason",
+    "supported_magic_context_series",
+    "tested_magic_context_version",
 ]

@@ -1,0 +1,7 @@
+{
+  "package": "@cortexkit/pi-magic-context",
+  "repository": "cortexkit/magic-context",
+  "release_tag": "v0.38.0",
+  "tested_version": "0.38.0",
+  "supported_series": [0, 38]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "magic-hermes-upstream-compat",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Pinned upstream Magic Context runtime used to validate magic-hermes compatibility",
+  "dependencies": {
+    "@cortexkit/pi-magic-context": "0.38.0"
+  }
+}
