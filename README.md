@@ -60,25 +60,60 @@ runtime.
 
 ## Install
 
-Install a published wheel from the GitHub Releases page into the Python environment
-used by Hermes. This repository is currently private, so authorized users should use
-an authenticated GitHub CLI session to download the wheel first:
+### 1. Install Magic Context
+
+Magic-Hermes delegates its context-management implementation to the official Magic
+Context package, so install Magic Context first. If you already use Pi, the upstream
+setup wizard is the simplest path and places the package where Magic-Hermes can
+discover it:
 
 ```bash
-gh release download vX.Y.Z --repo codeo1io/magic-hermes \
-  --pattern 'magic_hermes-X.Y.Z-py3-none-any.whl'
-uv pip install --python /path/to/hermes/venv/bin/python --no-deps \
-  magic_hermes-X.Y.Z-py3-none-any.whl
+npx @cortexkit/magic-context@latest setup --harness pi
 ```
 
-If the repository is later made public, release notes automatically switch to a
-direct wheel URL suitable for `pip install`/`uv pip install`.
+If Magic Context is already installed for Pi or OpenCode, you can reuse that same
+installation and database. Magic-Hermes automatically searches the normal Pi and
+OpenCode package locations. For a custom installation, point directly at the package:
 
-For development, install the repository directly instead:
+```bash
+export MAGIC_CONTEXT_PACKAGE_ROOT=/path/to/node_modules/@cortexkit/pi-magic-context
+```
+
+### 2. Install Magic-Hermes into Hermes
+
+Install the latest published wheel into the Python environment used by Hermes. This
+repository is currently private, so authenticate GitHub CLI once with `gh auth login`,
+then run:
+
+```bash
+rm -rf /tmp/magic-hermes-install
+mkdir -p /tmp/magic-hermes-install
+
+gh release download --repo codeo1io/magic-hermes \
+  --pattern 'magic_hermes-*-py3-none-any.whl' \
+  --dir /tmp/magic-hermes-install
+
+uv pip install --python /path/to/hermes/venv/bin/python --no-deps \
+  /tmp/magic-hermes-install/magic_hermes-*-py3-none-any.whl
+```
+
+If `uv` is not installed, use the Hermes environment's `pip` instead:
+
+```bash
+/path/to/hermes/venv/bin/python -m pip install --no-deps \
+  /tmp/magic-hermes-install/magic_hermes-*-py3-none-any.whl
+```
+
+When this repository becomes public, the release wheel can also be installed directly
+from its GitHub Release URL without the authenticated download step.
+
+For development from a local checkout, install the repository directly instead:
 
 ```bash
 uv pip install --python /path/to/hermes/venv/bin/python --no-deps -e .
 ```
+
+### 3. Enable Magic-Hermes
 
 Enable the plugin, context engine, and exclusive memory provider in Hermes:
 
@@ -107,7 +142,23 @@ platform_toolsets:
 ```
 
 Keep historian, memory, embedding, and dreamer policy in the shared Magic Context
-JSONC file. magic-hermes does not introduce a second configuration source.
+JSONC file. Magic-Hermes does not introduce a second configuration source.
+
+### 4. Verify the installation
+
+Confirm the package is installed in the Hermes environment and that Magic-Hermes can
+find a supported Magic Context runtime:
+
+```bash
+/path/to/hermes/venv/bin/python -c \
+  'import magic_hermes; print("magic-hermes", magic_hermes.__version__)'
+
+/path/to/hermes/venv/bin/python -c \
+  'from magic_hermes.runtime import runtime_available, runtime_unavailable_reason; print("Magic Context runtime: OK" if runtime_available() else runtime_unavailable_reason())'
+```
+
+Restart Hermes after changing its plugin configuration. Once loaded, the `ctx_search`,
+`ctx_expand`, `ctx_reduce`, `ctx_note`, and `ctx_memory` tools should be available.
 
 ## Exposed tools
 
