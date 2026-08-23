@@ -1312,9 +1312,10 @@ def test_upstream_config_resolver_merges_user_and_project_config(monkeypatch, tm
     # cloned repository cannot route private history to another model/provider.
     assert bound["config"]["historian_model"] == "openai/gpt-user"
     assert bound["config"]["historian_two_pass"] is True
-    assert any(
-        "Ignoring historian.model from project config" in warning
-        for warning in bound["config_warnings"]
+    # 0.39.0 still enforces user-only historian model selection, but no longer
+    # emits a warning for an ignored project-level historian.model override.
+    assert not any(
+        "historian.model" in warning for warning in bound["config_warnings"]
     )
 
 
