@@ -4,6 +4,6 @@
   "version": "0.0.0",
   "description": "Pinned upstream Magic Context runtime used to validate magic-hermes compatibility",
   "dependencies": {
-    "@cortexkit/pi-magic-context": "0.39.0"
+    "@cortexkit/pi-magic-context": "0.40.0"
   }
 }
