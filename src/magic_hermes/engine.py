@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import copy
 import json
@@ -141,10 +142,8 @@ class MagicContextEngine(_ContextEngineBase):
     def __del__(self) -> None:
         """Best-effort cleanup when a host lifecycle omits explicit ``close()``."""
 
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:  # pragma: no cover - destructor must never escape
-            pass
 
     def _bind(self) -> bool:
         identity = (self._session_id, self._project_root)

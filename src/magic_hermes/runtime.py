@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import importlib.resources
 import json
@@ -541,10 +542,8 @@ class RuntimeClient:
         down module state before object finalization.
         """
 
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:  # pragma: no cover - destructor must never escape
-            pass
 
 
 __all__ = [
