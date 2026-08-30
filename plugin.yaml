@@ -1,5 +1,5 @@
 name: magic-hermes
-version: 0.2.4
+version: 0.2.5
 description: "Hermes connector for the official Magic Context runtime, shared store, memory, history, and ctx_* tools."
 manifest_version: 2
 api_version: 1
