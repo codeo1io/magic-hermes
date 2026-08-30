@@ -61,6 +61,35 @@ def test_engine_deepcopy_creates_disconnected_client():
     assert cloned._project_root == engine._project_root
 
 
+def test_engine_close_releases_private_runtime_and_session_route():
+    routed = []
+    client = FakeClient()
+    engine = MagicContextEngine(
+        client=client,
+        project_root="/tmp",
+        session_id="session-cleanup",
+        session_route=lambda session_id, project_root: routed.append(
+            (session_id, project_root)
+        ),
+    )
+
+    engine.close()
+
+    assert client.closed is True
+    assert routed == [("session-cleanup", None)]
+    assert engine._bound_identity is None
+
+
+def test_engine_deepcopy_cleanup_is_independent_per_session():
+    engine = MagicContextEngine(client=FakeClient(), project_root="/tmp")
+    cloned = copy.deepcopy(engine)
+
+    cloned.close()
+
+    assert cloned._client.closed is True
+    assert engine._client.closed is False
+
+
 def test_engine_deepcopy_resolves_live_host_root_before_schema_bind(
     monkeypatch, tmp_path
 ):

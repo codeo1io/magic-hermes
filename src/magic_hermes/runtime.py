@@ -531,6 +531,21 @@ class RuntimeClient:
     def __exit__(self, *_args: object) -> None:
         self.close()
 
+    def __del__(self) -> None:
+        """Best-effort safety net for host-owned clients that are not explicitly closed.
+
+        Hermes deep-copies context engines per session. A missed host teardown must not
+        leave the private Node sidecar alive for the lifetime of the gateway process.
+        Explicit ``close()`` remains the primary lifecycle contract; this finalizer is
+        deliberately exception-safe because interpreter shutdown may partially tear
+        down module state before object finalization.
+        """
+
+        try:
+            self.close()
+        except Exception:  # pragma: no cover - destructor must never escape
+            pass
+
 
 __all__ = [
     "RuntimeClient",

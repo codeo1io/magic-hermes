@@ -120,6 +120,32 @@ class MagicContextEngine(_ContextEngineBase):
         copied._provider = self._provider
         return copied
 
+    def close(self) -> None:
+        """Release this session engine's private Magic Context runtime.
+
+        Context engines are deep-copied by Hermes for individual sessions, so each
+        copy owns a distinct RuntimeClient/Node sidecar. Teardown must release both
+        the host routing entry and that sidecar rather than leaving it attached to
+        the long-lived gateway service.
+        """
+
+        route = self._session_route
+        if route is not None:
+            try:
+                route(self._session_id, None)
+            except Exception:
+                log.debug("Magic Context session-route cleanup failed", exc_info=True)
+        self._client.close()
+        self._bound_identity = None
+
+    def __del__(self) -> None:
+        """Best-effort cleanup when a host lifecycle omits explicit ``close()``."""
+
+        try:
+            self.close()
+        except Exception:  # pragma: no cover - destructor must never escape
+            pass
+
     def _bind(self) -> bool:
         identity = (self._session_id, self._project_root)
         if self._bound_identity == identity:

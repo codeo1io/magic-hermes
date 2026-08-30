@@ -108,6 +108,16 @@ def test_explicit_package_root_is_preflighted_before_spawn(monkeypatch, tmp_path
     assert f"requires the {_supported_series_text()} series" in str(exc_info.value)
 
 
+def test_runtime_finalizer_closes_unreleased_client(monkeypatch):
+    client = runtime.RuntimeClient()
+    closed = []
+    monkeypatch.setattr(client, "close", lambda: closed.append(True))
+
+    client.__del__()
+
+    assert closed == [True]
+
+
 class _FakeProcess:
     def __init__(self, response_line: str):
         self.stdin = io.StringIO()
