@@ -156,59 +156,94 @@ def find_magic_context_package() -> Path | None:
     return None
 
 
+def _resolve_package_root(
+    package_root: str | os.PathLike[str] | None,
+) -> Path | None:
+    """Resolve the upstream package root, or None when it is unusable."""
+
+    if package_root is None:
+        return find_magic_context_package()
+    resolved_root = Path(package_root).expanduser().resolve(strict=False)
+    if not (
+        (resolved_root / "package.json").is_file()
+        and (resolved_root / "dist" / "index.js").is_file()
+    ):
+        return None
+    return resolved_root
+
+
+def magic_context_version_notice(
+    package_root: str | os.PathLike[str] | None = None,
+) -> str:
+    """Return an informational note when the upstream version is unvalidated.
+
+    Version information never gates availability: the compatibility contract
+    is enforced by the required runtime symbols, not by the semver series.
+    Returns an empty string when the installed version matches the validated
+    series (or when no package is installed — availability reporting owns that
+    case).
+    """
+
+    resolved_root = _resolve_package_root(package_root)
+    if resolved_root is None:
+        return ""
+    version = _package_version(resolved_root)
+    if version is not None and _is_supported_version(version):
+        return ""
+    found = version or "an unreadable version"
+    series = ".".join(map(str, _SUPPORTED_MAGIC_CONTEXT_SERIES))
+    return (
+        f"@cortexkit/pi-magic-context {found} is outside the {series}.x series "
+        f"validated with {_TESTED_MAGIC_CONTEXT_VERSION}; proceeding without "
+        "version restriction (compatibility is enforced by required runtime "
+        "symbols)"
+    )
+
+
 def runtime_available(
     package_root: str | os.PathLike[str] | None = None,
 ) -> bool:
     """Return whether Node and the requested upstream package are available."""
 
-    if package_root is None:
-        resolved_root = find_magic_context_package()
-    else:
-        resolved_root = Path(package_root).expanduser().resolve(strict=False)
-        if not (
-            (resolved_root / "package.json").is_file()
-            and (resolved_root / "dist" / "index.js").is_file()
-        ):
-            resolved_root = None
+    resolved_root = _resolve_package_root(package_root)
     return (
         shutil.which("node") is not None
         and runtime_script_path().is_file()
         and resolved_root is not None
-        and _is_supported_version(_package_version(resolved_root))
+        and _package_version(resolved_root) is not None
     )
 
 
 def runtime_unavailable_reason(
     package_root: str | os.PathLike[str] | None = None,
 ) -> str:
-    """Return an actionable local-only availability diagnostic."""
+    """Return an actionable local-only availability diagnostic.
+
+    Version mismatches are informational (see magic_context_version_notice)
+    and never make the runtime unavailable. Only genuinely broken
+    prerequisites — missing Node, missing sidecar, missing/unreadable package
+    — are reported here.
+    """
 
     if shutil.which("node") is None:
         return "Node.js is not installed or not on PATH."
     if not runtime_script_path().is_file():
         return "The magic-hermes Node runtime is missing from the installation."
-    if package_root is None:
-        resolved_root = find_magic_context_package()
-        if resolved_root is None:
+    resolved_root = _resolve_package_root(package_root)
+    if resolved_root is None:
+        if package_root is None:
             return (
                 "@cortexkit/pi-magic-context is not installed. Install the Pi Magic "
                 "Context package or set MAGIC_CONTEXT_PACKAGE_ROOT."
             )
-    else:
-        resolved_root = Path(package_root).expanduser().resolve(strict=False)
-        if not (
-            (resolved_root / "package.json").is_file()
-            and (resolved_root / "dist" / "index.js").is_file()
-        ):
-            return f"@cortexkit/pi-magic-context was not found at {resolved_root}."
-    version = _package_version(resolved_root)
-    if not _is_supported_version(version):
-        found = version or "an unreadable version"
-        series = ".".join(map(str, _SUPPORTED_MAGIC_CONTEXT_SERIES))
         return (
-            f"@cortexkit/pi-magic-context {found} is unsupported; "
-            f"magic-hermes requires the {series}.x series "
-            f"(validated with {_TESTED_MAGIC_CONTEXT_VERSION})."
+            "@cortexkit/pi-magic-context was not found at "
+            f"{Path(package_root).expanduser().resolve(strict=False)}."
+        )
+    if _package_version(resolved_root) is None:
+        return (
+            f"@cortexkit/pi-magic-context at {resolved_root} has an unreadable "
+            "package.json version."
         )
     return ""
 

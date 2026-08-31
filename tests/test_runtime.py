@@ -62,21 +62,24 @@ def test_runtime_accepts_supported_prerelease(monkeypatch, tmp_path):
     assert runtime.runtime_available() is True
 
 
-def test_runtime_rejects_unreviewed_upstream_series(monkeypatch, tmp_path):
+def test_runtime_accepts_version_outside_validated_series(monkeypatch, tmp_path):
     _local_runtime(monkeypatch, tmp_path, _next_series_version())
 
-    assert runtime.runtime_available() is False
-    reason = runtime.runtime_unavailable_reason()
-    assert f"requires the {_supported_series_text()} series" in reason
+    assert runtime.runtime_available() is True
+    assert runtime.runtime_unavailable_reason() == ""
+    notice = runtime.magic_context_version_notice()
+    assert _next_series_version() in notice
+    assert "validated" in notice
 
 
-def test_runtime_rejects_malformed_supported_series(monkeypatch, tmp_path):
+def test_runtime_notice_is_informational_for_malformed_version(monkeypatch, tmp_path):
     major, minor = runtime.supported_magic_context_series()
     _local_runtime(monkeypatch, tmp_path, f"{major}.{minor}.bad")
 
-    assert runtime.runtime_available() is False
-    reason = runtime.runtime_unavailable_reason()
-    assert f"requires the {_supported_series_text()} series" in reason
+    assert runtime.runtime_available() is True
+    assert runtime.runtime_unavailable_reason() == ""
+    assert f"{major}.{minor}.bad" in runtime.magic_context_version_notice()
+    assert "outside the" in runtime.magic_context_version_notice()
 
 
 def test_runtime_rejects_unreadable_package_version(monkeypatch, tmp_path):
@@ -84,28 +87,52 @@ def test_runtime_rejects_unreadable_package_version(monkeypatch, tmp_path):
         monkeypatch, tmp_path, runtime.tested_magic_context_version()
     )
     (package_root / "package.json").write_text("{", encoding="utf-8")
+    (package_root / "dist").mkdir()
+    (package_root / "dist" / "index.js").write_text("", encoding="utf-8")
 
     assert runtime.runtime_available() is False
-    assert "unreadable version" in runtime.runtime_unavailable_reason()
+    assert "unreadable" in runtime.runtime_unavailable_reason()
 
 
 def test_explicit_package_root_is_preflighted_before_spawn(monkeypatch, tmp_path):
+    missing_root = tmp_path / "no-such-package"
+    monkeypatch.setattr(runtime.shutil, "which", lambda _name: "/usr/bin/node")
+    monkeypatch.setattr(
+        runtime, "runtime_script_path", lambda: tmp_path / "runtime.mjs"
+    )
+    (tmp_path / "runtime.mjs").write_text("", encoding="utf-8")
+
+    def unexpected_spawn(*_args, **_kwargs):
+        raise AssertionError(
+            "broken package root must be rejected before spawning Node"
+        )
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", unexpected_spawn)
+    client = runtime.RuntimeClient(package_root=missing_root)
+
+    with pytest.raises(runtime.RuntimeUnavailable) as exc_info:
+        client._start()
+    assert "was not found at" in str(exc_info.value)
+
+
+def test_version_mismatch_proceeds_to_spawn(monkeypatch, tmp_path):
     package_root = _local_runtime(monkeypatch, tmp_path, _next_series_version())
     dist = package_root / "dist"
     dist.mkdir()
     (dist / "index.js").write_text("", encoding="utf-8")
 
-    def unexpected_spawn(*_args, **_kwargs):
-        raise AssertionError(
-            "unsupported package must be rejected before spawning Node"
-        )
+    spawned = []
 
-    monkeypatch.setattr(runtime.subprocess, "Popen", unexpected_spawn)
+    def record_spawn(*args, **_kwargs):
+        spawned.append(args)
+        raise RuntimeError("record_spawn sentinel")
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", record_spawn)
     client = runtime.RuntimeClient(package_root=package_root)
 
-    with pytest.raises(runtime.RuntimeUnavailable) as exc_info:
+    with pytest.raises(RuntimeError, match="record_spawn"):
         client._start()
-    assert f"requires the {_supported_series_text()} series" in str(exc_info.value)
+    assert len(spawned) == 1
 
 
 def test_runtime_finalizer_closes_unreleased_client(monkeypatch):

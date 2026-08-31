@@ -112,7 +112,7 @@ active parent around the entire `run_conversation()` call.
 | User+project config merge | `loadPiConfig` / upstream security merge | runtime `bind` | config files | fail closed on invalid required config | conflicting user/project fixture resolves exactly upstream |
 | Project identity | `resolveProjectIdentityForSession` | session start/switch | MC project registry | fail closed when identity unavailable | cwd/project switching E2E |
 | Embedding registration | `ensureProjectRegisteredFromPiDirectory` | bind/maintenance | MC SQLite | preserve last-known-good per upstream | config mutation reload test |
-| Version compatibility | adapter package version + required-symbol capability set | runtime preflight | none | fail closed with actionable diagnostic | supported 0.38.x passes; missing symbol/other series fails before mutation |
+| Version compatibility | adapter package version + required-symbol capability set | runtime preflight | none | informational version notice; fail closed only on missing required symbols | supported series passes silently; other series proceeds with a logged notice; missing symbol fails before mutation |
 | Config source diagnostics | upstream `loadedFromPaths`/warnings | status/doctor | none | diagnostic only | reports user/project contributors without secrets |
 
 ### B. Raw transcript / identity / restart

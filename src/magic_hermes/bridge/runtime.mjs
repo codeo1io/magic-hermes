@@ -58,7 +58,7 @@ function locatePackage() {
   );
 }
 
-function assertVersion(version) {
+function versionNotice(version) {
   const match = String(version).match(
     /^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:[+][0-9A-Za-z.-]+)?$/
   );
@@ -67,17 +67,23 @@ function assertVersion(version) {
     Number(match[1]) !== SUPPORTED_SERIES[0] ||
     Number(match[2]) !== SUPPORTED_SERIES[1]
   ) {
-    throw new Error(
+    return (
       "Magic Context " + version +
-      " is unsupported; magic-hermes requires the " +
-      SUPPORTED_SERIES.join(".") + ".x series (validated with " + TESTED_VERSION + ")"
+      " is outside the " + SUPPORTED_SERIES.join(".") +
+      ".x series validated with " + TESTED_VERSION +
+      "; proceeding without version restriction " +
+      "(compatibility is enforced by required runtime symbols)"
     );
   }
+  return "";
 }
 
 const packageRoot = locatePackage();
 const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
-assertVersion(packageJson.version);
+const versionWarning = versionNotice(packageJson.version);
+if (versionWarning) {
+  process.stderr.write("magic-hermes: " + versionWarning + "\n");
+}
 const adapterPath = join(packageRoot, "dist", "index.js");
 process.env.MAGIC_HERMES_ADAPTER_URL = pathToFileURL(adapterPath).href;
 register("./loader.mjs", import.meta.url);
