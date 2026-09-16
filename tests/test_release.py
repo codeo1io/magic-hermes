@@ -72,18 +72,41 @@ def test_release_rejects_unrelated_dirty_paths(monkeypatch):
         release.ensure_clean_or_release_version("0.2.1")
 
 
-def test_install_notes_use_authenticated_download_for_private_repo():
-    notes = release.install_notes("0.2.0", "v0.2.0", "PRIVATE")
+def test_release_notes_use_authenticated_download_for_private_repo(monkeypatch):
+    monkeypatch.setattr(release, "git_output", lambda *args: "")
+    monkeypatch.setattr(release, "changes_bullets", lambda tag: ["- fix: something"])
+
+    notes = release.release_notes("0.2.0", "v0.2.0", "PRIVATE")
+
     assert "gh release download v0.2.0" in notes
     assert "pip install magic_hermes-0.2.0-py3-none-any.whl" in notes
+    assert "## Changes" in notes
+    assert "- fix: something" in notes
 
 
-def test_install_notes_use_direct_url_for_public_repo():
-    notes = release.install_notes("0.2.0", "v0.2.0", "PUBLIC")
+def test_release_notes_use_direct_url_for_public_repo(monkeypatch):
+    monkeypatch.setattr(release, "git_output", lambda *args: "")
+    monkeypatch.setattr(release, "changes_bullets", lambda tag: [])
+
+    notes = release.release_notes("0.2.0", "v0.2.0", "PUBLIC")
+
     assert (
         "pip install https://github.com/codeo1io/magic-hermes/releases/download/"
         in notes
     )
+    assert "## Changes" not in notes
+
+
+def test_release_notes_exclude_release_and_merge_commits(monkeypatch):
+    monkeypatch.setattr(
+        release,
+        "git_output",
+        lambda *args: "release: v0.2.1\nfix: real change\n",
+    )
+
+    bullets = release.changes_bullets("v0.2.1")
+
+    assert bullets == ["- fix: real change"]
 
 
 def test_replace_once_requires_matching_version_line(tmp_path):
