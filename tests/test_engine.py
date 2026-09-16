@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
 
 from magic_hermes.engine import MagicContextEngine
 
@@ -98,6 +99,14 @@ def test_engine_deepcopy_resolves_live_host_root_before_schema_bind(
     discovery_root.mkdir()
     live_root.mkdir()
 
+    # The engine resolves Hermes' logical cwd via agent.runtime_cwd when it is
+    # importable (e.g. the gateway venv), which ignores monkeypatch.chdir.
+    # Patch the resolver to track the process cwd so both discovery-time and
+    # deepcopy-time resolution stay observable.
+    monkeypatch.setattr(
+        "magic_hermes.engine._resolve_host_project_root",
+        lambda: str(Path.cwd().resolve()),
+    )
     monkeypatch.chdir(discovery_root)
     engine = MagicContextEngine(client=FakeClient({"bind": bind_result()}))
     assert engine._project_root == str(discovery_root.resolve())

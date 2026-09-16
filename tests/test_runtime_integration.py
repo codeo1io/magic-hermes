@@ -5,6 +5,7 @@ import re
 import sqlite3
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -927,8 +928,10 @@ def test_historian_candidates_flow_through_user_memory_and_primer_dreamer(tmp_pa
                 timeout=60,
             )
             # Primer promotion additionally requires a seven-day observation
-            # span, independent of its candidate-count threshold.
-            base_ms = 1_780_000_000_000 + session_index * 8 * 86_400_000
+            # span, independent of its candidate-count threshold. Anchored to
+            # now: upstream 0.42 prunes primer candidates older than a 90-day
+            # TTL before clustering, so fixed epoch timestamps go stale.
+            base_ms = int(time.time() * 1000) - (2 - session_index) * 8 * 86_400_000
             messages = [{"role": "system", "content": "System."}]
             for index in range(12):
                 messages.append(

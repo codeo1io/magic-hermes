@@ -330,6 +330,14 @@ function truncateMessageHistoryFrom(sessionId, floorOrdinal) {
         "DELETE FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) >= ?"
       ).run(sessionId, floor);
     }
+    if (tableExists("message_fts_rowid_map")) {
+      // Upstream 0.42 re-index skips a message when a rowid-map entry still
+      // exists for it (isMessageAlreadyIndexed joins source with the map), so
+      // a truncated range must clear the map too or the tail keeps stale bytes.
+      db.prepare(
+        "DELETE FROM message_fts_rowid_map WHERE session_id = ? AND message_ordinal >= ?"
+      ).run(sessionId, floor);
+    }
     if (tableExists("message_history_source")) {
       db.prepare(
         "DELETE FROM message_history_source WHERE session_id = ? AND message_ordinal >= ?"
@@ -442,6 +450,7 @@ function resetSessionDerivedState(session) {
     "embedding_measurement_corpus",
     "pending_session_cleanup",
     "message_history_fts",
+    "message_fts_rowid_map",
     "message_history_source",
     "message_history_index"
   ];
@@ -816,6 +825,33 @@ function fromPiMessage(original, message) {
   return output;
 }
 
+// Upstream 0.42.x: "protected_tags" is deprecated and stripped at config load,
+// so session.config.protected_tags is undefined. Protection is token-based:
+// the floor is the configured protected_tokens override (>= 4000) or the
+// derived default clamp(round(0.05 * usableSoft), min(16k, 8% usable), 64k),
+// and the protected set is the newest tool-tag window covering that floor
+// (message tags are never protected by it). Mirrors
+// deriveDefaultProtectedTokens + getProtectionWindowForSession + the
+// applyPendingOperations call inside upstream runPipeline.
+function deriveProtectedFloor(session) {
+  const override = Number(session.config.protected_tokens);
+  if (Number.isInteger(override) && override >= 4000 && override <= 1_000_000) {
+    return override;
+  }
+  const usableSoft = Number(
+    session.contextLimit || session.lastUsage?.inputTokens || 200_000
+  );
+  const soft = usableSoft > 0 ? usableSoft : 200_000;
+  const low = Math.min(16_000, Math.round(0.08 * soft));
+  return Math.max(low, Math.min(64_000, Math.round(0.05 * soft)));
+}
+
+function protectedTagNumberSetForApply(session) {
+  const floor = deriveProtectedFloor(session);
+  const window = mc("getProtectionWindowForSession")(db, session.id, floor);
+  return window.tagNumberSet.tagNumbers;
+}
+
 function applyMagicContextTransform(session, messages, options = {}) {
   const ingested = options.ingested || ingest(session, messages, true);
   if (ingested.assigned.length === 0) {
@@ -851,12 +887,13 @@ function applyMagicContextTransform(session, messages, options = {}) {
     decision === "execute" &&
     pending.length > 0
   ) {
+    const protectedSet = protectedTagNumberSetForApply(session);
     mutated = Boolean(
       mc("applyPendingOperations")(
         session.id,
         db,
         tagged.targets,
-        Number(session.config.protected_tags || 20)
+        protectedSet
       )
     ) || mutated;
     pending = mc("getPendingOps")(db, session.id);
@@ -1065,7 +1102,12 @@ async function captureTools(session) {
     allowDreamerActions: true,
     dreamerEnabled: mc("isDreamerRunnable")(config),
     todowriteEnabled: false,
-    compactionOff: !Boolean(config.compaction?.enabled)
+    compactionOff: !Boolean(config.compaction?.enabled),
+    // Without this, ctx_reduce defaults to 20 protected tags; sessions with
+    // fewer than 20 active tags would defer every drop forever (the pending
+    // op is queued but applyPendingOperations always skips it as protected).
+    protectedTags: Number(config.protected_tags || 20),
+    resolveProtectedTags: () => Number(config.protected_tags || 20)
   });
 
   session.tools = tools;

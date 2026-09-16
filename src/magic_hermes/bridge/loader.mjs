@@ -58,6 +58,7 @@ const EXPOSED = [
   "tagTranscript",
   "applyPendingOperations",
   "applyFlushedStatuses",
+  "getProtectionWindowForSession",
   "getActiveTagsBySession",
   "getPendingOps",
   "acquireCompartmentLease",
@@ -108,11 +109,16 @@ export async function load(url, context, nextLoad) {
   }
 
   let source = String(result.source);
-  const piHarness = 'setHarness("pi");';
-  if (!source.includes(piHarness)) {
+  const piHarnessForms = [
+    'setHarness("pi");',
+    "setHarness('pi');",
+    "setHarness(PI_HARNESS_KIND);",
+  ];
+  const matchedForm = piHarnessForms.find((form) => source.includes(form));
+  if (matchedForm === undefined) {
     throw new Error("Unsupported Magic Context adapter: Pi harness initializer not found");
   }
-  source = source.replace(piHarness, 'setHarness("hermes");');
+  source = source.replace(matchedForm, 'setHarness("hermes");');
 
   const suffix = "\nexport { " + EXPOSED.map(
     (name) => name + " as __mh_" + name
