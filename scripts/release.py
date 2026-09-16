@@ -280,7 +280,37 @@ def commit_and_tag(version: str, tag: str, default_branch: str) -> None:
     run("git", "push", "origin", tag)
 
 
-def install_notes(version: str, tag: str, visibility: str) -> str:
+def previous_tag(tag: str) -> str | None:
+    tags = git_output("tag", "-l", "--sort=v:refname").splitlines()
+    others = [item for item in tags if item != tag]
+    return others[-1] if others else None
+
+
+def magic_context_tested_version() -> str | None:
+    match = re.search(
+        r'"tested_version":\s*"([^"]+)"',
+        (ROOT / "src" / "magic_hermes" / "magic_context_compat.json").read_text(
+            encoding="utf-8"
+        ),
+    )
+    return match.group(1) if match else None
+
+
+def changes_bullets(tag: str) -> list[str]:
+    previous = previous_tag(tag)
+    args = ["log", "--format=%s"]
+    if previous:
+        args.append(f"{previous}..HEAD")
+    bullets = []
+    for subject in git_output(*args).splitlines():
+        stripped = subject.strip()
+        if not stripped or stripped.startswith("release: "):
+            continue
+        bullets.append(f"- {stripped}")
+    return bullets
+
+
+def release_notes(version: str, tag: str, visibility: str) -> str:
     wheel = f"magic_hermes-{version}-py3-none-any.whl"
     if visibility.upper() == "PUBLIC":
         install_command = (
@@ -293,11 +323,20 @@ def install_notes(version: str, tag: str, visibility: str) -> str:
             f"--pattern '{wheel}'\n"
             f"pip install {wheel}"
         )
-    return (
-        f"## Install\n\n```bash\n{install_command}\n```\n\n"
-        "Magic Context must also be installed in a supported Pi/OpenCode location "
-        "or exposed with `MAGIC_CONTEXT_PACKAGE_ROOT`.\n"
-    )
+
+    sections = []
+    bullets = changes_bullets(tag)
+    if bullets:
+        sections.append("## Changes\n\n" + "\n".join(bullets))
+    tested = magic_context_tested_version()
+    if tested:
+        sections.append(
+            f"Tested against Magic Context core `v{tested}` "
+            "(`package.json` pin; runtime discovery still walks Pi/OpenCode "
+            "locations or `MAGIC_CONTEXT_PACKAGE_ROOT`)."
+        )
+    sections.append(f"## Install\n\n```bash\n{install_command}\n```")
+    return "\n\n".join(sections) + "\n"
 
 
 def publish_release(
@@ -319,7 +358,7 @@ def publish_release(
         ".visibility",
         capture=True,
     )
-    notes = install_notes(version, tag, visibility)
+    notes = release_notes(version, tag, visibility)
     run(
         "gh",
         "release",
