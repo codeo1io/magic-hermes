@@ -52,6 +52,38 @@ class FakeContext:
         return "tool-registered"
 
 
+class FakeRuntimeClient:
+    """Stands in for RuntimeClient so unit tests never spawn the real Node
+    sidecar.
+
+    ``plugin.load`` reaches ``_register_dreamer_tools``, which performs a
+    real ``dreamer_tool_schemas`` handshake against the Node sidecar with a
+    hard 30s deadline. Under CI host load that deadline expires
+    (RuntimeProtocolError) and the release gate fails for reasons unrelated
+    to the Python behavior under test. These tests assert Python-side
+    registration only; the real handshake is covered by
+    tests/test_runtime_integration.py."""
+
+    def __init__(self, callback_handler=None, timeout=None):
+        self.callback_handler = callback_handler
+        self.timeout = timeout
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def call(self, method, params=None, timeout=None):
+        assert method == "dreamer_tool_schemas", method
+        return [
+            {
+                "name": "ctx_memory",
+                "description": "Magic Context memory",
+            }
+        ]
+
+
 def test_zai_model_ref_uses_hermes_active_provider_shape():
     assert plugin._model_for_hermes("zai/glm-4.7") == "glm-4.7"
     assert plugin._model_for_hermes("vendor/model") == "vendor/model"
@@ -61,6 +93,7 @@ def test_plugin_registers_project_agnostic_auxiliary_slots(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(plugin, "runtime_available", lambda: True)
+    monkeypatch.setattr(plugin, "RuntimeClient", FakeRuntimeClient)
     context = FakeContext()
 
     result = plugin.load(context, project_root=tmp_path, session_id="plugin-test")
@@ -127,6 +160,7 @@ def test_registry_ctx_bridge_rejects_non_dreamer_root_session(tmp_path):
 
 def test_plugin_does_not_read_magic_context_config_in_python(monkeypatch, tmp_path):
     monkeypatch.setattr(plugin, "runtime_available", lambda: True)
+    monkeypatch.setattr(plugin, "RuntimeClient", FakeRuntimeClient)
     context = FakeContext()
 
     result = plugin.load(context, project_root=tmp_path)
