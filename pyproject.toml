@@ -10,11 +10,14 @@ dependencies = []
 [project.entry-points."hermes_agent.plugins"]
 magic-hermes = "magic_hermes.plugin"
 
+[project.scripts]
+magic-hermes = "magic_hermes.cli:main"
+
 [project.entry-points."hermes_agent.memory_providers"]
 magic_context = "magic_hermes.memory_provider:MagicContextMemoryProvider"
 
 [project.optional-dependencies]
-dev = ["build", "pytest", "ruff"]
+dev = ["build", "pytest", "ruff", "ruamel.yaml"]
 
 [build-system]
 requires = ["hatchling"]

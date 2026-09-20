@@ -103,6 +103,15 @@ def runtime_script_path() -> Path:
     return Path(str(resource))
 
 
+def xdg_data_home() -> Path:
+    """Return the XDG data home (where `magic-hermes install` manages npm)."""
+
+    configured = os.environ.get("XDG_DATA_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local" / "share"
+
+
 def magic_context_package_candidates() -> list[Path]:
     """Return local upstream package locations without probing the network."""
 
@@ -114,6 +123,14 @@ def magic_context_package_candidates() -> list[Path]:
     home = Path.home()
     candidates.extend(
         [
+            # Hermes-owned root managed by `magic-hermes install` — checked
+            # first so the version this plugin validated wins over copies
+            # owned by other tools' homes.
+            xdg_data_home()
+            / "magic-hermes"
+            / "node_modules"
+            / "@cortexkit"
+            / "pi-magic-context",
             home
             / ".pi"
             / "agent"

@@ -28,7 +28,13 @@ function packageCandidates() {
     candidates.push(process.env.MAGIC_CONTEXT_PACKAGE_ROOT);
   }
   const home = homedir();
+  const dataHome = process.env.XDG_DATA_HOME
+    ? resolve(process.env.XDG_DATA_HOME)
+    : join(home, ".local", "share");
   candidates.push(
+    // Hermes-owned root managed by `magic-hermes install` — checked before
+    // foreign homes so the validated version wins.
+    join(dataHome, "magic-hermes", "node_modules", "@cortexkit", "pi-magic-context"),
     join(home, ".pi", "agent", "npm", "node_modules", "@cortexkit", "pi-magic-context"),
     join(home, ".config", "opencode", "node_modules", "@cortexkit", "pi-magic-context")
   );
