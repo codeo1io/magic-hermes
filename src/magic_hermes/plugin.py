@@ -422,7 +422,20 @@ def load(
     )
     completion = _completion_callback(ctx)
     dreamer_bridge = _DreamerHostBridge(ctx)
-    _register_dreamer_tools(ctx, dreamer_bridge)
+    # Dreamer tools are an auxiliary surface; the context engine is the
+    # plugin's core value. A runtime failure while fetching Dreamer tool
+    # schemas (e.g. a schema-fence refusal from a newer shared database)
+    # must degrade the plugin to "engine without Dreamer tools", never
+    # abort registration entirely — that silently reverts every session to
+    # the built-in compressor while the log shows only a generic load error.
+    try:
+        _register_dreamer_tools(ctx, dreamer_bridge)
+    except Exception:
+        log.warning(
+            "Magic Context Dreamer tools unavailable; context engine "
+            "registered without them",
+            exc_info=True,
+        )
     engine = MagicContextEngine(
         client=RuntimeClient(callback_handler=dreamer_bridge.handle),
         complete=completion,

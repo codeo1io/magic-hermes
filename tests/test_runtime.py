@@ -257,3 +257,44 @@ rl.on("line", (line) => {
 
     assert result["abort"] == {"accepted": True, "parent": "bound-parent"}
     assert result["slow"] == {"saw_abort": True, "parent": "bound-parent"}
+
+
+def test_runtime_exit_error_includes_stderr_tail(monkeypatch):
+    client = runtime.RuntimeClient()
+    process = _FakeProcess("")
+    # Simulate stderr captured by the drain thread before the exit error.
+    client._stderr_tail.extend(
+        [
+            "[magic-context] storage fatal: refusing to open context.db; "
+            "upstream migration lane v85 is newer (max v84)",
+        ]
+    )
+    monkeypatch.setattr(client, "_ensure_process", lambda: process)
+    monkeypatch.setattr(
+        runtime.select,
+        "select",
+        lambda readable, _writable, _errors, _timeout: (readable, [], []),
+    )
+
+    with pytest.raises(
+        runtime.RuntimeProtocolError, match=r"migration lane v85"
+    ):
+        client.call("bind")
+
+
+def test_drain_stderr_escalates_storage_fatal_to_warning(caplog):
+    import io
+    import logging
+
+    client = runtime.RuntimeClient()
+    process = _FakeProcess("")
+    process.stderr = io.StringIO(
+        "[magic-context] storage fatal: refusing to open context.db\n"
+        "noise line\n"
+    )
+    with caplog.at_level(logging.DEBUG, logger="magic_hermes.runtime"):
+        client._drain_stderr(process)
+
+    records = [r for r in caplog.records if "Magic Context runtime" in r.message]
+    assert any(r.levelname == "WARNING" for r in records)
+    assert any(r.levelname == "DEBUG" for r in records)

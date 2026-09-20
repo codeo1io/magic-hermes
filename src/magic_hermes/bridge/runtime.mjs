@@ -2,7 +2,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { register } from "node:module";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
@@ -102,7 +102,37 @@ const db = process.env.MAGIC_CONTEXT_DB_PATH
   ? mc("openDatabase")({ dbPath: process.env.MAGIC_CONTEXT_DB_PATH })
   : mc("openDatabase")();
 if (!db) {
-  throw new Error("Magic Context refused to open its shared context database");
+  throw new Error(
+    "Magic Context refused to open its shared context database. " +
+    lastFenceDiagnostic()
+  );
+}
+
+function lastFenceDiagnostic() {
+  // openDatabase() returns null on a schema-fence or migration-on-open
+  // refusal; the actionable line ("migration lane vN is newer than this
+  // binary supports (max vM); update or unpin Magic Context with 'npx
+  // @cortexkit/magic-context@latest doctor --force'") is written to the
+  // upstream file log only, never stderr. Quote its tail so the host's
+  // error message carries the remedy instead of a generic refusal.
+  const logPaths = [
+    process.env.MAGIC_CONTEXT_LOG_PATH,
+    join(tmpdir(), "hermes", "magic-context", "magic-context.log"),
+    join(tmpdir(), "pi", "magic-context", "magic-context.log"),
+    join(tmpdir(), "opencode", "magic-context", "magic-context.log"),
+  ].filter(Boolean);
+  for (const p of logPaths) {
+    try {
+      if (!existsSync(p)) continue;
+      const text = readFileSync(p, "utf8");
+      const idx = text.lastIndexOf("storage fatal");
+      if (idx !== -1) {
+        const line = text.slice(idx).split("\n", 1)[0];
+        return `Reason (from ${p}): ${line}`;
+      }
+    } catch {}
+  }
+  return "No storage-fatal diagnostic found in the Magic Context log.";
 }
 
 const sessions = new Map();

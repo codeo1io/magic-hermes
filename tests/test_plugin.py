@@ -169,3 +169,33 @@ def test_plugin_does_not_read_magic_context_config_in_python(monkeypatch, tmp_pa
     assert not hasattr(plugin, "load_jsonc")
     assert context.tasks["mc_historian"]["defaults"]["model"] == ""
     assert "mc_dreamer" not in context.tasks
+
+
+class ExplodingRuntimeClient(FakeRuntimeClient):
+    """Simulates the Node sidecar dying during the dreamer_tool_schemas call."""
+
+    def call(self, method, params=None, timeout=None):
+        from magic_hermes.runtime import RuntimeProtocolError
+
+        raise RuntimeProtocolError(
+            "Runtime exited during dreamer_tool_schemas with status 1; "
+            "request was not replayed; stderr: [magic-context] storage fatal: "
+            "refusing to open context.db; upstream migration lane v85 is newer "
+            "than this binary supports (max v84)"
+        )
+
+
+def test_dreamer_registration_failure_still_registers_context_engine(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(plugin, "runtime_available", lambda: True)
+    monkeypatch.setattr(plugin, "RuntimeClient", ExplodingRuntimeClient)
+    context = FakeContext()
+
+    result = plugin.load(context, project_root=tmp_path)
+
+    # Degraded mode: engine and auxiliary slot registered, no Dreamer tools.
+    assert result["enabled"] is True
+    assert context.engine.name == "magic-context"
+    assert context.tasks == {"mc_historian": context.tasks["mc_historian"]}
+    assert context.tools == {}
