@@ -64,7 +64,7 @@ class TestDiscoveryOrder:
             )
         ]
         with mock.patch(
-            "magic_hermes.cli.magic_context_package_candidates",
+            "magic_hermes.runtime.magic_context_package_candidates",
             return_value=real_candidates,
         ):
             found = find_magic_context_package()
