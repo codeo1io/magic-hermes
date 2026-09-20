@@ -6,6 +6,12 @@
 
 **Pillars**: reliability work outranks customer-experience work; every roadmap item cites reproducible codebase signals; acceptance is proven by cited evidence, never claimed
 
+## Fleet context
+
+- upstreams (this repo builds on): hermes-agent
+- dependents (changes here affect): (host)
+- graph: evidence-derived (imports/refs/deploy surfaces); advisory
+
 ## Open items
 
 ### Refactor 21 high-complexity function(s)
