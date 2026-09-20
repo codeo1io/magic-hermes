@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -281,6 +282,10 @@ class RuntimeClient:
         self._process: subprocess.Popen[str] | None = None
         self._next_id = 1
         self._stderr_thread: threading.Thread | None = None
+        # Rolling stderr tail so exit/timeout diagnostics can quote the
+        # sidecar's own fatal message (schema fence, storage errors) — the
+        # actionable reason otherwise lives only in DEBUG logs.
+        self._stderr_tail: deque[str] = deque(maxlen=12)
 
     def __deepcopy__(self, memo: dict[int, Any]) -> RuntimeClient:
         """Return a disconnected client; process handles and locks are not copied."""
@@ -334,15 +339,28 @@ class RuntimeClient:
         self._stderr_thread.start()
         return process
 
-    @staticmethod
-    def _drain_stderr(process: subprocess.Popen[str]) -> None:
+    def _drain_stderr(self, process: subprocess.Popen[str]) -> None:
         stream = process.stderr
         if stream is None:
             return
         for line in stream:
             message = line.rstrip()
-            if message:
+            if not message:
+                continue
+            self._stderr_tail.append(message)
+            # Fatal sidecar diagnostics (schema-fence refusals, storage
+            # failures) carry the actionable remedy; they must reach the
+            # WARNING log, not DEBUG, or the operator sees only an opaque
+            # "Runtime exited during bind" wrapper.
+            if "storage fatal" in message or "storage unavailable" in message:
+                log.warning("Magic Context runtime: %s", message)
+            else:
                 log.debug("Magic Context runtime: %s", message)
+
+    def _stderr_detail(self) -> str:
+        """Quote the sidecar's rolling stderr tail for error messages."""
+
+        return " | ".join(self._stderr_tail) or "<no stderr captured>"
 
     def _ensure_process(self) -> subprocess.Popen[str]:
         process = self._process
@@ -484,7 +502,7 @@ class RuntimeClient:
                     self._dispose(process)
                     raise RuntimeProtocolError(
                         f"Runtime exited during {method} with status {code}; "
-                        "request was not replayed"
+                        f"request was not replayed; stderr: {self._stderr_detail()}"
                     )
 
                 try:
