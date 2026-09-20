@@ -6,3 +6,4 @@ dist/
 .ruff_cache/
 *.bak.*
 node_modules/
+dist_archive/
