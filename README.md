@@ -60,7 +60,53 @@ runtime.
 
 ## Install
 
-### 1. Install Magic Context
+### 1. One-command install (recommended)
+
+```bash
+/path/to/hermes/venv/bin/magic-hermes install
+```
+
+The installer auto-detects any existing Magic Context installation, installs or
+updates `@cortexkit/pi-magic-context` as needed, wires the Hermes config, and
+verifies the runtime end to end:
+
+- If Magic Context is already installed anywhere Magic-Hermes looks (Pi home,
+  OpenCode config, or the Hermes-managed root), it is reused when its version
+  matches the one this build was validated against. Foreign homes (Pi's,
+  OpenCode's) are never modified.
+- If the discovered copy is older than the validated version, the validated
+  version is installed into the Hermes-owned root
+  (`~/.local/share/magic-hermes`) — which takes precedence in runtime
+  discovery — leaving other tools' installations untouched.
+- If a newer Magic Context exists than this build validates (or npm `latest`
+  is newer), the installer says so and points at the release pipeline; the
+  schema fence follows the newest copy, so an upgrade needs a matching
+  magic-hermes release.
+- `~/.hermes/config.yaml` gains `context.engine: magic-context`,
+  `memory.provider: magic_context`, and `magic-hermes` in `plugins.enabled`,
+  with a timestamped backup and comments preserved (requires `ruamel.yaml` or
+  PyYAML in the magic-hermes environment).
+- The Node sidecar is then booted and must open the shared DB before install
+  reports success.
+
+`--version X.Y.Z` targets a specific upstream version, `--dry-run` shows the
+plan, `--package-root PATH` binds an arbitrary copy, and `--skip-config`
+leaves Hermes config untouched.
+
+### 1b. Check installation health
+
+```bash
+/path/to/hermes/venv/bin/magic-hermes doctor
+```
+
+Modeled after the upstream `@cortexkit/magic-context doctor`: a sequence of
+PASS/WARN/FAIL/INFO checks (Node, magic-hermes distribution, upstream package
+discovery + version pin, Hermes config wiring, shared DB presence and schema
+lane, live sidecar handshake + DB quick_check + core-symbol check) with a
+summary line and non-zero exit on FAIL. `--json` emits machine-readable
+output.
+
+### 2. Manual install (fallback)
 
 Magic-Hermes delegates its context-management implementation to the official Magic
 Context package, so install Magic Context first. If you already use Pi, the upstream
@@ -79,7 +125,7 @@ OpenCode package locations. For a custom installation, point directly at the pac
 export MAGIC_CONTEXT_PACKAGE_ROOT=/path/to/node_modules/@cortexkit/pi-magic-context
 ```
 
-### 2. Install Magic-Hermes into Hermes
+### 3. Install Magic-Hermes into Hermes
 
 Install the latest published wheel into the Python environment used by Hermes. This
 repository is currently private, so authenticate GitHub CLI once with `gh auth login`,
@@ -113,7 +159,7 @@ For development from a local checkout, install the repository directly instead:
 uv pip install --python /path/to/hermes/venv/bin/python --no-deps -e .
 ```
 
-### 3. Enable Magic-Hermes
+### 4. Enable Magic-Hermes
 
 Enable the plugin, context engine, and exclusive memory provider in Hermes:
 
@@ -144,7 +190,7 @@ platform_toolsets:
 Keep historian, memory, embedding, and dreamer policy in the shared Magic Context
 JSONC file. Magic-Hermes does not introduce a second configuration source.
 
-### 4. Verify the installation
+### 5. Verify the installation (manual path)
 
 Confirm the package is installed in the Hermes environment and that Magic-Hermes can
 find a supported Magic Context runtime:
