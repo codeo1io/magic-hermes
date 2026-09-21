@@ -1,0 +1,17 @@
+# Private-leak sentinel (fleet-wide credential scan) for magic-hermes.
+# Reusable workflow lives in codeo1io/.github — full-history gitleaks scan.
+name: private-leak-sentinel
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "23 3 * * *"  # daily off-peak full-history rescan
+
+permissions:
+  contents: read
+
+jobs:
+  private-leak:
+    uses: codeo1io/.github/.github/workflows/private-leak-sentinel.yaml@main
