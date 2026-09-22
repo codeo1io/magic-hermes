@@ -37,7 +37,7 @@ _DEFAULT_IDLE_TTL_S = 300.0
 _DEFAULT_FAILURE_COOLDOWN_S = 30.0
 
 _clients_lock = threading.Lock()
-_live_clients: "weakref.WeakSet[RuntimeClient]" = weakref.WeakSet()
+_live_clients: weakref.WeakSet[RuntimeClient] = weakref.WeakSet()
 _idle_sweeper_started = False
 
 
