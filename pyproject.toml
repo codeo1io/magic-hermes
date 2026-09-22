@@ -1,6 +1,6 @@
 [project]
 name = "magic-hermes"
-version = "0.3.0"
+version = "0.3.1"
 description = "Thin Hermes connector for the upstream Magic Context runtime"
 readme = "README.md"
 requires-python = ">=3.10"
