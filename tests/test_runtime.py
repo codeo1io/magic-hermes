@@ -3,7 +3,9 @@ from __future__ import annotations
 import contextvars
 import io
 import json
+import signal
 import threading
+import time
 
 import pytest
 
@@ -298,3 +300,101 @@ def test_drain_stderr_escalates_storage_fatal_to_warning(caplog):
     records = [r for r in caplog.records if "Magic Context runtime" in r.message]
     assert any(r.levelname == "WARNING" for r in records)
     assert any(r.levelname == "DEBUG" for r in records)
+
+
+class _FakeSidecar:
+    """Minimal Popen stand-in for lifecycle tests (no real process)."""
+
+    def __init__(self):
+        self.stdin = io.StringIO()
+        self.stdout = io.StringIO()
+        self.stderr = io.StringIO()
+        self.pid = 424242
+        self.terminated = []
+        self.killed = False
+
+    def poll(self):
+        return None if not self.killed else -9
+
+    def wait(self, timeout=None):
+        return self.poll()
+
+    def terminate(self):
+        self.terminated.append("SIGTERM")
+
+    def kill(self):
+        self.killed = True
+
+
+def test_reap_if_idle_requires_a_live_process():
+    client = runtime.RuntimeClient(idle_ttl_s=0.0)
+    client._process = None
+
+    assert client._reap_if_idle() is False
+
+
+def test_reap_if_idle_never_reaps_a_closed_client():
+    client = runtime.RuntimeClient(idle_ttl_s=0.0)
+    process = _FakeSidecar()
+    client._process = process
+    client._closed = True
+
+    assert client._reap_if_idle() is False
+    assert client._process is process
+
+
+def test_reap_if_idle_spares_recent_activity():
+    client = runtime.RuntimeClient(idle_ttl_s=300.0)
+    client._process = _FakeSidecar()
+    client._last_activity = time.monotonic()  # busy right now
+
+    assert client._reap_if_idle() is False
+    assert client._process is not None
+
+
+def test_reap_if_idle_disposes_a_stale_sidecar():
+    client = runtime.RuntimeClient(idle_ttl_s=1.0)
+    process = _FakeSidecar()
+    client._process = process
+    client._last_activity = time.monotonic() - 3600.0  # idle an hour
+
+    disposed = []
+    client._dispose = disposed.append
+
+    assert client._reap_if_idle() is True
+    assert disposed == [process]
+
+
+def test_call_refreshes_idle_activity(monkeypatch):
+    client, _process = _client_with_response(
+        monkeypatch, json.dumps({"id": 1, "result": {}}) + "\n"
+    )
+    stale = time.monotonic() - 3600.0
+    client._last_activity = stale
+
+    client.call("bind")
+
+    assert client._last_activity > stale
+
+
+def test_failure_cooldown_blocks_until_window_passes():
+    client = runtime.RuntimeClient()
+    client._failure_cooldown_until = time.monotonic() + 30.0
+
+    with pytest.raises(runtime.RuntimeUnavailable, match="failure cooldown"):
+        client._ensure_process()
+
+
+def test_dispose_kills_the_process_group_on_posix(monkeypatch):
+    client = runtime.RuntimeClient()
+    process = _FakeSidecar()
+    signals = []
+    monkeypatch.setattr(runtime.os, "getpgid", lambda pid: 999111)
+    monkeypatch.setattr(
+        runtime.os, "killpg", lambda pgid, sig: signals.append((pgid, sig))
+    )
+
+    client._dispose(process)
+
+    assert signals == [(999111, signal.SIGTERM)]
+    assert "SIGTERM" not in process.terminated  # group kill replaced bare terminate

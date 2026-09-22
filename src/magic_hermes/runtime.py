@@ -11,15 +11,58 @@ import os
 import re
 import select
 import shutil
+import signal
 import subprocess
 import threading
 import time
+import weakref
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+# Sidecars are started as session/process-group leaders on POSIX so teardown can
+# kill worker children (worker_threads spawn as separate PIDs) instead of
+# orphaning them with the stderr pipe still open.
+_PROCESS_GROUP = os.name == "posix"
+
+# Idle-sidecar reaping: the host gateway multiplexes many profiles, each holding
+# engine + memory-provider clients (one ~200MB Node sidecar each). Without
+# reaping the idle fleet alone exhausted the service memory cap and wedged the
+# host event loop (gateway exit-75 storms, 2026-09-21).
+_IDLE_SWEEP_INTERVAL_S = 60.0
+_DEFAULT_IDLE_TTL_S = 300.0
+_DEFAULT_FAILURE_COOLDOWN_S = 30.0
+
+_clients_lock = threading.Lock()
+_live_clients: "weakref.WeakSet[RuntimeClient]" = weakref.WeakSet()
+_idle_sweeper_started = False
+
+
+def _idle_sweep_loop() -> None:
+    while True:
+        time.sleep(_IDLE_SWEEP_INTERVAL_S)
+        with _clients_lock:
+            clients = list(_live_clients)
+        for client in clients:
+            with contextlib.suppress(Exception):
+                client._reap_if_idle()
+
+
+def _ensure_idle_sweeper() -> None:
+    global _idle_sweeper_started
+    with _clients_lock:
+        if _idle_sweeper_started:
+            return
+        _idle_sweeper_started = True
+    thread = threading.Thread(
+        target=_idle_sweep_loop,
+        name="magic-hermes-idle-sweeper",
+        daemon=True,
+    )
+    thread.start()
 
 _SEMVER = re.compile(
     r"^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)"
@@ -283,11 +326,13 @@ class RuntimeClient:
         db_path: str | os.PathLike[str] | None = None,
         timeout: float = 130.0,
         callback_handler: HostCallback | None = None,
+        idle_ttl_s: float = _DEFAULT_IDLE_TTL_S,
     ) -> None:
         self.package_root = Path(package_root).resolve() if package_root else None
         self.db_path = Path(db_path).resolve() if db_path else None
         self.timeout = timeout
         self.callback_handler = callback_handler
+        self.idle_ttl_s = max(0.0, float(idle_ttl_s))
         self._lock = threading.Lock()
         # Host callbacks may execute for minutes (Dreamer child agents).  Keep
         # stdin writes independently serialized so the main reader can accept a
@@ -297,12 +342,38 @@ class RuntimeClient:
         self._callback_threads_lock = threading.Lock()
         self._callback_threads: set[threading.Thread] = set()
         self._process: subprocess.Popen[str] | None = None
+        self._closed = False
         self._next_id = 1
         self._stderr_thread: threading.Thread | None = None
+        self._last_activity = time.monotonic()
+        self._failure_cooldown_until = 0.0
         # Rolling stderr tail so exit/timeout diagnostics can quote the
         # sidecar's own fatal message (schema fence, storage errors) — the
         # actionable reason otherwise lives only in DEBUG logs.
         self._stderr_tail: deque[str] = deque(maxlen=12)
+        with _clients_lock:
+            _live_clients.add(self)
+        _ensure_idle_sweeper()
+
+    def _reap_if_idle(self) -> bool:
+        """Kill the sidecar when it has been idle past ``idle_ttl_s``.
+
+        Run by the process-wide idle sweeper. The sidecar restarts lazily on the
+        next ``call()``; DB state is shared, so nothing is lost. The client lock
+        serializes this against in-flight ``call()`` bodies.
+        """
+
+        with self._lock:
+            process = self._process
+            if (
+                process is None
+                or self._closed
+                or self._last_activity + self.idle_ttl_s > time.monotonic()
+            ):
+                return False
+            log.debug("Reaping idle Magic Context sidecar (pid=%s)", process.pid)
+            self._dispose(process)
+            return True
 
     def __deepcopy__(self, memo: dict[int, Any]) -> RuntimeClient:
         """Return a disconnected client; process handles and locks are not copied."""
@@ -341,6 +412,7 @@ class RuntimeClient:
                 encoding="utf-8",
                 bufsize=1,
                 env=environment,
+                start_new_session=_PROCESS_GROUP,
             )
         except OSError as exc:
             message = f"Could not start Magic Context runtime: {exc}"
@@ -380,11 +452,22 @@ class RuntimeClient:
         return " | ".join(self._stderr_tail) or "<no stderr captured>"
 
     def _ensure_process(self) -> subprocess.Popen[str]:
+        # Failure cooldown: repeated bind failures under DB contention used to
+        # spawn a replacement sidecar per attempt (each ~200MB). Back off so a
+        # contention storm degrades to N clients / 1 sidecar attempt per window
+        # instead of a sidecar fleet.
+        if self._failure_cooldown_until > time.monotonic():
+            raise RuntimeUnavailable(
+                "Magic Context runtime is in a failure cooldown "
+                f"({self._failure_cooldown_until - time.monotonic():.0f}s left) "
+                "after a prior spawn/bind failure"
+            )
         process = self._process
         if process is None or process.poll() is not None:
             if process is not None:
                 self._dispose(process)
             process = self._start()
+            self._failure_cooldown_until = 0.0
         return process
 
     def _write_payload(
@@ -484,6 +567,7 @@ class RuntimeClient:
 
         with self._lock:
             process = self._ensure_process()
+            self._last_activity = time.monotonic()
             if process.stdin is None or process.stdout is None:
                 raise RuntimeProtocolError("Runtime pipes are unavailable")
 
@@ -506,8 +590,12 @@ class RuntimeClient:
             while True:
                 remaining = max(0.0, deadline - time.monotonic())
                 ready, _, _ = select.select([process.stdout], [], [], remaining)
+                self._last_activity = time.monotonic()
                 if not ready:
                     self._dispose(process)
+                    self._failure_cooldown_until = (
+                        time.monotonic() + _DEFAULT_FAILURE_COOLDOWN_S
+                    )
                     raise RuntimeProtocolError(
                         f"Runtime timed out after {wait_for:.1f}s during {method}; "
                         "request was not replayed"
@@ -517,6 +605,9 @@ class RuntimeClient:
                 if not line:
                     code = process.poll()
                     self._dispose(process)
+                    self._failure_cooldown_until = (
+                        time.monotonic() + _DEFAULT_FAILURE_COOLDOWN_S
+                    )
                     raise RuntimeProtocolError(
                         f"Runtime exited during {method} with status {code}; "
                         f"request was not replayed; stderr: {self._stderr_detail()}"
@@ -571,10 +662,21 @@ class RuntimeClient:
         """Terminate this client's private runtime process."""
 
         with self._lock:
+            self._closed = True
             if self._process is not None:
                 self._dispose(self._process)
 
     def _dispose(self, process: subprocess.Popen[str]) -> None:
+        """Kill the sidecar and its worker children. Caller holds ``self._lock``.
+
+        The sidecar runs as a session leader (``start_new_session``), so
+        killing the process GROUP takes down worker-thread children too.
+        Without the group kill, surviving children kept the stderr pipe open
+        forever: the ``_drain_stderr`` reader threads never saw EOF and both
+        threads and Node processes accumulated in the host gateway
+        (2026-09-21 leak).
+        """
+
         if self._process is process:
             self._process = None
         for stream in (process.stdin, process.stdout):
@@ -584,12 +686,26 @@ class RuntimeClient:
             except OSError:
                 pass
         if process.poll() is None:
-            process.terminate()
+            killed = False
+            if _PROCESS_GROUP:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    killed = True
+                except (ProcessLookupError, PermissionError, OSError):
+                    killed = False
+            if not killed:
+                with contextlib.suppress(OSError):
+                    process.terminate()
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
+                if _PROCESS_GROUP:
+                    with contextlib.suppress(OSError):
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                with contextlib.suppress(OSError):
+                    process.kill()
+                with contextlib.suppress(Exception):
+                    process.wait(timeout=2)
         try:
             if process.stderr is not None:
                 process.stderr.close()
