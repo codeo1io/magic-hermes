@@ -44,6 +44,10 @@ def bind_result():
     }
 
 
+def calls_for(client, method):
+    return [params for name, params, _timeout in client.calls if name == method]
+
+
 def test_engine_deepcopy_creates_disconnected_client():
     def complete(**kwargs):
         return "output"
@@ -330,6 +334,167 @@ def test_compress_fails_open_on_host_completion_error(tmp_path):
 
     assert engine.compress(original) is original
     assert engine.compression_count == 0
+
+
+def test_compress_abort_reports_failed_outcome_after_validation_give_up(tmp_path):
+    prepared = {
+        "ready": True,
+        "system_prompt": "# Historian",
+        "prompt": "<new_messages>history</new_messages>",
+        "model": "zai/glm-4.7",
+        "timeout_ms": 1_000,
+    }
+
+    def publish(_params):
+        return {
+            "ok": False,
+            "error": "invalid historian output",
+            "repair_prompt": "Repair the draft",
+            "system_prompt": "# Historian",
+        }
+
+    client = FakeClient(
+        {
+            "bind": bind_result(),
+            "historian_decide": {
+                "should_fire": True,
+                "reason": "trigger",
+                "boundary_snapshot": {"offset": 1, "eligibleEndOrdinal": 8},
+            },
+            "historian_prepare": prepared,
+            "historian_publish": publish,
+        }
+    )
+    original = [
+        {"role": "system", "content": "base"},
+        *[
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": str(index),
+            }
+            for index in range(10)
+        ],
+    ]
+    engine = MagicContextEngine(
+        client=client,
+        complete=lambda **_kwargs: "<output />",
+        project_root=tmp_path,
+        session_id="validation-give-up",
+    )
+
+    assert engine.compress(original) == original
+    assert engine.compression_count == 0
+    # The repair retry is an intermediate state: it publishes again without
+    # recording anything, and only the final give-up classifies the pass.
+    publishes = calls_for(client, "historian_publish")
+    assert [params["output"] for params in publishes] == [
+        "<output />",
+        "<output />",
+    ]
+    aborts = calls_for(client, "historian_abort")
+    assert len(aborts) == 1
+    outcome = aborts[0]["outcome"]
+    assert outcome["status"] == "failed"
+    assert outcome["reason"].startswith("historian output rejected: ")
+    assert "invalid historian output" in outcome["reason"]
+
+
+def test_compress_abort_reports_failed_outcome_on_host_completion_error(tmp_path):
+    client = FakeClient(
+        {
+            "bind": bind_result(),
+            "historian_decide": {
+                "should_fire": True,
+                "reason": "trigger",
+                "boundary_snapshot": {"offset": 1, "eligibleEndOrdinal": 8},
+            },
+            "historian_prepare": {
+                "ready": True,
+                "system_prompt": "# Historian",
+                "prompt": "history",
+            },
+        }
+    )
+
+    def complete(**_kwargs):
+        raise TimeoutError("auxiliary completion timed out")
+
+    engine = MagicContextEngine(
+        client=client,
+        complete=complete,
+        project_root=tmp_path,
+        session_id="aux-timeout",
+    )
+    original = [
+        {"role": "system", "content": "base"},
+        *[
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": str(index),
+            }
+            for index in range(10)
+        ],
+    ]
+
+    assert engine.compress(original) == original
+    assert engine.compression_count == 0
+    aborts = calls_for(client, "historian_abort")
+    assert len(aborts) == 1
+    outcome = aborts[0]["outcome"]
+    assert outcome["status"] == "failed"
+    assert "TimeoutError" in outcome["reason"]
+    assert "auxiliary completion timed out" in outcome["reason"]
+
+
+def test_compress_success_never_aborts_or_classifies(tmp_path):
+    prepared = {
+        "ready": True,
+        "system_prompt": "# Historian",
+        "prompt": "<new_messages>history</new_messages>",
+        "model": "zai/glm-4.7",
+        "timeout_ms": 1_000,
+    }
+    compacted = [
+        {"role": "system", "content": "base"},
+        {"role": "system", "content": "<session-history>summary</session-history>"},
+        {"role": "user", "content": "tail"},
+    ]
+    client = FakeClient(
+        {
+            "bind": bind_result(),
+            "historian_decide": {
+                "should_fire": True,
+                "reason": "trigger",
+                "boundary_snapshot": {"offset": 1, "eligibleEndOrdinal": 8},
+            },
+            "historian_prepare": prepared,
+            "historian_publish": {"ok": True, "messages": compacted},
+            "render_context": {"messages": compacted},
+        }
+    )
+    engine = MagicContextEngine(
+        client=client,
+        complete=lambda **_kwargs: "<output />",
+        project_root=tmp_path,
+        session_id="success-no-abort",
+    )
+
+    assert (
+        engine.compress(
+            [
+                {"role": "system", "content": "base"},
+                *[
+                    {
+                        "role": "user" if index % 2 == 0 else "assistant",
+                        "content": str(index),
+                    }
+                    for index in range(10)
+                ],
+            ]
+        )
+        == compacted
+    )
+    assert calls_for(client, "historian_abort") == []
 
 
 def test_select_context_keeps_upstream_tag_transform_without_compartments(tmp_path):
