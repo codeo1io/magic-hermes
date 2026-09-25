@@ -106,12 +106,20 @@ def test_official_runtime_indexes_tools_memories_and_compartments(tmp_path):
             "ctx_reduce",
             "ctx_note",
         }
+        if supported_magic_context_series() >= (0, 43):
+            # 0.43 registers ctx_memory_list alongside the core surface.
+            expected.add("ctx_memory_list")
         assert names == expected
         note_schema = next(
             schema for schema in bound["tool_schemas"] if schema["name"] == "ctx_note"
         )
         assert "surface_condition" in note_schema["parameters"]["properties"]
-        assert "Smart notes:" in note_schema["description"]
+        if supported_magic_context_series() < (0, 43):
+            assert "Smart notes:" in note_schema["description"]
+        else:
+            # 0.43 reworded the ctx_note description; the surface_condition
+            # contract above is the load-bearing assertion.
+            assert "surface_condition" in note_schema["description"]
         assert bound["config"]["dreamer_enabled"] is False
 
         messages = conversation()
@@ -602,8 +610,19 @@ HAND-AUTHORED INVARIANT: keep this byte-for-byte.
     structure_text = structure.read_text(encoding="utf-8")
     assert protected in architecture_text
     assert "MUTATED BY CHILD" not in architecture_text
-    assert "Current core lives at `src/core.py`." in architecture_text
-    assert "Core implementation: `src/core.py`." in structure_text
+    if supported_magic_context_series() < (0, 43):
+        # 0.42 gave the maintain-docs child write tools and the upstream
+        # wrapper restored protected regions from the pre-task snapshot,
+        # leaving non-protected child edits in place.
+        assert "Current core lives at `src/core.py`." in architecture_text
+        assert "Core implementation: `src/core.py`." in structure_text
+    else:
+        # 0.43 made maintain-docs a read-only investigator: the child
+        # proposes changes and the host applies them later, so a hostile
+        # direct edit is simply left untouched (proposal flow never writes
+        # docs itself) — the protected region survives either way.
+        assert "Old stale architecture text." in architecture_text
+        assert "Old stale structure text." in structure_text
 
 
 def test_smart_note_compiles_and_surfaces_through_upstream_sandbox(tmp_path):
@@ -1489,7 +1508,13 @@ def test_prompt_guidance_uses_upstream_shared_config_and_replays_once(
     replay_system = replay["messages"][0]["content"]
     assert "Base Hermes system prompt." in first_system
     assert "## Magic Context" in first_system
-    assert "Temporal awareness" in first_system
+    if supported_magic_context_series() < (0, 43):
+        # 0.42 headed the section "**Temporal awareness**"; 0.43 folds the
+        # same guidance into the markings sentence as "`<!-- +Xm -->` before
+        # a user message (the time that passed since your last reply ...)".
+        assert "Temporal awareness" in first_system
+    else:
+        assert "+Xm" in first_system
     assert first_system.count("## Magic Context") == 1
     assert replay_system.count("## Magic Context") == 1
 
