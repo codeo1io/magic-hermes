@@ -32,6 +32,7 @@ marked N/A rather than reimplemented.
 | Background historian | Full | Normal turn completion schedules a background upstream historian pass. `compress()` is only the synchronous manual/emergency compatibility seam. |
 | Historian transaction | Full | Upstream chunking, prompts, validation, repair, optional editor, publication, facts/events, queued drops, protected-tail floor, note trigger, primer candidates and embedding dispatch are used. |
 | Historian leases | Full | Upstream compartment lease plus its 60-second renewal cadence protect long Hermes LLM passes; abort/failure releases state safely. |
+| Historian run telemetry | Full | Every terminal outcome of an engaged pass is written to the shared `historian_runs` table through upstream `recordHistorianRun` with `harness='hermes'`, `run_kind='incremental'`: publication records `success` with the full metric set; validation give-up and exceptions abort with a `{status, reason}` outcome and record `failed` with a non-NULL reason; benign prepare non-runs (`protected-tail`, `historian-disabled`, `empty-chunk`, `lease-held`) and plain aborts record `noop` with an explicit reason. Intermediate retry states (repair, editor pass) record nothing by design, and recording is fail-open so it never blocks compaction. |
 | User-observation candidates | Full | Historian stores them only when the upstream review-user-memories configuration enables collection. |
 | Dreamer scheduler/task state | Full / Hermes-shaped wakeup | Upstream `buildDreamTaskRuntimeConfigs`, `runDueTasksForProject`, `runManualDream`, gates, backlogs, leases, retries and schedule patches are authoritative. Due work is evaluated on active Hermes lifecycle turns; Hermes does not invent a second cron state machine. |
 | Dreamer child execution | Hermes-shaped | Upstream Dreamer creates its virtual task sessions; a duplex host callback launches real Hermes public subagents. Tool-using children reach exact upstream `ctx_*` handlers through Hermes's scoped progressive-disclosure bridge. |
@@ -79,7 +80,8 @@ schedule state advanced prematurely.
 - Runtime requests are local stdio calls. Mutating calls are never replayed after
   a timeout or transport failure.
 - Historian failures fail open to the current transcript and clear/release the
-  upstream transaction state.
+  upstream transaction state; their terminal outcome is recorded in the shared
+  `historian_runs` table with a non-NULL failure reason.
 - Long historian passes renew the upstream compartment lease every 60 seconds.
 - Dreamer uses upstream domain leases/backlog state; Hermes child cancellation is
   addressable by the upstream virtual-session ID even while the launch callback is

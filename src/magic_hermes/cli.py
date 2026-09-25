@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .historian_guard import RETIRES_AT_UPSTREAM, guard_status
 from .runtime import (
     RuntimeClient,
     _package_version,
@@ -524,6 +525,45 @@ def run_doctor(json_output: bool = False) -> int:
         lane = db_schema_lane(db_path)
         if lane is not None:
             report.add("INFO", f"Shared DB schema migration lane: v{lane}")
+        # Historian classification guard (maestro finding d59758598379):
+        # deliberately WARN-only in every bad state — maestro requires
+        # doctor to exit 0, and a FAIL here would break that invariant
+        # while the guard is merely a workaround (KTD-2).
+        guard = guard_status(db_path)
+        if guard.error is not None:
+            report.add(
+                "WARN",
+                "Historian classification guard state unreadable: "
+                f"{guard.error}",
+            )
+        elif not guard.present:
+            report.add(
+                "WARN",
+                "Historian classification guard not installed on the shared "
+                "store — run `magic-hermes guard apply` to stop benign "
+                "historian early-returns being recorded as failed/NULL "
+                "(maestro finding d59758598379)",
+            )
+        elif not guard.matches:
+            report.add(
+                "WARN",
+                "Historian classification guard has drifted from the "
+                "canonical DDL — re-run `magic-hermes guard apply` to repair "
+                "it",
+            )
+        elif RETIRES_AT_UPSTREAM is not None:
+            report.add(
+                "INFO",
+                "Historian classification guard active and eligible for "
+                f"retirement (upstream fixed in {RETIRES_AT_UPSTREAM}) — "
+                "run `magic-hermes guard remove`",
+            )
+        else:
+            report.add(
+                "PASS",
+                "Historian classification guard active "
+                f"({guard.marker_rows_24h} rows reclassified in the last 24h)",
+            )
     else:
         report.add(
             "INFO",
