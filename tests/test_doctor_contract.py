@@ -26,6 +26,10 @@ returns once the bounded-scan rider is active:
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -341,3 +345,222 @@ class TestRetryBudget:
         assert isinstance(fast, float) and fast > 0
         assert isinstance(backoff, float) and backoff > 0
         assert fast + backoff <= 20.0
+
+    def test_wall_budget_fits_observer_shot(self):
+        # U15/U17 (plan 0d118f58): every attempt timeout derives from the
+        # remaining wall budget, so the budget itself — plus the render
+        # reserve kept back for printing — is the process total that must
+        # fit inside maestro's 90 s single-shot kill with room to spare.
+        budget = cli._DOCTOR_WALL_BUDGET_S
+        reserve = cli._DOCTOR_WALL_RENDER_RESERVE_S
+        assert isinstance(budget, float) and budget > 0
+        assert isinstance(reserve, float) and 0.0 < reserve < 1.0
+        assert budget + reserve < 90.0
+        assert budget >= cli._SIDECAR_FAST_FAIL_S + cli._SIDECAR_RETRY_BACKOFF_S
+
+
+_OBSERVER_DRIVER = r'''
+import json
+import os
+import sys
+from pathlib import Path
+from unittest import mock
+
+from magic_hermes import cli
+
+TESTED = os.environ["DOCTOR_TESTED_VERSION"]
+RESPONSE = json.loads(os.environ["DOCTOR_SIDECAR_RESPONSE"])
+
+
+class _FakeSidecar:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def call(self, method, params=None, timeout=None):
+        if method == "hello":
+            return {"harness": "hermes", "package_version": TESTED}
+        return RESPONSE
+
+
+with mock.patch.object(
+    cli,
+    "discover_installations",
+    return_value=[(Path(os.environ["DOCTOR_PACKAGE"]), TESTED)],
+), mock.patch.object(cli, "RuntimeClient", _FakeSidecar):
+    sys.exit(cli.run_doctor())
+'''
+
+
+class TestObserverBudgetMatrix:
+    """U17 (plan 0d118f58, finding c7d63424) — the forced-regime matrix
+    under a 90 s observer.
+
+    maestro's phase-2 verdict runs the real ``magic-hermes doctor``
+    process single-shot with a 90 s kill (phase2.py:296-316: rc124 ->
+    ERROR inconclusive-timeout). Each row drives the real CLI entry in a
+    subprocess under that same 90 s enforcement and asserts the invariant
+    the finding broke: a verdict always renders — rc 0 with "FAIL 0" for
+    the healthy regime and for every degraded one, never a hang.
+
+    The Node sidecar is faked in-driver (these suites never spawn Node);
+    each regime's response mirrors the bridge contract shapes pinned by
+    TestDegradedScanContract. The ``skipped:deadline`` *emission* is the
+    even lane's unit (U14); this row pins the CLI-side verdict invariant
+    for that shape regardless of which side mints it."""
+
+    OBSERVER_BUDGET_S = 90.0
+
+    def _run_row(self, tmp_path, isolated_home, env_forces, response=None):
+        """Run one matrix row as a real subprocess observer.
+
+        Returns ``(proc, elapsed)``; the subprocess timeout is the 90 s
+        observer budget itself — a hang fails the row exactly the way
+        maestro's phase-2 verdict would ERROR on rc124.
+        """
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        _wire_config()
+        tested = cli.tested_magic_context_version()
+        package = make_package(tmp_path / "pkg", tested)
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("MAGIC_CONTEXT_", "MAGIC_HERMES_"))
+        }
+        payload = {"database_health": "ok"}
+        if response:
+            payload.update(response)
+        env.update(
+            {
+                "HOME": str(Path.home()),
+                "PYTHONPATH": str(Path(cli.__file__).resolve().parents[1]),
+                "MAGIC_CONTEXT_DB_PATH": str(db),
+                "DOCTOR_TESTED_VERSION": tested,
+                "DOCTOR_PACKAGE": str(package),
+                "DOCTOR_SIDECAR_RESPONSE": json.dumps(
+                    {
+                        "core_symbols_ready": True,
+                        "supported_series": series,
+                        **payload,
+                    }
+                ),
+            }
+        )
+        env.update(env_forces)
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-c", _OBSERVER_DRIVER],
+            capture_output=True,
+            text=True,
+            timeout=self.OBSERVER_BUDGET_S,
+            env=env,
+            cwd=str(tmp_path),
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < self.OBSERVER_BUDGET_S
+        return proc
+
+    def test_healthy_regime_renders_pass_verdict(self, tmp_path, isolated_home):
+        proc = self._run_row(tmp_path, isolated_home, {})
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "FAIL 0" in proc.stdout
+        assert "quick_check ok" in proc.stdout
+
+    def test_store_size_gate_degrades_to_warn_not_hang(
+        self, tmp_path, isolated_home
+    ):
+        proc = self._run_row(
+            tmp_path,
+            isolated_home,
+            {"MAGIC_CONTEXT_DOCTOR_SCAN_MAX_BYTES": "4096"},
+            {"database_health": "skipped:store-size 3690000000 > 4096"},
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "FAIL 0" in proc.stdout
+        assert "store-size" in proc.stdout
+        assert "WARN 1 / FAIL 0" in proc.stdout
+
+    def test_probe_ms_gate_degrades_to_warn_not_hang(
+        self, tmp_path, isolated_home
+    ):
+        proc = self._run_row(
+            tmp_path,
+            isolated_home,
+            {"MAGIC_CONTEXT_DOCTOR_PROBE_MAX_MS": "0.001"},
+            {"database_health": "skipped:probe-ms 4300.5 > 0.001"},
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "FAIL 0" in proc.stdout
+        assert "probe-ms" in proc.stdout
+        assert "WARN 1 / FAIL 0" in proc.stdout
+
+    def test_scan_deadline_gate_degrades_to_warn_not_hang(
+        self, tmp_path, isolated_home
+    ):
+        proc = self._run_row(
+            tmp_path,
+            isolated_home,
+            {"MAGIC_CONTEXT_DOCTOR_SCAN_DEADLINE_S": "0.001"},
+            {"database_health": "skipped:deadline 12.5 > 0.001"},
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "FAIL 0" in proc.stdout
+        assert "deadline" in proc.stdout
+        assert "WARN 1 / FAIL 0" in proc.stdout
+
+    def test_exhausted_wall_budget_renders_verdict_without_sidecar(
+        self, tmp_path, isolated_home
+    ):
+        proc = self._run_row(
+            tmp_path,
+            isolated_home,
+            {"MAGIC_CONTEXT_DOCTOR_WALL_BUDGET_S": "0"},
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "FAIL 0" in proc.stdout
+        assert "wall-budget" in proc.stdout
+        assert "PRAGMA quick_check" in proc.stdout
+        assert "quick_check ok" not in proc.stdout
+
+
+class TestDeploySmoke:
+    """U17 deploy smoke — the interpreter maestro probes must carry the
+    newest tagged release of magic-hermes. Gated behind
+    MAGIC_HERMES_DEPLOY_SMOKE=1 (the deploy lanes U19/U21 set it); the
+    ordinary test lane skips, so the rider adds no skips to it."""
+
+    def test_installed_version_matches_newest_tag(self):
+        if os.environ.get("MAGIC_HERMES_DEPLOY_SMOKE") != "1":
+            pytest.skip("deploy smoke runs only with MAGIC_HERMES_DEPLOY_SMOKE=1")
+        from importlib import metadata
+
+        root = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        tags = subprocess.run(
+            ["git", "-C", root, "tag", "-l", "v*"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        assert tags, "no v* tags found in the release repository"
+        newest = max(tags, key=lambda t: tuple(map(int, t[1:].split("."))))
+        installed = metadata.version("magic-hermes")
+        assert installed == newest[1:], (
+            f"deployed interpreter has magic-hermes {installed} but the "
+            f"newest tag is {newest}"
+        )
