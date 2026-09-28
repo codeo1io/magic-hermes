@@ -10,6 +10,7 @@ edits, text-scan fallback when no YAML library is present).
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from unittest import mock
 
@@ -252,3 +253,440 @@ class TestDoctorReport:
         con.commit()
         con.close()
         assert cli.db_schema_lane(fake_db) == 99
+
+
+class TestGuardParser:
+    def test_guard_subcommand_accepts_all_three_actions(self):
+        parser = cli.build_parser()
+        for action in ("apply", "remove", "status"):
+            args = parser.parse_args(["guard", action])
+            assert args.command == "guard"
+            assert args.action == action
+
+    def test_guard_requires_a_known_action(self):
+        parser = cli.build_parser()
+        with pytest.raises(SystemExit) as excinfo:
+            parser.parse_args(["guard"])
+        assert excinfo.value.code == 2
+
+
+class TestGuardCommand:
+    """T9 — ``magic-hermes guard apply|remove|status`` exit codes and output.
+
+    The store is always a fixture reached through MAGIC_CONTEXT_DB_PATH;
+    no test ever touches the live shared store.
+    """
+
+    @staticmethod
+    def _fixture(tmp_path, monkeypatch, name="context.db"):
+        from magic_hermes import historian_guard as hg
+
+        db = hg.make_fixture_db(tmp_path / name)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        return db
+
+    def test_apply_status_remove_roundtrip(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        db = self._fixture(tmp_path, monkeypatch)
+
+        assert cli.main(["guard", "apply"]) == 0
+        out = capsys.readouterr().out
+        assert "mh_historian_classification_guard" in out
+        assert str(db) in out
+        assert "trigger installed" in out
+        assert "verification" in out and "ok" in out
+
+        assert cli.main(["guard", "status"]) == 0
+        out = capsys.readouterr().out
+        assert "present, matches canonical DDL" in out
+        assert "rows reclassified in the last 24h" in out
+
+        # Idempotent re-apply reports a no-op, still exit 0.
+        assert cli.main(["guard", "apply"]) == 0
+        assert "no-op" in capsys.readouterr().out
+
+        assert cli.main(["guard", "remove"]) == 0
+        assert "removed" in capsys.readouterr().out
+
+        assert cli.main(["guard", "status"]) == 0
+        assert "not installed" in capsys.readouterr().out
+
+        # Removing an absent guard is a successful no-op.
+        assert cli.main(["guard", "remove"]) == 0
+        assert "nothing to remove" in capsys.readouterr().out
+
+    def test_apply_missing_store_fails_loud(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv(
+            "MAGIC_CONTEXT_DB_PATH", str(tmp_path / "missing.db")
+        )
+        assert cli.main(["guard", "apply"]) == 1
+        err = capsys.readouterr().err
+        assert "no shared context store" in err
+        assert "guard apply failed" in err
+
+    def test_status_and_remove_on_missing_store_are_informational(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv(
+            "MAGIC_CONTEXT_DB_PATH", str(tmp_path / "missing.db")
+        )
+        assert cli.main(["guard", "status"]) == 0
+        assert "not installed" in capsys.readouterr().out
+        assert cli.main(["guard", "remove"]) == 0
+        assert "nothing to remove" in capsys.readouterr().out
+
+    def test_apply_writes_only_the_override_store(
+        self, tmp_path, monkeypatch, isolated_home
+    ):
+        """T11 — with MAGIC_CONTEXT_DB_PATH set, apply writes ONLY there.
+
+        A decoy store sits exactly where home-relative resolution would find
+        it; it must stay untouched, proving the override isolates every
+        write (and that the suite never reaches the real home store).
+        """
+
+        from magic_hermes import historian_guard as hg
+
+        decoy_dir = (
+            isolated_home / ".local" / "share" / "cortexkit" / "magic-context"
+        )
+        decoy_dir.mkdir(parents=True)
+        decoy = hg.make_fixture_db(decoy_dir / "context.db")
+        target = hg.make_fixture_db(tmp_path / "target.db")
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(target))
+        monkeypatch.setattr(Path, "home", lambda: isolated_home)
+
+        assert cli.main(["guard", "apply"]) == 0
+        assert hg.guard_status(target).present is True
+        assert hg.guard_status(target).matches is True
+        assert hg.guard_status(decoy).present is False
+
+
+class TestDoctorGuardPosture:
+    """T10 — the guard check is WARN-never-FAIL in every guard state
+    (KTD-2): maestro requires doctor to exit 0, so even the bad states must
+    not raise the FAIL count.
+    """
+
+    @staticmethod
+    def _wire_config():
+        config = Path(cli.hermes_config_path())
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n"
+            "  engine: magic-context\n"
+            "memory:\n"
+            "  provider: magic_context\n"
+            "plugins:\n"
+            "  enabled:\n"
+            "    - magic-hermes\n",
+            encoding="utf-8",
+        )
+
+    def _doctor(self, tmp_path, monkeypatch, isolated_home, db_setup):
+        db = tmp_path / "context.db"
+        db_setup(db)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        self._wire_config()
+
+        tested = cli.tested_magic_context_version()
+        package = make_package(tmp_path / "pkg", tested)
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+
+        sidecar = mock.MagicMock()
+        sidecar.call.side_effect = lambda method, params=None, timeout=60: {
+            "hello": {"harness": "hermes", "package_version": tested},
+            "doctor": {
+                "database_health": "ok",
+                "core_symbols_ready": True,
+                "supported_series": series,
+            },
+        }[method]
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+
+        with (
+            mock.patch.object(
+                cli, "discover_installations", return_value=[(package, tested)]
+            ),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+        ):
+            code = cli.run_doctor(json_output=False)
+        return code
+
+    @staticmethod
+    def _present(db):
+        from magic_hermes import historian_guard as hg
+
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+
+    @staticmethod
+    def _absent(db):
+        from magic_hermes import historian_guard as hg
+
+        hg.make_fixture_db(db)
+
+    @staticmethod
+    def _drifted(db):
+        from magic_hermes import historian_guard as hg
+
+        hg.make_fixture_db(db)
+        con = sqlite3.connect(db)
+        con.execute(
+            f"create trigger {hg.TRIGGER_NAME} "
+            "after insert on historian_runs "
+            "begin select 1; end;"
+        )
+        con.commit()
+        con.close()
+
+    @staticmethod
+    def _unreadable(db):
+        db.write_bytes(b"this is not a sqlite database at all\n")
+
+    def test_guard_present_is_pass_and_never_fails(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        code = self._doctor(tmp_path, monkeypatch, isolated_home, self._present)
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Historian classification guard active" in out
+
+    def test_guard_absent_warns_but_never_fails(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        code = self._doctor(tmp_path, monkeypatch, isolated_home, self._absent)
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "guard not installed" in out
+        assert "guard apply" in out
+
+    def test_guard_drift_warns_but_never_fails(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        code = self._doctor(tmp_path, monkeypatch, isolated_home, self._drifted)
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "drifted" in out
+
+    def test_guard_unreadable_warns_but_never_fails(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        code = self._doctor(tmp_path, monkeypatch, isolated_home, self._unreadable)
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "guard state unreadable" in out
+
+    def test_doctor_json_includes_guard_check(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        self._wire_config()
+
+        tested = cli.tested_magic_context_version()
+        package = make_package(tmp_path / "pkg", tested)
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+        sidecar = mock.MagicMock()
+        sidecar.call.side_effect = lambda method, params=None, timeout=60: {
+            "hello": {"harness": "hermes", "package_version": tested},
+            "doctor": {
+                "database_health": "ok",
+                "core_symbols_ready": True,
+                "supported_series": series,
+            },
+        }[method]
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+
+        with (
+            mock.patch.object(
+                cli, "discover_installations", return_value=[(package, tested)]
+            ),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+        ):
+            assert cli.run_doctor(json_output=True) == 0
+        payload = json.loads(capsys.readouterr().out)
+        guard_checks = [
+            c
+            for c in payload["checks"]
+            if "Historian classification guard" in c["message"]
+        ]
+        assert guard_checks, "doctor --json must surface the guard check"
+        assert guard_checks[0]["status"] == "PASS"
+        assert payload["summary"]["fail"] == 0
+
+
+class TestDoctorSidecarRetry:
+    """R2 (finding c7d63424) — the doctor sidecar pair (hello + doctor)
+    gets exactly one retry, and only when the first failure was fast.
+
+    A transient boot lock (the 5x rc=124 cluster) must not mint a FAIL
+    against maestro's 90 s verdict; a persistent lock must FAIL exactly
+    once, quoting both attempts' stderr tails so the operator sees what
+    both tries actually said.
+    """
+
+    @staticmethod
+    def _wire_config():
+        config = Path(cli.hermes_config_path())
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n"
+            "  engine: magic-context\n"
+            "memory:\n"
+            "  provider: magic_context\n"
+            "plugins:\n"
+            "  enabled:\n"
+            "    - magic-hermes\n",
+            encoding="utf-8",
+        )
+
+    def _run_doctor_with_attempts(
+        self, tmp_path, monkeypatch, isolated_home, scripts, fast_fail_s=None
+    ):
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        self._wire_config()
+
+        tested = cli.tested_magic_context_version()
+        package = make_package(tmp_path / "pkg", tested)
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+        attempts = []
+
+        def make_client(*args, **kwargs):
+            sidecar = mock.MagicMock()
+            script = scripts[min(len(attempts), len(scripts) - 1)]
+
+            def call(method, params=None, timeout=60):
+                return script(method, tested, series)
+
+            sidecar.call.side_effect = call
+            client = mock.MagicMock()
+            client.__enter__.return_value = sidecar
+            client.__exit__.return_value = False
+            attempts.append(client)
+            return client
+
+        with (
+            mock.patch.object(
+                cli, "discover_installations", return_value=[(package, tested)]
+            ),
+            mock.patch.object(cli, "RuntimeClient", side_effect=make_client),
+            mock.patch.object(cli, "_SIDECAR_RETRY_BACKOFF_S", 0.0),
+        ):
+            if fast_fail_s is not None:
+                monkeypatch.setattr(cli, "_SIDECAR_FAST_FAIL_S", fast_fail_s)
+            code = cli.run_doctor(json_output=False)
+        return code, attempts
+
+    @staticmethod
+    def _ok(method, tested, series):
+        if method == "hello":
+            return {"harness": "hermes", "package_version": tested}
+        return {
+            "database_health": "ok",
+            "core_symbols_ready": True,
+            "supported_series": series,
+        }
+
+    def test_transient_fast_failure_retries_and_recovers(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        def boot_lock(method, tested, series):
+            raise RuntimeError(
+                "Runtime exited during hello (status 1); "
+                "stderr: SQLITE_BUSY boot lock tail-one"
+            )
+
+        code, attempts = self._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [boot_lock, self._ok]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "◆  FAIL" not in out
+        assert len(attempts) == 2  # fresh client per attempt, never reused
+
+    def test_persistent_fast_failure_fails_once_quoting_both_tails(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        calls = {"n": 0}
+
+        def always_fail(method, tested, series):
+            calls["n"] += 1
+            raise RuntimeError(
+                f"Runtime exited during {method} (status 1); "
+                f"stderr: SQLITE_BUSY tail-{calls['n']}"
+            )
+
+        code, attempts = self._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [always_fail, always_fail]
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert len(attempts) == 2  # one retry, then stop
+        assert out.count("◆  FAIL") == 1  # exactly one FAIL entry
+        assert "tail-1" in out and "tail-2" in out  # both attempts quoted
+
+    def test_slow_first_failure_skips_the_retry(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        def slow_fail(method, tested, series):
+            raise RuntimeError(
+                "Runtime exited during doctor (status 124); stderr: timeout tail-slow"
+            )
+
+        # a zero gate makes any real elapsed time "slow": a failure that
+        # already burned the budget must not be retried
+        code, attempts = self._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [slow_fail], fast_fail_s=0.0
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert len(attempts) == 1
+        assert "tail-slow" in out
+        assert out.count("Magic Context sidecar failed") == 1
+
+    def test_retry_success_with_over_gate_store_warns_without_failing(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        def boot_lock(method, tested, series):
+            raise RuntimeError(
+                "Runtime exited during hello (status 1); stderr: boot lock tail-gate"
+            )
+
+        def over_gate(method, tested, series):
+            if method == "hello":
+                return {"harness": "hermes", "package_version": tested}
+            return {
+                "database_health": "skipped:store-size 3690000000 > 1610612736",
+                "scan_mode": "metadata",
+                "store_bytes": 3690000000,
+                "probe_ms": 4300.0,
+                "core_symbols_ready": True,
+                "supported_series": series,
+            }
+
+        code, attempts = self._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [boot_lock, over_gate]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "◆  FAIL" not in out
+        assert "WARN" in out
+        assert "store-size" in out
+        assert len(attempts) == 2

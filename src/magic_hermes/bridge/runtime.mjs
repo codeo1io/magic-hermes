@@ -1752,6 +1752,25 @@ async function renderContext(args) {
   };
 }
 
+// Hermes-lane historian telemetry: upstream's own writer records exactly one
+// row per terminal outcome of an engaged pass into the shared historian_runs
+// table, giving the Hermes lane the same observability the pi and opencode
+// lanes already have. Recording is a fail-open side channel — it must never
+// block or break compaction (upstream's writer swallows its own errors; this
+// wrapper keeps that guarantee for symbol or input-shape drift).
+function recordHistorianRunOutcome(session, fields) {
+  try {
+    mc("recordHistorianRun")(db, {
+      sessionId: session.id,
+      harness: "hermes",
+      runKind: "incremental",
+      ...fields
+    });
+  } catch {
+    // Best-effort telemetry only; historian behavior is unchanged.
+  }
+}
+
 function historianPrepare(args) {
   const session = getSession(args);
   const messages = Array.isArray(args.messages) ? args.messages : [];
@@ -1775,11 +1794,19 @@ function historianPrepare(args) {
     : Math.max(offset, rawEnd - protectLast + 1);
   if (protectedTailStart <= offset) {
     session.pendingHistorian = null;
+    recordHistorianRunOutcome(session, {
+      status: "noop",
+      failureReason: "protected-tail"
+    });
     return { ready: false, reason: "protected-tail" };
   }
 
   const historian = mc("resolveHistorianFromConfig")(session.config);
   if (!historian) {
+    recordHistorianRunOutcome(session, {
+      status: "noop",
+      failureReason: "historian-disabled"
+    });
     return { ready: false, reason: "historian-disabled" };
   }
   const model = String(historian.model || "");
@@ -1797,6 +1824,10 @@ function historianPrepare(args) {
   );
   if (!chunk.text || chunk.messageCount === 0) {
     session.pendingHistorian = null;
+    recordHistorianRunOutcome(session, {
+      status: "noop",
+      failureReason: "empty-chunk"
+    });
     return { ready: false, reason: "empty-chunk" };
   }
 
@@ -1840,6 +1871,10 @@ function historianPrepare(args) {
   const lease = mc("acquireCompartmentLease")(db, session.id, leaseHolder);
   if (!lease) {
     session.pendingHistorian = null;
+    recordHistorianRunOutcome(session, {
+      status: "noop",
+      failureReason: "lease-held"
+    });
     return { ready: false, reason: "lease-held" };
   }
   mc("updateSessionMeta")(db, session.id, { compartmentInProgress: true });
@@ -1983,6 +2018,50 @@ async function historianPublish(args) {
     }
   }
 
+  // Record the success row while the pending pass still exists and before
+  // any post-publication side effect can throw: a later rendering or
+  // embedding exception reaches the engine's abort path, and
+  // telemetryRecorded keeps that abort from minting a second row for this
+  // pass (exactly one terminal row per engaged pass).
+  pending.telemetryRecorded = true;
+  {
+    const telemetryIds = persistedIds.filter((id) => typeof id === "number");
+    const telemetryFacts = validation.facts || [];
+    const telemetryTally = {};
+    for (const fact of telemetryFacts) {
+      const category = String(fact.category ?? "UNKNOWN").trim() || "UNKNOWN";
+      telemetryTally[category] = (telemetryTally[category] ?? 0) + 1;
+    }
+    const importanceValues = compartments
+      .map((compartment) => compartment.importance ?? 50)
+      .filter((value) => typeof value === "number" && Number.isFinite(value));
+    recordHistorianRunOutcome(session, {
+      status: "success",
+      failureReason: null,
+      chunkStartOrdinal: pending.chunk.startIndex,
+      chunkEndOrdinal: pending.chunk.endIndex,
+      unprocessedFrom: lastNewEnd + 1,
+      compartmentsProduced: compartments.length,
+      compartmentIdMin:
+        telemetryIds.length > 0 ? Math.min(...telemetryIds) : null,
+      compartmentIdMax:
+        telemetryIds.length > 0 ? Math.max(...telemetryIds) : null,
+      factsEmitted: telemetryFacts.length,
+      factsByCategory: telemetryTally,
+      factsPromoted: promoted.length,
+      eventsEmitted: (validation.events || []).length,
+      eventsPublished: eventsStored,
+      importanceMin:
+        importanceValues.length > 0 ? Math.min(...importanceValues) : null,
+      importanceMax:
+        importanceValues.length > 0 ? Math.max(...importanceValues) : null,
+      importanceAvg: importanceValues.length > 0
+        ? importanceValues.reduce((total, value) => total + value, 0) /
+          importanceValues.length
+        : null
+    });
+  }
+
   // Match the upstream post-publication side effects that feed note nudges and
   // downstream primer/embedding pipelines. These are MC-owned state changes,
   // not Hermes scheduling policy.
@@ -2114,6 +2193,32 @@ function historianAbort(args) {
     mc("releaseCompartmentLease")(db, session.id, pending.leaseHolder);
   }
   session.pendingHistorian = null;
+  // One terminal telemetry row per engaged pass: record only when a pending
+  // pass existed at entry and publish has not already recorded its outcome.
+  // The engine classifies engine-side failures into args.outcome; sanitize
+  // defensively so the Hermes lane can never store a failed row without a
+  // non-NULL failure reason.
+  if (pending && !pending.telemetryRecorded) {
+    const outcome = args.outcome && typeof args.outcome === "object"
+      ? args.outcome
+      : {};
+    let status = String(outcome.status ?? "noop");
+    if (status !== "success" && status !== "noop" && status !== "failed") {
+      status = "noop";
+    }
+    let reason = outcome.reason == null ? null : String(outcome.reason);
+    if (status === "failed") {
+      reason = reason && reason.trim() ? reason : "unspecified failure";
+    } else if (status === "noop") {
+      reason = reason && reason.trim() ? reason : "aborted";
+    }
+    recordHistorianRunOutcome(session, {
+      status,
+      failureReason: reason,
+      chunkStartOrdinal: pending.chunk?.startIndex ?? null,
+      chunkEndOrdinal: pending.chunk?.endIndex ?? null
+    });
+  }
   return { aborted: true };
 }
 
@@ -2444,20 +2549,88 @@ async function dreamerRunManual(args) {
   return result;
 }
 
+function doctorScanGateFromEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
 function runtimeDoctor(args = {}) {
   const sessionId = String(args.session_id || "");
   const session = sessionId ? sessions.get(sessionId) : null;
+  const fullIntegrity = args.full_integrity === true;
+  // Bounded-scan gates (R1, finding c7d63424): the live 3.4 GB store made
+  // the unbounded quick_check the dominant term of every doctor or probe
+  // cycle, starving maestro's single-shot 90 s verdict into rc=124
+  // timeouts. Both gates are read once per doctor call from the
+  // environment the host copied verbatim (runtime.py's Popen env).
+  const scanMaxBytes = doctorScanGateFromEnv(
+    "MAGIC_CONTEXT_DOCTOR_SCAN_MAX_BYTES",
+    1610612736
+  );
+  const scanProbeGateMs = doctorScanGateFromEnv(
+    "MAGIC_CONTEXT_DOCTOR_SCAN_PROBE_MS",
+    2000
+  );
   let databaseHealth = "unknown";
+  let scanMode = "full";
+  let storeBytes = null;
+  let probeMs = null;
   try {
-    const rows = db.prepare("PRAGMA quick_check").all();
-    const first = rows?.[0];
-    databaseHealth = String(
-      first?.quick_check ?? first?.integrity_check ?? Object.values(first || {})[0] ?? "unknown"
-    );
+    // Size gate: the main database file only. The WAL is deliberately
+    // uncounted — upstream maintenance checkpoints it away while the
+    // main file only ever grows.
+    try {
+      const pageSize = Number(db.prepare("PRAGMA page_size").get()?.page_size);
+      const pageCount = Number(db.prepare("PRAGMA page_count").get()?.page_count);
+      if (pageSize > 0 && pageCount > 0) {
+        storeBytes = pageSize * pageCount;
+      }
+    } catch (error) {
+      // An unmeasured size is not evidence of an over-gate store; the
+      // probe and the scan below decide the health.
+    }
+    // Contention gate: time a single catalog read. A probe that cannot
+    // fit in the gate means quick_check cannot fit either — degrade
+    // honestly instead of burning the caller's budget.
+    try {
+      const probeStarted = performance.now();
+      db.prepare("SELECT count(*) FROM sqlite_master").get();
+      probeMs = performance.now() - probeStarted;
+    } catch (error) {
+      if (!fullIntegrity) {
+        databaseHealth =
+          "skipped:probe-error " +
+          (error instanceof Error ? error.message : String(error));
+        scanMode = "metadata";
+      }
+    }
+    if (databaseHealth === "unknown" && !fullIntegrity) {
+      if (storeBytes !== null && storeBytes > scanMaxBytes) {
+        databaseHealth = `skipped:store-size ${storeBytes} > ${scanMaxBytes}`;
+        scanMode = "metadata";
+      } else if (probeMs !== null && probeMs > scanProbeGateMs) {
+        databaseHealth = `skipped:probe-ms ${probeMs} > ${scanProbeGateMs}`;
+        scanMode = "metadata";
+      }
+    }
+    if (databaseHealth === "unknown") {
+      const rows = db.prepare("PRAGMA quick_check").all();
+      const first = rows?.[0];
+      databaseHealth = String(
+        first?.quick_check ?? first?.integrity_check ?? Object.values(first || {})[0] ?? "unknown"
+      );
+    }
   } catch (error) {
     databaseHealth = "error:" + (error instanceof Error ? error.message : String(error));
   }
-  return {
+  const result = {
     package_version: packageJson.version,
     package_root: packageRoot,
     harness: "hermes",
@@ -2465,6 +2638,7 @@ function runtimeDoctor(args = {}) {
     core_symbols_ready: missingCoreSymbols.length === 0,
     missing_core_symbols: [...missingCoreSymbols],
     database_health: databaseHealth,
+    scan_mode: scanMode,
     session_bound: Boolean(session),
     project_identity: session?.projectIdentity ?? null,
     project_root: session?.projectRoot ?? null,
@@ -2472,6 +2646,13 @@ function runtimeDoctor(args = {}) {
     config_loaded_from: session ? [...(session.configLoadedFrom || [])] : [],
     config_warnings: session ? [...(session.configWarnings || [])] : []
   };
+  if (storeBytes !== null) {
+    result.store_bytes = storeBytes;
+  }
+  if (probeMs !== null) {
+    result.probe_ms = probeMs;
+  }
+  return result;
 }
 
 let nextHostCallbackId = 1;
