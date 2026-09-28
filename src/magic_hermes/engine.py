@@ -26,6 +26,18 @@ except ImportError:  # pragma: no cover - Hermes is absent in isolated unit test
 Completion = Callable[..., str]
 SessionRoute = Callable[[str, str | None], None]
 
+# Terminal historian failures are summarized into the shared historian_runs
+# table through the abort outcome; the recorded failure reason stays a
+# bounded, human-readable summary rather than a full traceback.
+_HISTORIAN_FAILURE_REASON_LIMIT = 300
+
+
+def _historian_failure_reason(error: BaseException) -> str:
+    """Concise non-empty failure summary (type + message) for telemetry."""
+
+    summary = f"{type(error).__name__}: {error}"[:_HISTORIAN_FAILURE_REASON_LIMIT]
+    return summary.strip() or type(error).__name__
+
 
 def _resolve_host_project_root() -> str:
     """Resolve Hermes' logical working directory, falling back to process cwd."""
@@ -310,6 +322,10 @@ class MagicContextEngine(_ContextEngineBase):
             return None
         prepared_started = False
         published_ok = False
+        # Terminal classification handed to the bridge on abort so the shared
+        # historian_runs table records why the pass ended. None (plain cancel)
+        # lets the bridge default to a benign "aborted" outcome.
+        terminal_outcome: dict[str, str] | None = None
         lease_stop = threading.Event()
         lease_thread: threading.Thread | None = None
         try:
@@ -434,11 +450,21 @@ class MagicContextEngine(_ContextEngineBase):
                 if isinstance(compacted, list) and compacted:
                     return compacted
                 return None
+            rejection = str(published.get("error", "unknown validation error"))
+            reason = f"historian output rejected: {rejection}"
+            terminal_outcome = {
+                "status": "failed",
+                "reason": reason[:_HISTORIAN_FAILURE_REASON_LIMIT],
+            }
             log.warning(
                 "Magic Context historian output was rejected: %s",
-                published.get("error", "unknown validation error"),
+                rejection,
             )
-        except Exception:
+        except Exception as error:
+            terminal_outcome = {
+                "status": "failed",
+                "reason": _historian_failure_reason(error),
+            }
             log.warning(
                 "Magic Context historian pass failed open; transcript is unchanged",
                 exc_info=True,
@@ -456,10 +482,13 @@ class MagicContextEngine(_ContextEngineBase):
             ):
                 lease_thread.join(timeout=1.0)
             if prepared_started and not published_ok:
+                abort: dict[str, Any] = {"session_id": session_id}
+                if terminal_outcome is not None:
+                    abort["outcome"] = terminal_outcome
                 try:
                     client.call(
                         "historian_abort",
-                        {"session_id": session_id},
+                        abort,
                         timeout=30,
                     )
                 except Exception:

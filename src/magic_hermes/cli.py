@@ -22,6 +22,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .historian_guard import (
+    RETIRES_AT_UPSTREAM,
+    TRIGGER_NAME,
+    GuardError,
+    apply_guard,
+    guard_status,
+    remove_guard,
+)
 from .runtime import (
     RuntimeClient,
     _package_version,
@@ -524,6 +532,45 @@ def run_doctor(json_output: bool = False) -> int:
         lane = db_schema_lane(db_path)
         if lane is not None:
             report.add("INFO", f"Shared DB schema migration lane: v{lane}")
+        # Historian classification guard (maestro finding d59758598379):
+        # deliberately WARN-only in every bad state — maestro requires
+        # doctor to exit 0, and a FAIL here would break that invariant
+        # while the guard is merely a workaround (KTD-2).
+        guard = guard_status(db_path)
+        if guard.error is not None:
+            report.add(
+                "WARN",
+                "Historian classification guard state unreadable: "
+                f"{guard.error}",
+            )
+        elif not guard.present:
+            report.add(
+                "WARN",
+                "Historian classification guard not installed on the shared "
+                "store — run `magic-hermes guard apply` to stop benign "
+                "historian early-returns being recorded as failed/NULL "
+                "(maestro finding d59758598379)",
+            )
+        elif not guard.matches:
+            report.add(
+                "WARN",
+                "Historian classification guard has drifted from the "
+                "canonical DDL — re-run `magic-hermes guard apply` to repair "
+                "it",
+            )
+        elif RETIRES_AT_UPSTREAM is not None:
+            report.add(
+                "INFO",
+                "Historian classification guard active and eligible for "
+                f"retirement (upstream fixed in {RETIRES_AT_UPSTREAM}) — "
+                "run `magic-hermes guard remove`",
+            )
+        else:
+            report.add(
+                "PASS",
+                "Historian classification guard active "
+                f"({guard.marker_rows_24h} rows reclassified in the last 24h)",
+            )
     else:
         report.add(
             "INFO",
@@ -593,6 +640,91 @@ def run_doctor(json_output: bool = False) -> int:
         )
         print("└  Doctor complete")
     return 1 if report.failed else 0
+
+
+# ---------------------------------------------------------------------------
+# guard command
+# ---------------------------------------------------------------------------
+
+
+def run_guard(action: str) -> int:
+    """Manage the shared-store historian classification guard.
+
+    ``apply`` is fail-loud: it exits 1 when the store is missing, when the
+    guard refuses the store, or when the post-apply semantic verification
+    fails, so deploy scripts never mistake a silent no-op for coverage.
+    ``remove`` and ``status`` are informational/idempotent and exit 0.
+    """
+
+    db_path = shared_db_path()
+    if db_path is None:
+        if action == "apply":
+            print(
+                "No shared context store found — it is created on first "
+                "successful runtime bind; set MAGIC_CONTEXT_DB_PATH to "
+ "target a specific store",
+                file=sys.stderr,
+            )
+            return 1
+        print("No shared context store found — guard not present")
+        return 0
+
+    if action == "apply":
+        print("┌  magic-hermes guard apply")
+        print(f"│  store: {db_path}")
+        print(f"│  trigger: {TRIGGER_NAME}")
+        prior = guard_status(db_path)
+        try:
+            result = apply_guard(db_path)
+        except GuardError as exc:
+            print(f"└  guard apply failed: {exc}", file=sys.stderr)
+            return 1
+        if result.repaired:
+            print("│  existing trigger drifted from the canonical DDL — dropped "
+                  "and re-created")
+        elif prior.present:
+            print("│  already installed and matching the canonical DDL — no-op")
+        else:
+            print("│  trigger installed")
+        if result.verification_failures:
+            for failure in result.verification_failures:
+                print(f"│  semantic verification FAILED: {failure}", file=sys.stderr)
+            print("└  guard applied but verification failed")
+            return 1
+        print("│  semantic verification on a throwaway fixture store: ok")
+        print("└  guard apply complete")
+        return 0
+
+    if action == "remove":
+        removed = remove_guard(db_path)
+        if removed:
+            print(f"Historian classification guard {TRIGGER_NAME} removed "
+                  f"from {db_path}")
+        else:
+            print(f"No {TRIGGER_NAME} trigger present at {db_path} — "
+                  "nothing to remove")
+        return 0
+
+    status = guard_status(db_path)
+    print("┌  magic-hermes guard status")
+    print(f"│  store: {db_path}")
+    if status.error is not None:
+        print(f"│  guard state unreadable: {status.error}")
+    elif not status.present:
+        print("│  trigger: not installed — run `magic-hermes guard apply`")
+    else:
+        state = (
+            "matches canonical DDL"
+            if status.matches
+            else "DRIFTED from canonical DDL"
+        )
+        print(f"│  trigger {TRIGGER_NAME}: present, {state}")
+        print(f"│  rows reclassified in the last 24h: {status.marker_rows_24h}")
+        if RETIRES_AT_UPSTREAM is not None:
+            print(f"│  eligible for retirement (upstream fixed in "
+                  f"{RETIRES_AT_UPSTREAM})")
+    print("└  guard status complete")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +871,17 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="check installation health")
     doctor.add_argument("--json", action="store_true", help="machine-readable output")
 
+    guard = sub.add_parser(
+        "guard",
+        help="manage the historian classification guard on the shared store",
+    )
+    guard.add_argument(
+        "action",
+        choices=("apply", "remove", "status"),
+        help="apply: install/repair (fail-loud); remove: retire; "
+        "status: read-only state",
+    )
+
     return parser
 
 
@@ -751,6 +894,8 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             skip_config=args.skip_config,
         )
+    if args.command == "guard":
+        return run_guard(action=args.action)
     return run_doctor(json_output=args.json)
 
 
