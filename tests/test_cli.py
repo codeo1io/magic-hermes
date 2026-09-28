@@ -892,3 +892,68 @@ class TestDoctorWallBudget:
             < cli._DOCTOR_WALL_BUDGET_S
         )
         assert 0.0 < cli._DOCTOR_WALL_RENDER_RESERVE_S < 1.0
+
+
+class TestDoctorSkipWording:
+    """U16c (R6, run 589cf794) — the skipped-scan WARN must follow the
+    probe outcome: the probe-error lane must not claim that probe reads
+    succeeded. The WARN/``FAIL 0`` contract itself is unchanged, so a
+    degraded probe still exits 0 against maestro's verdict grep.
+    """
+
+    def test_probe_error_skip_never_claims_probe_success(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        harness = TestDoctorSidecarRetry()
+
+        def probe_error(method, tested, series):
+            if method == "hello":
+                return {"harness": "hermes", "package_version": tested}
+            return {
+                "database_health": (
+                    "skipped:probe-error database disk image is malformed (code 1)"
+                ),
+                "scan_mode": "metadata",
+                "core_symbols_ready": True,
+                "supported_series": series,
+            }
+
+        code, _ = harness._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [probe_error]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "◆  FAIL" not in out
+        assert "WARN" in out
+        assert "probe-error" in out
+        assert "unverified" in out
+        assert "probe reads succeeded" not in out
+
+    def test_probe_success_skip_keeps_the_probe_success_wording(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # probe-success skip lanes (store-size, probe-ms, deadline) keep
+        # the truthful "probe reads succeeded" claim
+        harness = TestDoctorSidecarRetry()
+
+        def deadline_skip(method, tested, series):
+            if method == "hello":
+                return {"harness": "hermes", "package_version": tested}
+            return {
+                "database_health": "skipped:deadline 62000 > 45000",
+                "scan_mode": "budgeted",
+                "scan_estimate_ms": 62000,
+                "scan_budget_ms": 45000,
+                "core_symbols_ready": True,
+                "supported_series": series,
+            }
+
+        code, _ = harness._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [deadline_skip]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "◆  FAIL" not in out
+        assert "WARN" in out
+        assert "deadline" in out
+        assert "probe reads succeeded" in out
