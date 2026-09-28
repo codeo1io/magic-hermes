@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { register } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -1921,6 +1921,33 @@ function historianRenew(args) {
   };
 }
 
+// R6/U16b (run 589cf794): upstream getCompartments materializes every
+// compartment row for the session (`SELECT * ... ORDER BY sequence ASC`)
+// only for the caller to immediately discard all but the newest N ids.
+// Inside the publish transaction that full fetch is the historian's own
+// unbounded read against the shared store. The bounded mirror below
+// reads exactly N ids using the same table and ordering, and falls back
+// to the original full fetch on any error so upstream schema drift can
+// degrade the optimization, never the publication.
+function lastCompartmentIds(db, sessionId, count) {
+  if (!(count > 0)) {
+    return [];
+  }
+  try {
+    const rows = db
+      .prepare(
+        "SELECT id FROM compartments WHERE session_id = ? " +
+          "ORDER BY sequence DESC LIMIT ?"
+      )
+      .all(sessionId, count);
+    return rows.map((row) => row.id).reverse();
+  } catch {
+    return mc("getCompartments")(db, sessionId)
+      .slice(-count)
+      .map((compartment) => compartment.id);
+  }
+}
+
 async function historianPublish(args) {
   const session = getSession(args);
   const pending = session.pendingHistorian;
@@ -1978,9 +2005,7 @@ async function historianPublish(args) {
   db.exec("BEGIN IMMEDIATE");
   try {
     mc("appendCompartments")(db, session.id, compartments);
-    persistedIds = mc("getCompartments")(db, session.id)
-      .slice(-compartments.length)
-      .map((compartment) => compartment.id);
+    persistedIds = lastCompartmentIds(db, session.id, compartments.length);
     if (session.config.memory?.enabled && session.config.memory?.auto_promote) {
       promoted = mc("promoteSessionFactsDurable")(
         db,
@@ -2561,6 +2586,96 @@ function doctorScanGateFromEnv(name, fallback) {
   return parsed;
 }
 
+// R4/U14 (run 589cf794): scan affordability estimation. quick_check reads
+// every page of the store sequentially, and DatabaseSync cannot interrupt
+// a started statement, so before starting the scan the doctor measures a
+// bounded, read-only sample of real data pages and projects the sample's
+// read rate across the whole store (main + WAL bytes). Both halves are
+// deliberately conservative: the bytes the sample read are counted at a
+// per-row floor that undercounts wide rows (so the measured rate is a
+// lower bound), and the floor term assumes the most pessimistic
+// sequential throughput any local volume provides — a store that could
+// not finish in time even at that rate is unaffordable regardless of
+// what the sample says. When in doubt the estimate is high and the scan
+// is skipped; the WARN names the real numbers and the offline audit.
+const SCAN_ESTIMATE_FLOOR_BYTES_PER_MS = (42 * 1024 * 1024) / 1000;
+const SCAN_ESTIMATE_SAFETY = 4;
+const SCAN_ESTIMATE_SAMPLE_ROWS = 1024;
+const SCAN_ESTIMATE_MIN_ROW_BYTES = 64;
+const SCAN_ESTIMATE_CANDIDATE_TABLES = 12;
+
+function doctorScanEstimateMs(storeBytes) {
+  try {
+    if (typeof storeBytes !== "number" || !(storeBytes > 0)) {
+      return { ok: false, reason: "store size unmeasured" };
+    }
+    const floorMs = storeBytes / SCAN_ESTIMATE_FLOOR_BYTES_PER_MS;
+    const tables = db
+      .prepare(
+        "SELECT name FROM sqlite_master " +
+          "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND rootpage > 0 " +
+          "ORDER BY name LIMIT " +
+          SCAN_ESTIMATE_CANDIDATE_TABLES
+      )
+      .all();
+    // Sample the widest rowid table we can find cheaply: max(rowid) is a
+    // rightmost-seek on each candidate, and the table with the most rows
+    // dominates the store's pages, so its rate is the representative one.
+    let widest = null;
+    for (const row of tables) {
+      const name = String(row.name).replaceAll('"', '""');
+      try {
+        const maxRowid = Number(
+          db.prepare(`SELECT max(rowid) AS m FROM "${name}"`).get()?.m
+        );
+        if (
+          Number.isFinite(maxRowid) &&
+          maxRowid >= 1 &&
+          (!widest || maxRowid > widest.maxRowid)
+        ) {
+          widest = { name, maxRowid };
+        }
+      } catch {
+        // A table that cannot serve the seek (WITHOUT ROWID, locked,
+        // corrupt) is not a candidate; it is skipped, never fatal.
+      }
+    }
+    let sampledBytesPerMs = null;
+    if (widest) {
+      const start = Math.max(1, widest.maxRowid - SCAN_ESTIMATE_SAMPLE_ROWS + 1);
+      const sampleStarted = performance.now();
+      const rows = db
+        .prepare(
+          `SELECT rowid AS r FROM "${widest.name}" ` +
+            `WHERE rowid >= ? LIMIT ${SCAN_ESTIMATE_SAMPLE_ROWS}`
+        )
+        .all(start);
+      const sampleMs = performance.now() - sampleStarted;
+      if (Array.isArray(rows) && rows.length > 0) {
+        const sampleBytes = Math.max(
+          rows.length * SCAN_ESTIMATE_MIN_ROW_BYTES,
+          4096
+        );
+        sampledBytesPerMs = sampleBytes / Math.max(sampleMs, 0.05);
+      }
+    }
+    if (sampledBytesPerMs === null) {
+      // No table yielded a sample (an empty or unreadable store): trust
+      // only the absolute floor.
+      return { ok: true, estimateMs: floorMs };
+    }
+    const sampleMs = (storeBytes / sampledBytesPerMs) * SCAN_ESTIMATE_SAFETY;
+    return { ok: true, estimateMs: Math.max(floorMs, sampleMs) };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: String(
+        error instanceof Error ? error.message : error
+      ).slice(0, 120)
+    };
+  }
+}
+
 function runtimeDoctor(args = {}) {
   const sessionId = String(args.session_id || "");
   const session = sessionId ? sessions.get(sessionId) : null;
@@ -2578,23 +2693,58 @@ function runtimeDoctor(args = {}) {
     "MAGIC_CONTEXT_DOCTOR_SCAN_PROBE_MS",
     2000
   );
+  // Scan deadline slice (U14, R4): the projected quick_check must fit
+  // inside this many seconds or the scan is never started. Parsed with
+  // the same invalid-falls-back-to-default rule as the merged knobs.
+  const scanDeadlineS = doctorScanGateFromEnv(
+    "MAGIC_CONTEXT_DOCTOR_SCAN_DEADLINE_S",
+    45
+  );
   let databaseHealth = "unknown";
   let scanMode = "full";
   let storeBytes = null;
+  let walBytes = null;
+  let scanEstimateMs = null;
+  let scanBudgetMs = null;
   let probeMs = null;
   try {
-    // Size gate: the main database file only. The WAL is deliberately
-    // uncounted — upstream maintenance checkpoints it away while the
-    // main file only ever grows.
+    // Size gate (U16a, R6): main file plus WAL sibling. The merged gate
+    // counted logical pages of the main file only, so a small main file
+    // with an oversized write-ahead log slipped past it and started the
+    // very unaffordable scan the gate exists to prevent. Resolving the
+    // path read-only through pragma_database_list and statSync never
+    // opens or writes the store, so it cannot checkpoint the WAL or
+    // contend a live writer; an unmeasurable size falls back to logical
+    // pages, and unmeasured stays unmeasured (never evidence of small).
     try {
-      const pageSize = Number(db.prepare("PRAGMA page_size").get()?.page_size);
-      const pageCount = Number(db.prepare("PRAGMA page_count").get()?.page_count);
-      if (pageSize > 0 && pageCount > 0) {
-        storeBytes = pageSize * pageCount;
+      const mainFile = db
+        .prepare("SELECT file FROM pragma_database_list WHERE name = 'main'")
+        .get()?.file;
+      if (typeof mainFile === "string" && mainFile.length > 0) {
+        const mainBytes = statSync(mainFile).size;
+        walBytes = 0;
+        try {
+          walBytes = statSync(`${mainFile}-wal`).size;
+        } catch {
+          // No WAL sibling next to the store: an honest zero.
+        }
+        storeBytes = mainBytes + walBytes;
       }
     } catch (error) {
-      // An unmeasured size is not evidence of an over-gate store; the
-      // probe and the scan below decide the health.
+      // fall through to the logical-page fallback
+    }
+    if (storeBytes === null) {
+      try {
+        const pageSize = Number(db.prepare("PRAGMA page_size").get()?.page_size);
+        const pageCount = Number(db.prepare("PRAGMA page_count").get()?.page_count);
+        if (pageSize > 0 && pageCount > 0) {
+          storeBytes = pageSize * pageCount;
+          walBytes = 0;
+        }
+      } catch (error) {
+        // An unmeasured size is not evidence of an over-gate store; the
+        // probe and the scan below decide the health.
+      }
     }
     // Contention gate: time a single catalog read. A probe that cannot
     // fit in the gate means quick_check cannot fit either — degrade
@@ -2618,6 +2768,23 @@ function runtimeDoctor(args = {}) {
       } else if (probeMs !== null && probeMs > scanProbeGateMs) {
         databaseHealth = `skipped:probe-ms ${probeMs} > ${scanProbeGateMs}`;
         scanMode = "metadata";
+      }
+    }
+    if (databaseHealth === "unknown" && !fullIntegrity) {
+      // Affordability gate (U14, R4 — the residual window the merged
+      // rider left open): a sub-gate store under contention can still be
+      // too slow to scan inside the verdict budget, and quick_check
+      // cannot be interrupted once started, so an unaffordable scan must
+      // never start. A miss (or an estimation failure) degrades to the
+      // metadata shape with the real numbers in the health string.
+      scanBudgetMs = Math.round(scanDeadlineS * 1000);
+      const estimate = doctorScanEstimateMs(storeBytes);
+      scanEstimateMs = estimate.estimateMs;
+      if (!estimate.ok || estimate.estimateMs > scanBudgetMs) {
+        databaseHealth = estimate.ok
+          ? `skipped:deadline ${Math.round(estimate.estimateMs)} > ${scanBudgetMs}`
+          : `skipped:deadline estimate-error ${estimate.reason} > ${scanBudgetMs}`;
+        scanMode = "budgeted";
       }
     }
     if (databaseHealth === "unknown") {
@@ -2651,6 +2818,15 @@ function runtimeDoctor(args = {}) {
   }
   if (probeMs !== null) {
     result.probe_ms = probeMs;
+  }
+  if (walBytes !== null) {
+    result.wal_bytes = walBytes;
+  }
+  if (scanBudgetMs !== null) {
+    result.scan_budget_ms = scanBudgetMs;
+  }
+  if (scanEstimateMs !== null) {
+    result.scan_estimate_ms = Math.round(scanEstimateMs);
   }
   return result;
 }
