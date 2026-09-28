@@ -582,3 +582,54 @@ def test_tool_result_is_json_and_passes_current_messages(tmp_path):
     assert result == {"content": "found"}
     tool_call = next(call for call in client.calls if call[0] == "tool")
     assert tool_call[1]["messages"] == messages
+
+
+def _usage_engine(tmp_path):
+    client = FakeClient({"bind": bind_result()})
+    engine = MagicContextEngine(
+        client=client, project_root=tmp_path, session_id="usage-session"
+    )
+    engine.context_length = 1_000_000
+    return engine, client
+
+
+def _usage_update_tokens(client):
+    return [
+        params["input_tokens"]
+        for method, params, _ in client.calls
+        if method == "usage_update"
+    ]
+
+
+def test_update_from_response_counts_cached_prompt(tmp_path):
+    # Hermes-normalized usage on a cached route: almost the whole prompt is cache.
+    engine, client = _usage_engine(tmp_path)
+    engine.update_from_response(
+        {
+            "input_tokens": 12,
+            "cache_read_tokens": 32_396,
+            "cache_write_tokens": 939_799,
+            "prompt_tokens": 972_207,
+            "output_tokens": 471,
+            "completion_tokens": 471,
+            "total_tokens": 972_678,
+        }
+    )
+    assert engine.last_prompt_tokens == 972_207
+    assert _usage_update_tokens(client)[-1] == 972_207
+
+
+def test_update_from_response_sums_cache_buckets_without_prompt_tokens(tmp_path):
+    engine, client = _usage_engine(tmp_path)
+    engine.update_from_response(
+        {"input_tokens": 12, "cache_read_tokens": 100, "cache_write_tokens": 900}
+    )
+    assert engine.last_prompt_tokens == 1_012
+    assert _usage_update_tokens(client)[-1] == 1_012
+
+
+def test_update_from_response_uncached_usage_unchanged(tmp_path):
+    engine, client = _usage_engine(tmp_path)
+    engine.update_from_response({"input_tokens": 5_000, "output_tokens": 10})
+    assert engine.last_prompt_tokens == 5_000
+    assert _usage_update_tokens(client)[-1] == 5_000
