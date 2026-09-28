@@ -397,7 +397,7 @@ class TestDoctorGuardPosture:
         series = ".".join(map(str, cli.supported_magic_context_series()))
 
         sidecar = mock.MagicMock()
-        sidecar.call.side_effect = lambda method, timeout=60: {
+        sidecar.call.side_effect = lambda method, params=None, timeout=60: {
             "hello": {"harness": "hermes", "package_version": tested},
             "doctor": {
                 "database_health": "ok",
@@ -497,7 +497,7 @@ class TestDoctorGuardPosture:
         package = make_package(tmp_path / "pkg", tested)
         series = ".".join(map(str, cli.supported_magic_context_series()))
         sidecar = mock.MagicMock()
-        sidecar.call.side_effect = lambda method, timeout=60: {
+        sidecar.call.side_effect = lambda method, params=None, timeout=60: {
             "hello": {"harness": "hermes", "package_version": tested},
             "doctor": {
                 "database_health": "ok",
@@ -525,3 +525,168 @@ class TestDoctorGuardPosture:
         assert guard_checks, "doctor --json must surface the guard check"
         assert guard_checks[0]["status"] == "PASS"
         assert payload["summary"]["fail"] == 0
+
+
+class TestDoctorSidecarRetry:
+    """R2 (finding c7d63424) — the doctor sidecar pair (hello + doctor)
+    gets exactly one retry, and only when the first failure was fast.
+
+    A transient boot lock (the 5x rc=124 cluster) must not mint a FAIL
+    against maestro's 90 s verdict; a persistent lock must FAIL exactly
+    once, quoting both attempts' stderr tails so the operator sees what
+    both tries actually said.
+    """
+
+    @staticmethod
+    def _wire_config():
+        config = Path(cli.hermes_config_path())
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n"
+            "  engine: magic-context\n"
+            "memory:\n"
+            "  provider: magic_context\n"
+            "plugins:\n"
+            "  enabled:\n"
+            "    - magic-hermes\n",
+            encoding="utf-8",
+        )
+
+    def _run_doctor_with_attempts(
+        self, tmp_path, monkeypatch, isolated_home, scripts, fast_fail_s=None
+    ):
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        self._wire_config()
+
+        tested = cli.tested_magic_context_version()
+        package = make_package(tmp_path / "pkg", tested)
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+        attempts = []
+
+        def make_client(*args, **kwargs):
+            sidecar = mock.MagicMock()
+            script = scripts[min(len(attempts), len(scripts) - 1)]
+
+            def call(method, params=None, timeout=60):
+                return script(method, tested, series)
+
+            sidecar.call.side_effect = call
+            client = mock.MagicMock()
+            client.__enter__.return_value = sidecar
+            client.__exit__.return_value = False
+            attempts.append(client)
+            return client
+
+        with (
+            mock.patch.object(
+                cli, "discover_installations", return_value=[(package, tested)]
+            ),
+            mock.patch.object(cli, "RuntimeClient", side_effect=make_client),
+            mock.patch.object(cli, "_SIDECAR_RETRY_BACKOFF_S", 0.0),
+        ):
+            if fast_fail_s is not None:
+                monkeypatch.setattr(cli, "_SIDECAR_FAST_FAIL_S", fast_fail_s)
+            code = cli.run_doctor(json_output=False)
+        return code, attempts
+
+    @staticmethod
+    def _ok(method, tested, series):
+        if method == "hello":
+            return {"harness": "hermes", "package_version": tested}
+        return {
+            "database_health": "ok",
+            "core_symbols_ready": True,
+            "supported_series": series,
+        }
+
+    def test_transient_fast_failure_retries_and_recovers(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        def boot_lock(method, tested, series):
+            raise RuntimeError(
+                "Runtime exited during hello (status 1); "
+                "stderr: SQLITE_BUSY boot lock tail-one"
+            )
+
+        code, attempts = self._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [boot_lock, self._ok]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "◆  FAIL" not in out
+        assert len(attempts) == 2  # fresh client per attempt, never reused
+
+    def test_persistent_fast_failure_fails_once_quoting_both_tails(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        calls = {"n": 0}
+
+        def always_fail(method, tested, series):
+            calls["n"] += 1
+            raise RuntimeError(
+                f"Runtime exited during {method} (status 1); "
+                f"stderr: SQLITE_BUSY tail-{calls['n']}"
+            )
+
+        code, attempts = self._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [always_fail, always_fail]
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert len(attempts) == 2  # one retry, then stop
+        assert out.count("◆  FAIL") == 1  # exactly one FAIL entry
+        assert "tail-1" in out and "tail-2" in out  # both attempts quoted
+
+    def test_slow_first_failure_skips_the_retry(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        def slow_fail(method, tested, series):
+            raise RuntimeError(
+                "Runtime exited during doctor (status 124); stderr: timeout tail-slow"
+            )
+
+        # a zero gate makes any real elapsed time "slow": a failure that
+        # already burned the budget must not be retried
+        code, attempts = self._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [slow_fail], fast_fail_s=0.0
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert len(attempts) == 1
+        assert "tail-slow" in out
+        assert out.count("Magic Context sidecar failed") == 1
+
+    def test_retry_success_with_over_gate_store_warns_without_failing(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        def boot_lock(method, tested, series):
+            raise RuntimeError(
+                "Runtime exited during hello (status 1); stderr: boot lock tail-gate"
+            )
+
+        def over_gate(method, tested, series):
+            if method == "hello":
+                return {"harness": "hermes", "package_version": tested}
+            return {
+                "database_health": "skipped:store-size 3690000000 > 1610612736",
+                "scan_mode": "metadata",
+                "store_bytes": 3690000000,
+                "probe_ms": 4300.0,
+                "core_symbols_ready": True,
+                "supported_series": series,
+            }
+
+        code, attempts = self._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [boot_lock, over_gate]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "◆  FAIL" not in out
+        assert "WARN" in out
+        assert "store-size" in out
+        assert len(attempts) == 2
