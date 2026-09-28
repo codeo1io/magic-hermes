@@ -2635,3 +2635,258 @@ def test_doctor_scan_probe_error_degrades_not_fails(monkeypatch, tmp_path):
         doctor = _doctor_scan(client)
     assert doctor["database_health"].startswith("skipped:probe-error ")
     assert doctor["scan_mode"] == "metadata"
+
+
+# --- doctor verdict-budget rider (R4/R6, run 589cf794, units U14/U16) -----
+#
+# U14 (R4): the merged size gate only bounds stores that are large on
+# disk; a sub-gate store under contention can still start a
+# `PRAGMA quick_check` that cannot finish inside the verdict budget —
+# and node:sqlite's DatabaseSync has no interrupt(), so a started scan
+# blocks the sidecar's only thread until it ends (the residual breach
+# window left by the merged rider). The doctor therefore ESTIMATES the
+# scan before starting it: a bounded, read-only sample of real data
+# pages yields a conservative read rate, the projected full-store scan
+# time is compared against a scan deadline slice, and an unaffordable
+# scan is never started — it degrades honestly instead:
+#
+#   MAGIC_CONTEXT_DOCTOR_SCAN_DEADLINE_S  default 45 (seconds); invalid
+#                                         or non-positive values fall
+#                                         back to the default, mirroring
+#                                         the merged gate knobs (a tiny
+#                                         POSITIVE value is the
+#                                         deterministic skip trigger)
+#
+# U16a (R6): the size gate counts what it claims — main + WAL bytes
+# (`store_bytes` is main+WAL, `wal_bytes` records the split) — so a
+# small main file with an oversized write-ahead log can no longer slip
+# past the gate and start an unaffordable scan. U16b (R6): historian
+# publish no longer materializes every compartment row just to keep
+# the newest N ids.
+
+
+def _fill_estimate_probe_table(db_path, rows=600, pad=120):
+    """A real b-tree table with data pages the estimator can sample.
+
+    Written from a second connection so the fixture needs no upstream
+    schema knowledge: any real rowid table is a valid rate sample for
+    the doctor's affordability estimate. Returns (page_size, rootpage)
+    so callers can corrupt the table's root page deterministically.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS estimate_probe "
+            "(id INTEGER PRIMARY KEY, pad TEXT NOT NULL)"
+        )
+        conn.executemany(
+            "INSERT INTO estimate_probe (pad) VALUES (?)",
+            [("x" * pad + f"-{index}",) for index in range(rows)],
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        root = conn.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'estimate_probe'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return page_size, root
+
+
+def test_doctor_scan_affordable_store_estimates_and_scans(tmp_path):
+    # happy path: the estimate runs, lands in the result next to its
+    # budget, and an affordable store still gets its full integrity scan
+    with RuntimeClient(
+        db_path=tmp_path / "doctor-budget-ok.db", timeout=60
+    ) as client:
+        doctor = _doctor_scan(client)
+    assert doctor["database_health"] == "ok"
+    assert doctor["scan_mode"] == "full"
+    assert doctor["scan_budget_ms"] == 45_000
+    assert 0 < doctor["scan_estimate_ms"] <= doctor["scan_budget_ms"]
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "abc", "1e999"])
+def test_doctor_scan_deadline_env_falls_back_on_invalid_values(
+    monkeypatch, tmp_path, value
+):
+    # unparsable, zero, negative, or infinite deadline values fall back
+    # to the 45 s default (the merged knobs' rule); a small store still
+    # gets its full scan — a tiny POSITIVE value is the skip trigger
+    monkeypatch.setenv("MAGIC_CONTEXT_DOCTOR_SCAN_DEADLINE_S", value)
+    with RuntimeClient(
+        db_path=tmp_path / "doctor-budget-fallback.db", timeout=60
+    ) as client:
+        doctor = _doctor_scan(client)
+    assert doctor["database_health"] == "ok"
+    assert doctor["scan_mode"] == "full"
+
+
+def test_doctor_scan_unaffordable_estimate_never_starts_the_scan(
+    monkeypatch, tmp_path
+):
+    # A 1 ms deadline slice sits beneath even the floor-rate estimate of
+    # any migrated store, so the skip decision is deterministic (it does
+    # not depend on measured timing). The fixture additionally carries
+    # a table whose root page is corrupted after a checkpoint: the test
+    # first proves that store is quick_check-detectably corrupt, so a
+    # `skipped:deadline` verdict from the same store is proof the scan
+    # was never started — the residual-window invariant of U14.
+    db_path = tmp_path / "doctor-budget-skip.db"
+    monkeypatch.setenv("MAGIC_CONTEXT_DOCTOR_SCAN_DEADLINE_S", "0.001")
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        assert client.call("hello", timeout=60)["harness"] == "hermes"
+        page_size, root = _fill_estimate_probe_table(db_path)
+        with open(db_path, "r+b") as handle:
+            handle.seek(root * page_size)
+            handle.write(b"\xff" * 32)
+        probe = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            verdict = probe.execute("PRAGMA quick_check").fetchone()
+        except sqlite3.DatabaseError:
+            verdict = None  # corruption is visible before any scan runs
+        finally:
+            probe.close()
+        assert verdict is None or verdict[0] != "ok"
+        doctor = _doctor_scan(client)
+    assert doctor["database_health"].startswith("skipped:deadline ")
+    assert doctor["scan_mode"] == "budgeted"
+    assert doctor["scan_budget_ms"] == 1
+    assert doctor["scan_estimate_ms"] > 1
+
+
+def test_doctor_full_integrity_ignores_the_deadline_estimate(
+    monkeypatch, tmp_path
+):
+    # --full-integrity is the manual audit escape hatch: the estimate
+    # never gates it, and the result carries no estimate fields
+    monkeypatch.setenv("MAGIC_CONTEXT_DOCTOR_SCAN_DEADLINE_S", "0.001")
+    with RuntimeClient(
+        db_path=tmp_path / "doctor-budget-escape.db", timeout=60
+    ) as client:
+        doctor = _doctor_scan(client, full_integrity=True)
+    assert doctor["database_health"] == "ok"
+    assert doctor["scan_mode"] == "full"
+    assert "scan_estimate_ms" not in doctor
+    assert "scan_budget_ms" not in doctor
+
+
+def test_doctor_size_gate_counts_wal_bytes(monkeypatch, tmp_path):
+    # U16a: the gate must count what an operator sees in `ls` — main
+    # bytes plus the write-ahead log. A sub-gate main file with an
+    # inflated `-wal` sibling still trips `skipped:store-size`, and the
+    # result records the split (`wal_bytes`) and the honest total.
+    db_path = tmp_path / "doctor-wal-gate.db"
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        assert client.call("hello", timeout=60)["harness"] == "hermes"
+        boot_main_bytes = db_path.stat().st_size
+    # env knobs reach the sidecar only through its spawn environment
+    monkeypatch.setenv(
+        "MAGIC_CONTEXT_DOCTOR_SCAN_MAX_BYTES", str(boot_main_bytes + 512 * 1024)
+    )
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        assert client.call("hello", timeout=60)["harness"] == "hermes"
+        wal_path = db_path.parent / (db_path.name + "-wal")
+        original_wal = wal_path.stat().st_size if wal_path.exists() else 0
+        with wal_path.open("ab") as handle:
+            handle.write(b"\x00" * (768 * 1024))
+        try:
+            doctor = _doctor_scan(client)
+            inflated_main = db_path.stat().st_size
+            inflated_wal = wal_path.stat().st_size
+        finally:
+            with wal_path.open("r+b") as handle:
+                handle.truncate(original_wal)
+    assert doctor["database_health"].startswith("skipped:store-size ")
+    assert doctor["scan_mode"] == "metadata"
+    assert doctor["wal_bytes"] == inflated_wal
+    assert doctor["store_bytes"] == inflated_main + inflated_wal
+    assert str(doctor["store_bytes"]) in doctor["database_health"]
+
+
+def test_doctor_reports_zero_wal_bytes_without_wal_sibling(tmp_path):
+    # U16a edge: with no `-wal` sibling next to the store the split is
+    # an honest zero and the gate falls back to main-only sizing
+    db_path = tmp_path / "doctor-no-wal.db"
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        assert client.call("hello", timeout=60)["harness"] == "hermes"
+        wal_path = db_path.parent / (db_path.name + "-wal")
+        if wal_path.exists():
+            wal_path.unlink()
+        main_bytes = db_path.stat().st_size
+        doctor = _doctor_scan(client)
+    assert doctor["database_health"] == "ok"
+    assert doctor["scan_mode"] == "full"
+    assert doctor["wal_bytes"] == 0
+    assert doctor["store_bytes"] == main_bytes
+
+
+def test_historian_publish_last_compartment_ids_match_full_fetch(
+    monkeypatch, tmp_path
+):
+    # U16b: publish keeps the newest N compartment ids through a bounded
+    # reversed read instead of materializing every row for the session.
+    # The persisted ids are not part of the publish result, but each
+    # success telemetry row records their min/max, and the full-fetch
+    # expectation is recomputed here independently from the store — the
+    # bounded path must agree with it after every publish round, with
+    # earlier rounds' rows present as the rows it must skip over.
+    user_home = _historian_telemetry_config(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "bounded-ids.db"
+    session = "bounded-ids"
+    expected_bounds = []
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {"session_id": session, "project_root": str(project)},
+            timeout=60,
+        )
+        for count in (12, 24):
+            prepared = client.call(
+                "historian_prepare",
+                {
+                    "session_id": session,
+                    "messages": conversation(count),
+                    "protect_last_n": 2,
+                    "history_budget_tokens": 8_000,
+                },
+                timeout=60,
+            )
+            assert prepared["ready"] is True
+            published = client.call(
+                "historian_publish",
+                {
+                    "session_id": session,
+                    "output": historian_xml(
+                        prepared["chunk"]["start"], prepared["chunk"]["end"]
+                    ),
+                },
+                timeout=60,
+            )
+            assert published["ok"] is True
+            added = published["compartments_added"]
+            assert added > 0
+            with sqlite3.connect(db_path) as conn:
+                all_ids = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT id FROM compartments "
+                        "WHERE session_id = ? ORDER BY sequence ASC",
+                        (session,),
+                    )
+                ]
+            expected = all_ids[-added:]
+            assert len(expected) == added
+            expected_bounds.append((min(expected), max(expected)))
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 2
+    for row, (low, high) in zip(rows, expected_bounds, strict=True):
+        assert row["status"] == "success"
+        assert row["compartment_id_min"] == low
+        assert row["compartment_id_max"] == high
+    assert_no_unclassified_hermes_failures(db_path)

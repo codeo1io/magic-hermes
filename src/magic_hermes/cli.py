@@ -642,13 +642,22 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                 # "FAIL 0" in stdout; a WARN keeps both.
                 reason = health.partition(":")[2]
                 where = str(db_path) if db_path else "<shared-store>"
+                # U16c (R6, run 589cf794): the wording follows the probe
+                # outcome — the probe-error lane must not claim that probe
+                # reads succeeded; every probe-success skip lane keeps the
+                # truthful claim.
+                probe_claim = (
+                    "the store opened but the probe read failed"
+                    if reason.startswith("probe-error")
+                    else "the store opened and probe reads succeeded"
+                )
                 report.add(
                     "WARN",
                     "Shared DB integrity scan skipped in doctor budget "
-                    f"({reason}); the store opened and probe reads "
-                    "succeeded, but deep integrity is unverified — run an "
-                    f"offline audit: sqlite3 {where} 'PRAGMA quick_check;', "
-                    "or `magic-hermes doctor --full-integrity`",
+                    f"({reason}); {probe_claim}, but deep integrity is "
+                    "unverified — run an offline audit: sqlite3 "
+                    f"{where} 'PRAGMA quick_check;', or "
+                    "`magic-hermes doctor --full-integrity`",
                 )
             else:
                 report.add("WARN", f"Shared DB health reported as {health!r}")
