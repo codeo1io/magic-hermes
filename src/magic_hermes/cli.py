@@ -49,6 +49,21 @@ UPSTREAM_PACKAGE = "@cortexkit/pi-magic-context"
 # already burned that budget and is reported immediately.
 _SIDECAR_FAST_FAIL_S = 15.0
 _SIDECAR_RETRY_BACKOFF_S = 3.0
+# Wall budget for the whole doctor sidecar pair (U15, finding
+# c7d63424): maestro's phase-2 verdict observes the full `magic-hermes
+# doctor` process for 90 s, single-shot, no retry.  The retry constants
+# above bound only the *retry decision*; this budget caps the total the
+# pair (boot + handshake + doctor scan) may spend so a verdict always
+# renders inside the observer.  Boot/handshake and doctor-call timeouts
+# derive from the remaining budget; exhaustion degrades to a WARN
+# naming the offline audit remedy — never a FAIL, never a hang.
+# 75 s + 0.25 s render reserve < 90 s; one full fast-fail retry
+# cycle (15 s + 3 s) fits inside the budget, not on top of it.
+_DOCTOR_WALL_BUDGET_ENV = "MAGIC_CONTEXT_DOCTOR_WALL_BUDGET_S"
+_DOCTOR_WALL_BUDGET_S = 75.0
+# kept back from the budget so the rendered report (and process
+# teardown) still fits after the last sidecar wait fires
+_DOCTOR_WALL_RENDER_RESERVE_S = 0.25
 HERMES_CONFIG_RELPATH = Path(".hermes") / "config.yaml"
 SHARED_DB_RELPATH = (
     Path(".local") / "share" / "cortexkit" / "magic-context" / "context.db"
@@ -428,8 +443,31 @@ def db_schema_lane(db_path: Path) -> int | None:
     return int(row[0]) if row and row[0] is not None else None
 
 
+def _doctor_wall_budget_s() -> float:
+    """Resolve the doctor's total wall budget (U15, finding c7d63424).
+
+    maestro's phase-2 verdict observes the whole ``magic-hermes doctor``
+    process for 90 s, single-shot. This budget caps everything the sidecar
+    pair (boot + handshake + scan) may spend so a verdict always renders
+    inside that window. An unparseable or non-finite override falls back to
+    the default — junk never widens the cap — while a parsed non-positive
+    value is honoured as a degenerate (already exhausted) budget: it can
+    only narrow, never widen, and still renders a verdict.
+    """
+    raw = os.environ.get(_DOCTOR_WALL_BUDGET_ENV, "")
+    try:
+        value = float(raw) if raw.strip() else _DOCTOR_WALL_BUDGET_S
+    except ValueError:
+        return _DOCTOR_WALL_BUDGET_S
+    if value != value or value == float("inf"):  # NaN / +inf would widen
+        return _DOCTOR_WALL_BUDGET_S
+    return value
+
+
 def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
     report = DoctorReport()
+    wall_started = time.monotonic()
+    wall_budget_s = _doctor_wall_budget_s()
     tested = tested_magic_context_version()
     series = ".".join(map(str, supported_magic_context_series()))
 
@@ -597,29 +635,73 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
         # failure does not degrade the verdict's truth.
         sidecar_failures: list[str] = []
         sidecar_healthy = False
+        wall_exhausted = False
         retried = False
         while True:
+            remaining = (
+                wall_budget_s
+                - (time.monotonic() - wall_started)
+                - _DOCTOR_WALL_RENDER_RESERVE_S
+            )
+            if remaining <= 0.0:
+                # nothing left to give an attempt: degrade instead of
+                # booting a pair that cannot fit inside the observer
+                wall_exhausted = True
+                break
             attempt_started = time.monotonic()
+            # U15: the boot/handshake cap follows the remaining budget
+            # down instead of the bare 60 s constant
+            handshake_timeout = min(60.0, remaining)
             try:
-                with RuntimeClient(timeout=60) as client:
-                    handshake = client.call("hello", timeout=60)
+                with RuntimeClient(timeout=handshake_timeout) as client:
+                    handshake = client.call("hello", timeout=handshake_timeout)
                     # quick_check scans the entire shared DB; the sidecar bounds
                     # that scan by default (size/contention gates in the
                     # bridge's runtimeDoctor), and --full-integrity forces the
                     # full scan for manual audits.
+                    doctor_budget = (
+                        wall_budget_s
+                        - (time.monotonic() - wall_started)
+                        - _DOCTOR_WALL_RENDER_RESERVE_S
+                    )
+                    if doctor_budget <= 0.0:
+                        wall_exhausted = True
+                        break
                     bridge = client.call(
-                        "doctor", {"full_integrity": full_integrity}, timeout=300
+                        "doctor",
+                        {"full_integrity": full_integrity},
+                        timeout=min(300.0, doctor_budget),
                     )
                 sidecar_healthy = True
                 break
             except Exception as exc:
+                spent = time.monotonic() - wall_started
+                if spent + _DOCTOR_WALL_RENDER_RESERVE_S >= wall_budget_s:
+                    # the doctor's own budget is gone: render the verdict we
+                    # have rather than mint a FAIL — maestro's observer would
+                    # kill a longer wait before any verdict could print
+                    wall_exhausted = True
+                    break
                 sidecar_failures.append(f"Magic Context sidecar failed: {exc}")
                 elapsed = time.monotonic() - attempt_started
                 if retried or elapsed > _SIDECAR_FAST_FAIL_S:
                     break
                 retried = True
                 time.sleep(_SIDECAR_RETRY_BACKOFF_S)
-        if not sidecar_healthy:
+        if wall_exhausted:
+            spent = time.monotonic() - wall_started
+            where = str(db_path) if db_path else "<shared-store>"
+            report.add(
+                "WARN",
+                "Shared DB integrity scan skipped in doctor budget "
+                f"(wall-budget exhausted after {spent:.2f}s of "
+                f"{wall_budget_s:g}s, render reserve "
+                f"{_DOCTOR_WALL_RENDER_RESERVE_S:g}s); run an offline audit: "
+                f"sqlite3 {where} 'PRAGMA quick_check;', or raise "
+                f"{_DOCTOR_WALL_BUDGET_ENV} and re-run "
+                "'magic-hermes doctor --full-integrity'",
+            )
+        elif not sidecar_healthy:
             if len(sidecar_failures) == 2:
                 report.add(
                     "FAIL",

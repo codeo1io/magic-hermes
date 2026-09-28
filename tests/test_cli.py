@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -690,3 +691,204 @@ class TestDoctorSidecarRetry:
         assert "WARN" in out
         assert "store-size" in out
         assert len(attempts) == 2
+
+
+class TestDoctorWallBudget:
+    """U15 (finding c7d63424) — the doctor sidecar pair runs inside a
+    wall budget.
+
+    maestro's phase-2 verdict observes the whole ``magic-hermes doctor``
+    process for 90 s, single-shot, with no retry. The R2 retry constants
+    bound only the *retry decision*; the total the pair may spend is
+    capped by ``MAGIC_CONTEXT_DOCTOR_WALL_BUDGET_S`` (default 75 s) so a
+    verdict always renders inside the observer: boot/handshake and
+    doctor-call timeouts derive from the remaining budget, and exhaustion
+    degrades to a WARN naming the offline audit remedy — never a FAIL,
+    never a hang.
+    """
+
+    BUDGET_ENV = "MAGIC_CONTEXT_DOCTOR_WALL_BUDGET_S"
+
+    @staticmethod
+    def _wire_config():
+        config = Path(cli.hermes_config_path())
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n"
+            "  engine: magic-context\n"
+            "memory:\n"
+            "  provider: magic_context\n"
+            "plugins:\n"
+            "  enabled:\n"
+            "    - magic-hermes\n",
+            encoding="utf-8",
+        )
+
+    def _run_doctor_budget(
+        self, tmp_path, monkeypatch, isolated_home, budget_env, doctor_script=None
+    ):
+        """Run cli.run_doctor under a forced wall budget.
+
+        Returns ``(rc, ctor_calls, sidecar_calls)``: the RuntimeClient
+        constructor kwargs (carrying the derived boot/handshake timeout)
+        and every sidecar call as a ``(method, params, timeout)`` triple.
+        ``doctor_script`` (if set) replaces the doctor RPC's behavior.
+        """
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        self._wire_config()
+
+        if budget_env is None:
+            monkeypatch.delenv(self.BUDGET_ENV, raising=False)
+        else:
+            monkeypatch.setenv(self.BUDGET_ENV, budget_env)
+
+        tested = cli.tested_magic_context_version()
+        package = make_package(tmp_path / "pkg", tested)
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+        ctor_calls: list[dict] = []
+        sidecar_calls: list[tuple] = []
+
+        def make_client(*args, **kwargs):
+            ctor_calls.append(kwargs)
+            sidecar = mock.MagicMock()
+
+            def call(method, params=None, timeout=None):
+                sidecar_calls.append((method, params, timeout))
+                if method == "hello":
+                    return {"harness": "hermes", "package_version": tested}
+                report = {
+                    "database_health": "ok",
+                    "core_symbols_ready": True,
+                    "supported_series": series,
+                }
+                if doctor_script is not None:
+                    return doctor_script(report)
+                return report
+
+            sidecar.call.side_effect = call
+            client = mock.MagicMock()
+            client.__enter__.return_value = sidecar
+            client.__exit__.return_value = False
+            return client
+
+        with (
+            mock.patch.object(
+                cli, "discover_installations", return_value=[(package, tested)]
+            ),
+            mock.patch.object(cli, "RuntimeClient", side_effect=make_client),
+            mock.patch.object(cli, "_SIDECAR_RETRY_BACKOFF_S", 0.0),
+        ):
+            rc = cli.run_doctor(json_output=False)
+        return rc, ctor_calls, sidecar_calls
+
+    def test_env_resolution_default_junk_and_override(self, monkeypatch):
+        resolve = cli._doctor_wall_budget_s
+        # default when unset or empty
+        monkeypatch.delenv(self.BUDGET_ENV, raising=False)
+        assert resolve() == 75.0
+        monkeypatch.setenv(self.BUDGET_ENV, "")
+        assert resolve() == 75.0
+        # junk never widens the cap
+        monkeypatch.setenv(self.BUDGET_ENV, "soon")
+        assert resolve() == 75.0
+        monkeypatch.setenv(self.BUDGET_ENV, "nan")
+        assert resolve() == 75.0
+        monkeypatch.setenv(self.BUDGET_ENV, "inf")
+        assert resolve() == 75.0
+        # a real override is honored exactly
+        monkeypatch.setenv(self.BUDGET_ENV, " 30 ")
+        assert resolve() == 30.0
+        # non-positive values are honored as degenerate (already spent)
+        # budgets, never widened back to the default
+        monkeypatch.setenv(self.BUDGET_ENV, "0")
+        assert resolve() == 0.0
+
+    def test_budget_scales_handshake_and_doctor_timeouts(
+        self, tmp_path, monkeypatch, isolated_home
+    ):
+        rc, ctor_calls, sidecar_calls = self._run_doctor_budget(
+            tmp_path, monkeypatch, isolated_home, "30"
+        )
+        assert rc == 0
+        assert ctor_calls, "sidecar must still boot under a 30s budget"
+        handshake_timeout = ctor_calls[0]["timeout"]
+        # the derived cap follows the budget down, not the 60s constant
+        assert 20.0 <= handshake_timeout < 60.0
+        hello = next(c for c in sidecar_calls if c[0] == "hello")
+        assert 20.0 <= hello[2] < 60.0
+        doctor = next(c for c in sidecar_calls if c[0] == "doctor")
+        assert 15.0 < doctor[2] <= 30.0
+
+    def test_default_budget_keeps_sixty_second_handshake_cap(
+        self, tmp_path, monkeypatch, isolated_home
+    ):
+        _, ctor_calls, _ = self._run_doctor_budget(
+            tmp_path, monkeypatch, isolated_home, None
+        )
+        # with the default 75s budget and a fresh clock the boot cap is
+        # still the 60s constant (min, never a widening)
+        assert ctor_calls[0]["timeout"] == 60.0
+
+    def test_exhausted_budget_warns_without_sidecar_call(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        rc, ctor_calls, sidecar_calls = self._run_doctor_budget(
+            tmp_path, monkeypatch, isolated_home, "0"
+        )
+        out = capsys.readouterr().out
+        # maestro contract survives a spent budget: verdict renders
+        assert rc == 0
+        assert "FAIL 0" in out
+        assert "wall-budget" in out
+        assert "PRAGMA quick_check" in out  # offline audit remedy named
+        # nothing booted, nothing was probed
+        assert ctor_calls == []
+        assert sidecar_calls == []
+        assert "quick_check ok" not in out
+        assert "◆  FAIL" not in out
+
+    def test_doctor_timeout_at_budget_edge_renders_wall_budget_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        from magic_hermes.runtime import RuntimeProtocolError
+
+        def past_budget(report):
+            # mirror what the real capped client does when the derived
+            # deadline fires mid-scan: it raises after burning the budget
+            time.sleep(0.9)
+            raise RuntimeProtocolError(
+                "Runtime timed out after 0.6s during doctor; "
+                "request was not replayed"
+            )
+
+        rc, _, _ = self._run_doctor_budget(
+            tmp_path, monkeypatch, isolated_home, "1.0", doctor_script=past_budget
+        )
+        out = capsys.readouterr().out
+        # exhaustion mid-attempt is a WARN, not a sidecar FAIL
+        assert rc == 0
+        assert "FAIL 0" in out
+        assert "wall-budget" in out
+        assert "◆  FAIL" not in out
+        assert "Magic Context sidecar failed" not in out
+
+    def test_wall_budget_arithmetic_fits_observer(self):
+        # Attempt timeouts derive from the remaining budget, so the whole
+        # sidecar phase — including one full fast-fail retry cycle — is
+        # bounded by the wall budget itself, plus the render reserve kept
+        # back for printing the verdict. maestro's observer kills at 90 s.
+        assert (
+            cli._DOCTOR_WALL_BUDGET_S + cli._DOCTOR_WALL_RENDER_RESERVE_S
+            < 90.0
+        )
+        # a full R2 fast-fail retry cycle fits inside the budget
+        assert (
+            cli._SIDECAR_FAST_FAIL_S + cli._SIDECAR_RETRY_BACKOFF_S
+            < cli._DOCTOR_WALL_BUDGET_S
+        )
+        assert 0.0 < cli._DOCTOR_WALL_RENDER_RESERVE_S < 1.0
