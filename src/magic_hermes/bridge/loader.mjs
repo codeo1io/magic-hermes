@@ -7,6 +7,7 @@ const EXPOSED = [
   "ensureProjectRegisteredFromPiDirectory",
   "resolveProjectIdentityForSession",
   "recordSessionProjectIdentity",
+  "recordHistorianRun",
   "registerMagicContextTools",
   "convertEntriesToRawMessages",
   "indexMessagesAfterOrdinal",

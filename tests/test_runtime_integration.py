@@ -2122,3 +2122,396 @@ def test_upstream_historian_trigger_and_compartment_lease(monkeypatch, tmp_path)
             assert blocked == {"ready": False, "reason": "lease-held"}
 
         first.call("historian_abort", {"session_id": "lease"})
+
+
+def hermes_historian_rows(db_path):
+    """Every Hermes-lane historian_runs row in the store, oldest first."""
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT session_id, run_kind, status, failure_reason, "
+            "chunk_start_ordinal, chunk_end_ordinal, unprocessed_from, "
+            "compartments_produced, compartment_id_min, compartment_id_max, "
+            "facts_emitted, events_emitted, "
+            "importance_min, importance_max, importance_avg "
+            "FROM historian_runs WHERE harness = 'hermes' ORDER BY id"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def assert_no_unclassified_hermes_failures(db_path):
+    """Invariant: the Hermes lane never writes failed rows with NULL reason.
+
+    Rows 31203/31204 of the shared production store are pi-lane
+    status='failed' / failure_reason=NULL artifacts; before this fix the
+    hermes lane was simply unobservable (zero rows). Both halves of the
+    failure class are asserted absent here after every scenario.
+    """
+    with sqlite3.connect(db_path) as conn:
+        unclassified = conn.execute(
+            "SELECT COUNT(*) FROM historian_runs "
+            "WHERE harness = 'hermes' AND status = 'failed' "
+            "AND failure_reason IS NULL"
+        ).fetchone()[0]
+    assert unclassified == 0
+
+
+def _historian_telemetry_config(tmp_path, extra=None):
+    user_home = tmp_path / "xdg"
+    user_dir = user_home / "cortexkit"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    config = {
+        "historian": {"model": "gpt-5.5", "two_pass": False},
+        "embedding": {"provider": "off"},
+    }
+    config.update(extra or {})
+    (user_dir / "magic-context.jsonc").write_text(
+        json.dumps(config), encoding="utf-8"
+    )
+    return user_home
+
+
+def test_historian_prepare_protected_tail_records_noop_row(monkeypatch, tmp_path):
+    user_home = _historian_telemetry_config(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-tail.db"
+    messages = conversation(12)
+
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {"session_id": "telemetry-tail", "project_root": str(project)},
+            timeout=60,
+        )
+        blocked = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-tail",
+                "messages": messages,
+                # Protecting the whole transcript leaves no eligible head.
+                "protect_last_n": len(messages),
+            },
+            timeout=60,
+        )
+        assert blocked == {"ready": False, "reason": "protected-tail"}
+
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == "telemetry-tail"
+    assert rows[0]["run_kind"] == "incremental"
+    assert rows[0]["status"] == "noop"
+    assert rows[0]["failure_reason"] == "protected-tail"
+    assert rows[0]["chunk_start_ordinal"] is None
+    assert_no_unclassified_hermes_failures(db_path)
+
+
+def test_historian_prepare_disabled_records_noop_row(monkeypatch, tmp_path):
+    user_home = _historian_telemetry_config(
+        tmp_path, {"historian": {"disable": True}}
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-disabled.db"
+
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {"session_id": "telemetry-off", "project_root": str(project)},
+            timeout=60,
+        )
+        blocked = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-off",
+                "messages": conversation(12),
+            },
+            timeout=60,
+        )
+        assert blocked == {"ready": False, "reason": "historian-disabled"}
+
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "noop"
+    assert rows[0]["failure_reason"] == "historian-disabled"
+    assert_no_unclassified_hermes_failures(db_path)
+
+
+def test_historian_lease_conflict_records_noop_and_abort_rows(
+    monkeypatch, tmp_path
+):
+    user_home = _historian_telemetry_config(
+        tmp_path,
+        {
+            "execute_threshold_percentage": 65,
+            "cache_ttl": "5m",
+            "historian": {"model": "gpt-5.5", "two_pass": False},
+        },
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-lease.db"
+    messages = conversation(30)
+    for message in messages[1:]:
+        message["content"] += " " + ("trigger-payload " * 80)
+
+    with RuntimeClient(db_path=db_path, timeout=60) as first:
+        first.call(
+            "bind",
+            {"session_id": "telemetry-lease", "project_root": str(project)},
+            timeout=60,
+        )
+        first.call(
+            "model_update",
+            {
+                "session_id": "telemetry-lease",
+                "model": "gpt-5",
+                "provider": "openai",
+                "context_length": 10_000,
+            },
+        )
+        first.call(
+            "usage_update",
+            {
+                "session_id": "telemetry-lease",
+                "input_tokens": 7_000,
+                "context_length": 10_000,
+            },
+        )
+        decision = first.call(
+            "historian_decide",
+            {"session_id": "telemetry-lease", "messages": messages},
+            timeout=60,
+        )
+        assert decision["should_fire"] is True
+
+        prepared = first.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-lease",
+                "messages": messages,
+                "boundary_snapshot": decision["boundary_snapshot"],
+                "history_budget_tokens": 8_000,
+                "holder_id": "first-worker",
+            },
+            timeout=60,
+        )
+        assert prepared["ready"] is True
+
+        with RuntimeClient(db_path=db_path, timeout=60) as second:
+            second.call(
+                "bind",
+                {
+                    "session_id": "telemetry-lease",
+                    "project_root": str(project),
+                },
+                timeout=60,
+            )
+            blocked = second.call(
+                "historian_prepare",
+                {
+                    "session_id": "telemetry-lease",
+                    "messages": messages,
+                    "boundary_snapshot": decision["boundary_snapshot"],
+                    "history_budget_tokens": 8_000,
+                    "holder_id": "second-worker",
+                },
+                timeout=60,
+            )
+            assert blocked == {"ready": False, "reason": "lease-held"}
+
+        lease_rows = hermes_historian_rows(db_path)
+        assert len(lease_rows) == 1
+        assert lease_rows[0]["status"] == "noop"
+        assert lease_rows[0]["failure_reason"] == "lease-held"
+
+        aborted = first.call(
+            "historian_abort", {"session_id": "telemetry-lease"}
+        )
+        assert aborted == {"aborted": True}
+
+    rows = hermes_historian_rows(db_path)
+    # Exactly one terminal row per engaged prepare: the losing worker's
+    # lease-held noop plus the holder's plain abort — not two for the abort.
+    assert len(rows) == 2
+    assert rows[1]["status"] == "noop"
+    assert rows[1]["failure_reason"] == "aborted"
+    assert rows[1]["chunk_start_ordinal"] == prepared["chunk"]["start"]
+    assert rows[1]["chunk_end_ordinal"] == prepared["chunk"]["end"]
+    assert_no_unclassified_hermes_failures(db_path)
+
+
+def test_historian_publish_success_records_success_row(monkeypatch, tmp_path):
+    user_home = _historian_telemetry_config(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-success.db"
+
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {"session_id": "telemetry-ok", "project_root": str(project)},
+            timeout=60,
+        )
+        prepared = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-ok",
+                "messages": conversation(12),
+                "protect_last_n": 2,
+                "history_budget_tokens": 8_000,
+            },
+            timeout=60,
+        )
+        assert prepared["ready"] is True
+        start = prepared["chunk"]["start"]
+        end = prepared["chunk"]["end"]
+        published = client.call(
+            "historian_publish",
+            {
+                "session_id": "telemetry-ok",
+                "output": historian_xml(start, end),
+            },
+            timeout=60,
+        )
+        assert published["ok"] is True
+
+        # A redundant abort after a successful publish is a no-op for
+        # telemetry: the pass already recorded its terminal outcome.
+        redundant = client.call(
+            "historian_abort", {"session_id": "telemetry-ok"}
+        )
+        assert redundant == {"aborted": True}
+
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["status"] == "success"
+    assert row["failure_reason"] is None
+    assert row["session_id"] == "telemetry-ok"
+    assert row["run_kind"] == "incremental"
+    assert row["chunk_start_ordinal"] == start
+    assert row["chunk_end_ordinal"] == end
+    assert row["unprocessed_from"] == end + 1
+    assert row["compartments_produced"] == published["compartments_added"]
+    assert row["compartments_produced"] > 0
+    assert row["compartment_id_min"] is not None
+    assert row["compartment_id_max"] >= row["compartment_id_min"]
+    assert row["facts_emitted"] == 0
+    assert row["events_emitted"] == 1
+    assert row["importance_min"] == 80
+    assert row["importance_max"] == 80
+    assert row["importance_avg"] == 80
+    assert_no_unclassified_hermes_failures(db_path)
+
+
+def test_historian_invalid_publish_then_failed_abort_records_one_row(
+    monkeypatch, tmp_path
+):
+    user_home = _historian_telemetry_config(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-invalid.db"
+
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {"session_id": "telemetry-bad", "project_root": str(project)},
+            timeout=60,
+        )
+        prepared = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-bad",
+                "messages": conversation(12),
+                "protect_last_n": 2,
+                "history_budget_tokens": 8_000,
+            },
+            timeout=60,
+        )
+        assert prepared["ready"] is True
+
+        rejected = client.call(
+            "historian_publish",
+            {"session_id": "telemetry-bad", "output": "not historian output"},
+            timeout=60,
+        )
+        assert rejected["ok"] is False
+        assert rejected["repair_prompt"]
+        # Intermediate outcome: the pass is still retryable, so nothing is
+        # recorded yet.
+        assert hermes_historian_rows(db_path) == []
+
+        aborted = client.call(
+            "historian_abort",
+            {
+                "session_id": "telemetry-bad",
+                "outcome": {
+                    "status": "failed",
+                    "reason": (
+                        "historian output rejected: invalid historian output"
+                    ),
+                },
+            },
+        )
+        assert aborted == {"aborted": True}
+
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert (
+        rows[0]["failure_reason"]
+        == "historian output rejected: invalid historian output"
+    )
+    assert rows[0]["chunk_start_ordinal"] == prepared["chunk"]["start"]
+    assert rows[0]["chunk_end_ordinal"] == prepared["chunk"]["end"]
+    assert_no_unclassified_hermes_failures(db_path)
+
+
+def test_historian_abort_failed_without_reason_gets_default_reason(
+    monkeypatch, tmp_path
+):
+    user_home = _historian_telemetry_config(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-default.db"
+
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {"session_id": "telemetry-default", "project_root": str(project)},
+            timeout=60,
+        )
+        prepared = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-default",
+                "messages": conversation(12),
+                "protect_last_n": 2,
+                "history_budget_tokens": 8_000,
+            },
+            timeout=60,
+        )
+        assert prepared["ready"] is True
+        aborted = client.call(
+            "historian_abort",
+            {
+                "session_id": "telemetry-default",
+                # Defensive sanitization: a failed outcome must never reach
+                # the store without a non-NULL reason.
+                "outcome": {"status": "failed"},
+            },
+        )
+        assert aborted == {"aborted": True}
+
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["failure_reason"] == "unspecified failure"
+    assert_no_unclassified_hermes_failures(db_path)

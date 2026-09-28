@@ -106,6 +106,48 @@ lane, live sidecar handshake + DB quick_check + core-symbol check) with a
 summary line and non-zero exit on FAIL. `--json` emits machine-readable
 output.
 
+### 1c. Shared store classification guard
+
+Upstream `@cortexkit/pi-magic-context` (through 0.43.2) seeds historian run
+telemetry with `status='failed'`, and its benign early-return paths (drain
+budget exhausted, nothing to process, ...) commit rows with
+`status='failed'` and `failure_reason IS NULL`. Consumers that count
+unreasoned "failed" historian rows as operational failures (maestro's
+`phase1.context.operational` contract, finding d59758598379) then read
+routine health as failure.
+
+The guard fixes this at the one boundary every writer shares — the store
+itself. `magic-hermes guard apply` installs an idempotent `AFTER INSERT`
+trigger (`mh_historian_classification_guard`) on the shared
+`historian_runs` table that reclassifies exactly that defect class to
+upstream's own benign vocabulary: `status='noop'` plus an explicit marker
+reason. Reasoned failures, successes, existing noop rows, and historical
+rows are never rewritten, and the trigger never touches `schema_migrations`
+(the schema lane).
+
+```bash
+/path/to/hermes/venv/bin/magic-hermes guard apply    # install / repair (fail-loud)
+/path/to/hermes/venv/bin/magic-hermes guard status   # read-only state
+/path/to/hermes/venv/bin/magic-hermes guard remove   # retire
+```
+
+- `apply` prints the plan (store path, trigger name), installs or repairs
+  the trigger (a drifted body is dropped and re-created from the canonical
+  DDL), verifies the classification contract on a throwaway fixture store,
+  and exits non-zero when the store is missing or verification fails.
+- `status` reports presence, DDL match, and the number of rows reclassified
+  in the last 24 hours.
+- `doctor` surfaces the guard as PASS (active) or WARN (absent, drifted, or
+  unreadable) — never FAIL — because the guard is a workaround applied
+  explicitly by the operator, never automatically, and must not hold the
+  health gate hostage.
+
+The guard is retired deliberately once an upstream release that classifies
+the early-return paths is validated: `RETIRES_AT_UPSTREAM` in
+`src/magic_hermes/historian_guard.py` records that release, and
+`magic-hermes guard remove` drops the trigger (an idempotent no-op when
+absent). `MAGIC_CONTEXT_DB_PATH` overrides the store for testing.
+
 ### 2. Manual install (fallback)
 
 Magic-Hermes delegates its context-management implementation to the official Magic
