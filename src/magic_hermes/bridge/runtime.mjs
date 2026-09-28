@@ -2549,20 +2549,88 @@ async function dreamerRunManual(args) {
   return result;
 }
 
+function doctorScanGateFromEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
 function runtimeDoctor(args = {}) {
   const sessionId = String(args.session_id || "");
   const session = sessionId ? sessions.get(sessionId) : null;
+  const fullIntegrity = args.full_integrity === true;
+  // Bounded-scan gates (R1, finding c7d63424): the live 3.4 GB store made
+  // the unbounded quick_check the dominant term of every doctor or probe
+  // cycle, starving maestro's single-shot 90 s verdict into rc=124
+  // timeouts. Both gates are read once per doctor call from the
+  // environment the host copied verbatim (runtime.py's Popen env).
+  const scanMaxBytes = doctorScanGateFromEnv(
+    "MAGIC_CONTEXT_DOCTOR_SCAN_MAX_BYTES",
+    1610612736
+  );
+  const scanProbeGateMs = doctorScanGateFromEnv(
+    "MAGIC_CONTEXT_DOCTOR_SCAN_PROBE_MS",
+    2000
+  );
   let databaseHealth = "unknown";
+  let scanMode = "full";
+  let storeBytes = null;
+  let probeMs = null;
   try {
-    const rows = db.prepare("PRAGMA quick_check").all();
-    const first = rows?.[0];
-    databaseHealth = String(
-      first?.quick_check ?? first?.integrity_check ?? Object.values(first || {})[0] ?? "unknown"
-    );
+    // Size gate: the main database file only. The WAL is deliberately
+    // uncounted — upstream maintenance checkpoints it away while the
+    // main file only ever grows.
+    try {
+      const pageSize = Number(db.prepare("PRAGMA page_size").get()?.page_size);
+      const pageCount = Number(db.prepare("PRAGMA page_count").get()?.page_count);
+      if (pageSize > 0 && pageCount > 0) {
+        storeBytes = pageSize * pageCount;
+      }
+    } catch (error) {
+      // An unmeasured size is not evidence of an over-gate store; the
+      // probe and the scan below decide the health.
+    }
+    // Contention gate: time a single catalog read. A probe that cannot
+    // fit in the gate means quick_check cannot fit either — degrade
+    // honestly instead of burning the caller's budget.
+    try {
+      const probeStarted = performance.now();
+      db.prepare("SELECT count(*) FROM sqlite_master").get();
+      probeMs = performance.now() - probeStarted;
+    } catch (error) {
+      if (!fullIntegrity) {
+        databaseHealth =
+          "skipped:probe-error " +
+          (error instanceof Error ? error.message : String(error));
+        scanMode = "metadata";
+      }
+    }
+    if (databaseHealth === "unknown" && !fullIntegrity) {
+      if (storeBytes !== null && storeBytes > scanMaxBytes) {
+        databaseHealth = `skipped:store-size ${storeBytes} > ${scanMaxBytes}`;
+        scanMode = "metadata";
+      } else if (probeMs !== null && probeMs > scanProbeGateMs) {
+        databaseHealth = `skipped:probe-ms ${probeMs} > ${scanProbeGateMs}`;
+        scanMode = "metadata";
+      }
+    }
+    if (databaseHealth === "unknown") {
+      const rows = db.prepare("PRAGMA quick_check").all();
+      const first = rows?.[0];
+      databaseHealth = String(
+        first?.quick_check ?? first?.integrity_check ?? Object.values(first || {})[0] ?? "unknown"
+      );
+    }
   } catch (error) {
     databaseHealth = "error:" + (error instanceof Error ? error.message : String(error));
   }
-  return {
+  const result = {
     package_version: packageJson.version,
     package_root: packageRoot,
     harness: "hermes",
@@ -2570,6 +2638,7 @@ function runtimeDoctor(args = {}) {
     core_symbols_ready: missingCoreSymbols.length === 0,
     missing_core_symbols: [...missingCoreSymbols],
     database_health: databaseHealth,
+    scan_mode: scanMode,
     session_bound: Boolean(session),
     project_identity: session?.projectIdentity ?? null,
     project_root: session?.projectRoot ?? null,
@@ -2577,6 +2646,13 @@ function runtimeDoctor(args = {}) {
     config_loaded_from: session ? [...(session.configLoadedFrom || [])] : [],
     config_warnings: session ? [...(session.configWarnings || [])] : []
   };
+  if (storeBytes !== null) {
+    result.store_bytes = storeBytes;
+  }
+  if (probeMs !== null) {
+    result.probe_ms = probeMs;
+  }
+  return result;
 }
 
 let nextHostCallbackId = 1;

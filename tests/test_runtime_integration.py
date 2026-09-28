@@ -2515,3 +2515,123 @@ def test_historian_abort_failed_without_reason_gets_default_reason(
     assert rows[0]["status"] == "failed"
     assert rows[0]["failure_reason"] == "unspecified failure"
     assert_no_unclassified_hermes_failures(db_path)
+
+
+# --- doctor bounded-scan gates (R1, rider unit U4) -------------------------
+#
+# The live 3.4 GB shared store made the unbounded `PRAGMA quick_check` in
+# runtimeDoctor the dominant term of every doctor/probe cycle: maestro's
+# single-shot 90 s verdict and the periodic store probes starved each
+# other into rc=124 timeouts (finding c7d63424). The bridge therefore
+# bounds the scan with two gates, controlled by environment variables
+# that RuntimeClient propagates verbatim to the sidecar (runtime.py
+# builds the Popen environment from os.environ.copy()):
+#
+#   MAGIC_CONTEXT_DOCTOR_SCAN_MAX_BYTES  default 1610612736 (1.5 GiB)
+#   MAGIC_CONTEXT_DOCTOR_SCAN_PROBE_MS   default 2000
+#
+# The gates are read once per doctor call. A store above the size gate,
+# or a catalog probe slower than the probe gate, skips quick_check and
+# reports the reason as a `skipped:` health (the CLI maps that to WARN);
+# `full_integrity: true` bypasses both gates and always runs the scan.
+
+
+def _doctor_scan(client, full_integrity=False):
+    return client.call(
+        "doctor", {"full_integrity": full_integrity}, timeout=60
+    )
+
+
+def test_doctor_scan_default_gates_small_store_runs_full_scan(tmp_path):
+    with RuntimeClient(
+        db_path=tmp_path / "doctor-scan-small.db", timeout=60
+    ) as client:
+        doctor = _doctor_scan(client)
+    assert doctor["database_health"] == "ok"
+    assert doctor["scan_mode"] == "full"
+    assert doctor["store_bytes"] > 0
+    assert doctor["probe_ms"] > 0
+
+
+def test_doctor_scan_size_gate_skips_with_honest_reason(monkeypatch, tmp_path):
+    monkeypatch.setenv("MAGIC_CONTEXT_DOCTOR_SCAN_MAX_BYTES", "1")
+    with RuntimeClient(
+        db_path=tmp_path / "doctor-scan-sized.db", timeout=60
+    ) as client:
+        doctor = _doctor_scan(client)
+    assert doctor["database_health"].startswith("skipped:store-size ")
+    assert doctor["scan_mode"] == "metadata"
+    assert doctor["store_bytes"] > 1
+    # the reason names both the measurement and the gate that tripped
+    assert str(doctor["store_bytes"]) in doctor["database_health"]
+    assert " 1" in doctor["database_health"]
+
+
+@pytest.mark.parametrize(
+    "gate,value",
+    [
+        ("MAGIC_CONTEXT_DOCTOR_SCAN_PROBE_MS", "0"),
+        ("MAGIC_CONTEXT_DOCTOR_SCAN_PROBE_MS", "-5"),
+        ("MAGIC_CONTEXT_DOCTOR_SCAN_PROBE_MS", "nonsense"),
+        ("MAGIC_CONTEXT_DOCTOR_SCAN_MAX_BYTES", "0"),
+        ("MAGIC_CONTEXT_DOCTOR_SCAN_MAX_BYTES", "abc"),
+    ],
+)
+def test_doctor_scan_gate_env_falls_back_on_invalid_values(
+    monkeypatch, tmp_path, gate, value
+):
+    # unparsable, zero, or negative gate values fall back to the safe
+    # defaults; a small store still gets its full scan
+    monkeypatch.setenv(gate, value)
+    with RuntimeClient(
+        db_path=tmp_path / "doctor-scan-fallback.db", timeout=60
+    ) as client:
+        doctor = _doctor_scan(client)
+    assert doctor["database_health"] == "ok"
+    assert doctor["scan_mode"] == "full"
+
+
+def test_doctor_scan_probe_gate_skips_with_honest_reason(monkeypatch, tmp_path):
+    # any real catalog probe takes more than a microsecond, so a 0.001 ms
+    # gate deterministically trips the contention gate
+    monkeypatch.setenv("MAGIC_CONTEXT_DOCTOR_SCAN_PROBE_MS", "0.001")
+    with RuntimeClient(
+        db_path=tmp_path / "doctor-scan-probe.db", timeout=60
+    ) as client:
+        doctor = _doctor_scan(client)
+    assert doctor["database_health"].startswith("skipped:probe-ms ")
+    assert doctor["scan_mode"] == "metadata"
+    assert doctor["probe_ms"] > 0.001
+
+
+def test_doctor_scan_full_integrity_bypasses_gates(monkeypatch, tmp_path):
+    monkeypatch.setenv("MAGIC_CONTEXT_DOCTOR_SCAN_MAX_BYTES", "1")
+    monkeypatch.setenv("MAGIC_CONTEXT_DOCTOR_SCAN_PROBE_MS", "0.001")
+    with RuntimeClient(
+        db_path=tmp_path / "doctor-scan-override.db", timeout=60
+    ) as client:
+        doctor = _doctor_scan(client, full_integrity=True)
+    assert doctor["database_health"] == "ok"
+    assert doctor["scan_mode"] == "full"
+
+
+def test_doctor_scan_probe_error_degrades_not_fails(monkeypatch, tmp_path):
+    # A store whose catalog cannot even be read (a locked or corrupted
+    # store under contention) must degrade to `skipped:probe-error`, not
+    # FAIL: maestro's verdict greps for "FAIL 0" and a WARN keeps the
+    # check honest about what was actually verified. WAL readers are not
+    # blocked by write locks, so the deterministic trigger is a damaged
+    # schema page: checkpoint the WAL, then break the page-1 b-tree
+    # header a live connection revalidates on every schema read.
+    db_path = tmp_path / "doctor-scan-probe-error.db"
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        assert client.call("hello", timeout=60)["harness"] == "hermes"
+        checkpoint = sqlite3.connect(db_path)
+        checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        checkpoint.close()
+        with open(db_path, "r+b") as handle:
+            handle.seek(100)
+            handle.write(b"\xff")
+        doctor = _doctor_scan(client)
+    assert doctor["database_health"].startswith("skipped:probe-error ")
+    assert doctor["scan_mode"] == "metadata"

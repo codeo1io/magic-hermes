@@ -13,12 +13,14 @@ contract (finding c7d63424, plan units U5/U7):
 - a real quick_check keeps its PASS wording;
 - ``--json`` carries the sidecar's additive scan fields and its summary
   counts stay consistent with the text summary;
-- the ``--full-integrity`` override reaches the sidecar verbatim (RQ7).
+- the ``--full-integrity`` override reaches the sidecar verbatim (RQ7);
+- the fast-fail retry constants stay inside maestro's budget (R2).
 
 The Node sidecar is never spawned here: RuntimeClient is patched, and the
 doctor report shapes mirror what bridge/runtime.mjs ``runtimeDoctor``
-returns (``skipped:`` health + scan_mode/store_bytes/probe_ms appear once
-the bounded-scan rider is active).
+returns once the bounded-scan rider is active:
+``skipped:store-size <bytes> > <gate>``, ``skipped:probe-ms <ms> > <gate>``,
+``skipped:probe-error <message>``, with ``scan_mode`` ``full``/``metadata``.
 """
 
 from __future__ import annotations
@@ -120,6 +122,9 @@ def _run_doctor(
             cli, "discover_installations", return_value=[(package, tested)]
         ),
         mock.patch.object(cli, "RuntimeClient", return_value=client),
+        # the retry backoff is real wall-clock sleep; these tests exercise
+        # the report mapping, not the timing, so zero it out
+        mock.patch.object(cli, "_SIDECAR_RETRY_BACKOFF_S", 0.0),
     ):
         rc = cli.run_doctor(json_output=json_output, full_integrity=full_integrity)
     doctor_calls = [c for c in sidecar.call.call_args_list if c.args[0] == "doctor"]
@@ -128,9 +133,11 @@ def _run_doctor(
 
 
 def _degraded_report():
+    # the exact emission shape of runtime.mjs runtimeDoctor when the size
+    # gate trips on the live 3.4 GB store
     return {
-        "database_health": "skipped:store=3690000000B>gate=1610612736B",
-        "scan_mode": "bounded",
+        "database_health": "skipped:store-size 3690000000 > 1610612736",
+        "scan_mode": "metadata",
         "store_bytes": 3690000000,
         "probe_ms": 4.3,
     }
@@ -147,8 +154,9 @@ class TestDegradedScanContract:
         assert "FAIL 0" in out
         # honest degradation: exactly one WARN names the gate and numbers
         assert out.count("integrity scan skipped") == 1
-        assert "store=3690000000B" in out
-        assert "gate=1610612736B" in out
+        assert "store-size" in out
+        assert "3690000000" in out
+        assert "1610612736" in out
         # actionable: the offline audit command is named
         assert "PRAGMA quick_check" in out
         assert "sqlite3" in out
@@ -159,13 +167,35 @@ class TestDegradedScanContract:
         self, tmp_path, monkeypatch, isolated_home, capsys
     ):
         report = _degraded_report()
-        report["database_health"] = "skipped:probe=4300ms>2000ms"
+        report["database_health"] = "skipped:probe-ms 4300.5 > 2000"
+        report["probe_ms"] = 4300.5
         rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, report)
         out = capsys.readouterr().out
         assert rc == 0
         assert "FAIL 0" in out
         assert out.count("integrity scan skipped") == 1
-        assert "probe=4300ms" in out
+        assert "probe-ms" in out
+        assert "4300.5" in out
+
+    def test_probe_error_skip_keeps_the_same_contract(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # a store whose catalog read itself throws (locked or damaged
+        # under contention) degrades exactly like a gate skip: WARN, not
+        # FAIL, with the probe error quoted — the bridge omits probe_ms
+        # on this path because the probe never completed
+        report = _degraded_report()
+        report.pop("probe_ms")
+        report["database_health"] = (
+            "skipped:probe-error SqliteError: database is locked"
+        )
+        rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, report)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "FAIL 0" in out
+        assert out.count("integrity scan skipped") == 1
+        assert "probe-error" in out
+        assert "database is locked" in out
 
     def test_real_scan_pass_wording_unchanged(
         self, tmp_path, monkeypatch, isolated_home, capsys
@@ -190,7 +220,7 @@ class TestJsonContract:
         )
         payload = json.loads(capsys.readouterr().out)
         assert rc == 0
-        assert payload["scan_mode"] == "bounded"
+        assert payload["scan_mode"] == "metadata"
         assert payload["store_bytes"] == 3690000000
         assert payload["probe_ms"] == 4.3
         # summary counts must equal the actual check counts
@@ -250,7 +280,7 @@ class TestHonestyInvariant:
                 ),
             ),
             (
-                {"database_health": "skipped:store=3690000000B>gate=1610612736B"},
+                {"database_health": "skipped:store-size 3690000000 > 1610612736"},
                 None,
             ),
         ],
@@ -296,3 +326,18 @@ class TestFullIntegrityPlumbing:
         with mock.patch.object(cli, "run_doctor", return_value=0) as run:
             cli.main(["doctor", "--full-integrity"])
         assert run.call_args.kwargs.get("full_integrity") is True
+
+
+class TestRetryBudget:
+    """R2 (finding c7d63424) — the doctor sidecar pair retries exactly
+    once, and only on a fast failure. The constants are the whole budget:
+    fast-fail window + backoff + one fast second boot lock must fit
+    inside maestro's 90 s single-shot verdict with room for the direct
+    store checks, so their sum is pinned at 15 + 3 = 18 s <= 20 s."""
+
+    def test_constants_are_positive_floats_within_budget(self):
+        fast = cli._SIDECAR_FAST_FAIL_S
+        backoff = cli._SIDECAR_RETRY_BACKOFF_S
+        assert isinstance(fast, float) and fast > 0
+        assert isinstance(backoff, float) and backoff > 0
+        assert fast + backoff <= 20.0
