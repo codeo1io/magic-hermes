@@ -138,6 +138,50 @@ def next_patch_version(version: str) -> str:
     return f"{major}.{minor}.{patch + 1}"
 
 
+def latest_tag() -> str | None:
+    """Return the highest semantic-version tag, ignoring non-release tags."""
+    tags = [
+        item
+        for item in git_output("tag", "-l", "v*", "--sort=v:refname").splitlines()
+        if SEMVER.fullmatch(item.removeprefix("v"))
+    ]
+    return tags[-1] if tags else None
+
+
+def pending_release_version(current: str, latest: str | None) -> str | None:
+    """Return the pre-bumped project version when it has not been released yet.
+
+    A squash-merged release chore can bump the version metadata before the
+    tag is cut (for example master at 0.3.4 with the newest tag at v0.3.3).
+    In that state ``--next-patch`` must release the pending version, not bump
+    past it — otherwise the pending version never gets a tag or release.
+    """
+    if latest is None:
+        return None
+    released = latest.removeprefix("v")
+    if not SEMVER.fullmatch(released):
+        return None
+    current_parts = [int(part) for part in current.split(".")]
+    released_parts = [int(part) for part in released.split(".")]
+    if current_parts > released_parts:
+        return current
+    return None
+
+
+def next_release_version() -> str:
+    """Resolve what ``--next-patch`` should release, honoring pending bumps."""
+    current = current_version()
+    latest = latest_tag()
+    pending = pending_release_version(current, latest)
+    if pending is not None:
+        print(
+            f"Version {current} is set in project metadata but newer than tag "
+            f"{latest}; releasing the pending version instead of bumping."
+        )
+        return pending
+    return next_patch_version(current)
+
+
 def ensure_clean_or_release_version(version: str) -> None:
     status = git_output("status", "--porcelain")
     if not status:
@@ -392,7 +436,7 @@ def main() -> int:
     if args.next_patch and args.version:
         parser.error("version and --next-patch are mutually exclusive")
     if args.next_patch:
-        version = next_patch_version(current_version())
+        version = next_release_version()
     elif args.version:
         version = args.version.removeprefix("v")
     else:
