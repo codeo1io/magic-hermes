@@ -1,0 +1,99 @@
+"""Guardrails for documented repository claims.
+
+These tests keep the README, the sync workflow, and the pinned upstream
+manifest in agreement. They exist because the sync workflow drives releases
+automatically: if a documented cadence or pin claim drifts from the actual
+configuration, operators reason about the wrong system.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SYNC_WORKFLOW = ROOT / ".github" / "workflows" / "sync-magic-context.yml"
+README = ROOT / "README.md"
+
+
+def _upstream_pin() -> str:
+    package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+    return package["dependencies"]["@cortexkit/pi-magic-context"].lstrip("=^~")
+
+
+def _tested_version() -> str:
+    manifest = json.loads(
+        (ROOT / "src" / "magic_hermes" / "magic_context_compat.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return manifest["tested_version"]
+
+
+def _sync_cron() -> str:
+    workflow_text = SYNC_WORKFLOW.read_text(encoding="utf-8")
+    match = re.search(r"cron:\s*\"([^\"]+)\"", workflow_text)
+    assert match is not None, "sync workflow must declare a schedule cron"
+    return match.group(1)
+
+
+def test_upstream_pin_matches_compatibility_manifest():
+    """package.json and magic_context_compat.json must never disagree."""
+    assert _upstream_pin() == _tested_version()
+
+
+def test_readme_cadence_claim_matches_sync_workflow_cron():
+    """README's sync cadence claim must match the workflow's actual schedule."""
+    cron = _sync_cron()
+    fields = cron.split()
+    assert len(fields) == 5, f"expected a simple cron expression, got {cron!r}"
+    minute, hour, day, month, weekday = fields
+    assert {day, month, weekday} == {"*"}, (
+        "cadence claim in this test only models daily schedules; "
+        f"update the README claim and this test together for {cron!r}"
+    )
+    expected = f"daily at {int(hour):02d}:{int(minute):02d} UTC"
+    readme = README.read_text(encoding="utf-8")
+    assert expected in readme, (
+        f"README sync-cadence claim does not mention the actual schedule "
+        f"{expected!r} (cron {cron!r})"
+    )
+    assert "every 15 minutes" not in readme, (
+        "README still claims a 15-minute polling cadence that the workflow "
+        "does not have"
+    )
+
+
+def test_readme_pin_claim_when_present_matches_manifest():
+    """A README 'through X.Y.Z' claim, if present, must equal the pinned release."""
+    readme = README.read_text(encoding="utf-8")
+    claims = re.findall(r"through (\d+\.\d+\.\d+)", readme)
+    for claim in claims:
+        assert claim == _tested_version(), (
+            f"README claims upstream {claim} but the manifest pins "
+            f"{_tested_version()}"
+        )
+
+
+class TestSyncWorkflowGuardrails:
+    """The auto-release workflow must keep its series-jump guard intact."""
+
+    def test_pull_requests_permission_declared(self):
+        text = SYNC_WORKFLOW.read_text(encoding="utf-8")
+        assert "pull-requests: write" in text, (
+            "sync workflow needs pull-requests: write to open adoption PRs"
+        )
+
+    def test_direct_release_is_gated_on_series_jump(self):
+        text = SYNC_WORKFLOW.read_text(encoding="utf-8")
+        assert "series_jump" in text, (
+            "sync workflow lost its series-jump gate"
+        )
+
+    def test_adoption_pr_step_exists(self):
+        text = SYNC_WORKFLOW.read_text(encoding="utf-8")
+        assert "gh pr create" in text, (
+            "sync workflow must open an adoption PR instead of direct-releasing "
+            "series jumps"
+        )
