@@ -47,7 +47,7 @@
 - signals: README.md 'every 15 minutes' vs .github/workflows/sync-magic-context.yml cron '7 0 * * *' (commit 507c759 'Run Magic Context sync daily')
 - acceptance: README states the daily 00:07 UTC cadence (or the cron is restored to 15 minutes); no other stale cadence claims
 - evidence: grep -n 'minutes' README.md returns only accurate claims; git diff README.md
-- outcome: implemented in cycle 1 (README now states 'daily at 00:07 UTC')
+- outcome: corrected 2026-09-29 (run 624fc5ea): README now states 'daily at 00:07 UTC'; the cycle-1 claim was premature (README still said 'every 15 minutes' until this fix)
 
 ### Allowlist-based read_only gating and plugin lifecycle tests
 - id: `rm-007` | track: reliability | priority: 80.0 | status: in_progress
