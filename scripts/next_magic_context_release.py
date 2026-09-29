@@ -13,6 +13,18 @@ SEMVER_TAG = re.compile(
 )
 
 
+def is_series_jump(current_version: str, next_version: str) -> bool:
+    """True when the upgrade crosses a minor or major boundary.
+
+    Patch-only updates within the same series keep the fully automated sync
+    path; anything wider requires an adoption PR because it can move the
+    compatibility fence and migrate the shared store.
+    """
+    current = current_version.removeprefix("v").split(".")
+    nxt = next_version.removeprefix("v").split(".")
+    return current[:2] != nxt[:2]
+
+
 def next_release_tag(releases: list[dict], current_version: str) -> str | None:
     current_tag = f"v{current_version.removeprefix('v')}"
     published = [
