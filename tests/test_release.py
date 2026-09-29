@@ -114,3 +114,48 @@ def test_replace_once_requires_matching_version_line(tmp_path):
     path.write_text("name = nope\n", encoding="utf-8")
     with pytest.raises(release.ReleaseError, match="could not update version"):
         release.replace_once(path, re.escape('version = "old"'), 'version = "new"')
+
+
+def test_pending_release_version_returns_pre_bumped_metadata():
+    # master at 0.3.4 while the newest tag is v0.3.3: --next-patch must
+    # release 0.3.4, not silently skip to 0.3.5.
+    assert release.pending_release_version("0.3.4", "v0.3.3") == "0.3.4"
+
+
+def test_pending_release_version_none_when_metadata_matches_latest_tag():
+    assert release.pending_release_version("0.3.3", "v0.3.3") is None
+
+
+def test_pending_release_version_none_when_metadata_is_older_than_tag():
+    assert release.pending_release_version("0.3.3", "v0.3.4") is None
+
+
+def test_pending_release_version_ignores_non_release_tags():
+    assert release.pending_release_version("0.3.4", "dashboard-v0.18.0") is None
+    assert release.pending_release_version("0.3.4", None) is None
+
+
+def test_latest_tag_returns_highest_semver_ignoring_non_release_tags(monkeypatch):
+    # git --sort=v:refname is version-aware, so the stub mirrors its order.
+    monkeypatch.setattr(
+        release,
+        "git_output",
+        lambda *args: "dashboard-v0.18.0\nv0.3.3\nv0.3.4\nv0.3.10\n",
+    )
+    assert release.latest_tag() == "v0.3.10"
+
+
+def test_next_release_version_releases_pending_version(monkeypatch, capsys):
+    monkeypatch.setattr(release, "current_version", lambda: "0.3.4")
+    monkeypatch.setattr(release, "git_output", lambda *args: "v0.3.2\nv0.3.3\n")
+
+    assert release.next_release_version() == "0.3.4"
+    assert "releasing the pending version" in capsys.readouterr().out
+
+
+def test_next_release_version_bumps_when_nothing_pending(monkeypatch, capsys):
+    monkeypatch.setattr(release, "current_version", lambda: "0.3.3")
+    monkeypatch.setattr(release, "git_output", lambda *args: "v0.3.2\nv0.3.3\n")
+
+    assert release.next_release_version() == "0.3.4"
+    assert "releasing the pending version" not in capsys.readouterr().out
