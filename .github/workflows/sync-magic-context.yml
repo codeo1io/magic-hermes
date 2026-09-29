@@ -9,11 +9,17 @@ on:
         description: "Magic Context core version (for example 0.39.0); blank means next unseen core release"
         required: false
         type: string
+      allow_series_jump:
+        description: "Confirm a requested series jump (minor/major) — routes it to an adoption PR instead of aborting"
+        required: false
+        default: false
+        type: boolean
   repository_dispatch:
     types: [magic-context-release]
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: sync-magic-context-release
@@ -35,7 +41,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           cache: npm
 
       - name: Resolve next Magic Context core release
@@ -43,6 +49,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_VERSION: ${{ inputs.version || github.event.client_payload.version || '' }}
+          ALLOW_SERIES_JUMP: ${{ inputs.allow_series_jump || 'false' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -50,6 +57,10 @@ jobs:
 
           if [[ -n "$REQUESTED_VERSION" ]]; then
             version="${REQUESTED_VERSION#v}"
+            if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Requested version must be plain X.Y.Z (got '${REQUESTED_VERSION}')."
+              exit 1
+            fi
             tag="v${version}"
           else
             releases_file="$RUNNER_TEMP/magic-context-releases.json"
@@ -83,6 +94,25 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
+          # Series jumps (minor/major upgrades) can move the compatibility
+          # fence and migrate the shared store. They always go through an
+          # adoption PR instead of the direct auto-release path — including
+          # explicitly requested versions, which must be confirmed with the
+          # allow_series_jump dispatch input before they resolve at all.
+          if python -c '
+            import sys
+            from scripts.next_magic_context_release import is_series_jump
+            sys.exit(0 if is_series_jump(sys.argv[1], sys.argv[2]) else 1)
+          ' "$current" "$version"; then
+            if [[ -n "$REQUESTED_VERSION" && "$ALLOW_SERIES_JUMP" != "true" ]]; then
+              echo "::error::Refusing ${tag}: it is a series jump over v${current} and can move the compatibility fence / migrate the shared store. Re-dispatch with allow_series_jump=true to open the adoption PR (a series jump never direct-releases)."
+              exit 1
+            fi
+            echo "series_jump=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "series_jump=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Synchronize dependency metadata
         if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true'
         run: |
@@ -92,8 +122,49 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund
           python scripts/sync_magic_context_release.py --check
 
+      - name: Open adoption PR for series jumps
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true' && steps.release.outputs.series_jump == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${TAG:?validated in the resolve step}"
+          branch="sync/magic-context-${tag}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ "$(gh pr list --head "$branch" --state open --json number --jq 'length')" != "0" ]]; then
+            echo "Adoption PR for $branch is already open; leaving it untouched."
+            exit 0
+          fi
+          git checkout -b "$branch"
+          git add package.json package-lock.json src/magic_hermes/magic_context_compat.json
+          git commit -m "sync: adopt Magic Context ${tag} (series bump, PR-gated)"
+          # The branch is disposable tooling output; a stale remote copy left
+          # behind by a closed PR would otherwise reject a non-fast-forward push.
+          git push --force-with-lease -u origin "$branch"
+          gh pr create \
+            --title "Adopt Magic Context ${tag} (series bump)" \
+            --body "Automated series adoption: a minor/major upgrade can move the compatibility fence and migrate the shared store, so the direct auto-release path is intentionally disabled. CI runs the full battery on this PR — merge only when it is green and the migration notes (ROADMAP rm-014) are reviewed. Nightly syncs will not duplicate this PR. Rollback: close this PR unmerged, or revert its merge commit after merging — the pin, lockfile, and manifest revert with it, restoring the previous series (documented rollback per ROADMAP rm-016)."
+
+      - name: Seed historian model config (user-level CortexKit config)
+        # Same requirement ci.yml proved live: the release battery asserts
+        # historian readiness, which needs a configured historian model in
+        # the user-level CortexKit config. Fresh runners have none — the
+        # 2026-09-29T05:33Z nightly failed exactly here (4 ready:false).
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true' && steps.release.outputs.series_jump != 'true'
+        run: |
+          mkdir -p "$HOME/.config/cortexkit"
+          cat > "$HOME/.config/cortexkit/magic-context.jsonc" <<'EOF'
+          {
+            "historian": {
+              "pi": { "model": "anthropic/claude-sonnet-4-5" }
+            }
+          }
+          EOF
+
       - name: Prepare release environment
-        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true'
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true' && steps.release.outputs.series_jump != 'true'
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
@@ -102,7 +173,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Publish Magic-Hermes patch release
-        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true'
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true' && steps.release.outputs.series_jump != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: .venv/bin/python scripts/release.py --next-patch

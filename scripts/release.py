@@ -25,6 +25,17 @@ MAGIC_CONTEXT_SYNC_FILES = {
     "src/magic_hermes/magic_context_compat.json",
 }
 
+#: The interpreter operational probes resolve through PATH — the maestro
+#: phase-2 observer runs ``magic-hermes doctor`` from this venv, so landing
+#: a release on master does nothing for the finding until the wheel is
+#: installed HERE (finding d59758598379: release lane ended at publish).
+DEFAULT_DEPLOY_VENV = Path("/home/agent/.hermes/hermes-agent/venv")
+#: Overrides DEFAULT_DEPLOY_VENV (tests, other hosts).
+DEPLOY_VENV_ENV = "MAGIC_HERMES_DEPLOY_VENV"
+#: When set by the deploy/release lane, the deploy step additionally runs
+#: ``<venv>/bin/magic-hermes doctor`` and requires a clean exit.
+DEPLOY_SMOKE_ENV = "MAGIC_HERMES_DEPLOY_SMOKE"
+
 
 class ReleaseError(RuntimeError):
     """Raised when a release precondition or command fails."""
@@ -138,6 +149,54 @@ def next_patch_version(version: str) -> str:
     return f"{major}.{minor}.{patch + 1}"
 
 
+def latest_tag() -> str | None:
+    """Return the highest semantic-version tag, ignoring non-release tags."""
+    tags = [
+        item
+        for item in git_output("tag", "-l", "v*", "--sort=v:refname").splitlines()
+        if SEMVER.fullmatch(item.removeprefix("v"))
+    ]
+    return tags[-1] if tags else None
+
+
+def pending_release_version(current: str, latest: str | None) -> str | None:
+    """Return the pre-bumped project version when it has not been released yet.
+
+    A squash-merged release chore can bump the version metadata before the
+    tag is cut (for example master at 0.3.4 with the newest tag at v0.3.3).
+    In that state ``--next-patch`` must release the pending version, not bump
+    past it — otherwise the pending version never gets a tag or release.
+    """
+    if latest is None:
+        return None
+    released = latest.removeprefix("v")
+    if not SEMVER.fullmatch(released):
+        return None
+    if not SEMVER.fullmatch(current):
+        raise ReleaseError(
+            f"project version {current!r} is not X.Y.Z; fix pyproject.toml"
+        )
+    current_parts = [int(part) for part in current.split(".")]
+    released_parts = [int(part) for part in released.split(".")]
+    if current_parts > released_parts:
+        return current
+    return None
+
+
+def next_release_version() -> str:
+    """Resolve what ``--next-patch`` should release, honoring pending bumps."""
+    current = current_version()
+    latest = latest_tag()
+    pending = pending_release_version(current, latest)
+    if pending is not None:
+        print(
+            f"Version {current} is set in project metadata but newer than tag "
+            f"{latest}; releasing the pending version instead of bumping."
+        )
+        return pending
+    return next_patch_version(current)
+
+
 def ensure_clean_or_release_version(version: str) -> None:
     status = git_output("status", "--porcelain")
     if not status:
@@ -249,6 +308,114 @@ def release_exists(tag: str) -> bool:
     ).returncode == 0
 
 
+def deploy_target() -> Path:
+    """Resolve the deploy target venv: env override beats the default."""
+    override = os.environ.get(DEPLOY_VENV_ENV)
+    return Path(override) if override else DEFAULT_DEPLOY_VENV
+
+
+def deployed_version(target: Path) -> str | None:
+    """Report the magic-hermes version installed in the TARGET venv.
+
+    Resolution runs in the target interpreter itself — never this one —
+    because the development interpreter's own metadata can be stale.
+    Returns ``None`` when the venv is absent or magic-hermes is missing.
+    """
+    python = target / "bin" / "python"
+    if not python.is_file():
+        return None
+    probe = subprocess.run(
+        [
+            str(python),
+            "-c",
+            "import importlib.metadata as m; print(m.version('magic-hermes'))",
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if probe.returncode != 0:
+        return None
+    return probe.stdout.strip() or None
+
+
+def deploy_release(artifacts: list[Path], version: str, target: Path) -> None:
+    """Install and verify the freshly built wheel in the probe venv.
+
+    Ordering (callers): after ``commit_and_tag`` and before
+    ``publish_release`` — the tag exists when bits land in the venv, and a
+    deploy failure aborts the release before the GitHub release object is
+    created. Idempotent: when the target already carries ``version`` the
+    install is skipped and verification still runs. A missing venv,
+    missing pip, or a failed verification is a loud error, never a skip.
+    """
+    python = target / "bin" / "python"
+    if not python.is_file():
+        raise ReleaseError(f"deploy target venv python is missing: {python}")
+
+    wheel_name = f"magic_hermes-{version}-py3-none-any.whl"
+    wheel = next((a for a in artifacts if a.name == wheel_name), None)
+    if wheel is None:
+        raise ReleaseError(
+            f"release wheel {wheel_name} not found among built artifacts"
+        )
+
+    installed = deployed_version(target)
+    if installed != version:
+        run(str(python), "-m", "pip", "--version")
+        run(
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            "--no-deps",
+            str(wheel),
+        )
+        installed = deployed_version(target)
+        if installed != version:
+            raise ReleaseError(
+                f"target venv {target} reports magic-hermes {installed!r} "
+                f"after installing the wheel; expected {version}"
+            )
+
+    console_script = target / "bin" / "magic-hermes"
+    if not console_script.is_file():
+        raise ReleaseError(f"console script missing after deploy: {console_script}")
+
+    if os.environ.get(DEPLOY_SMOKE_ENV):
+        run(str(console_script), "doctor")
+
+
+def redeploy_release(version: str, tag: str) -> None:
+    """Re-deliver an already-released version to the deploy target.
+
+    Taken when the GitHub release exists and ``--deploy`` was requested:
+    the tag must exist and point at current HEAD, so the wheel is rebuilt
+    from exactly the released tree; commit and publish are skipped (both
+    already happened for this version).
+    """
+    if not tag_exists(tag):
+        raise ReleaseError(
+            f"GitHub release {tag} exists but tag {tag} does not; "
+            "refusing to deploy from an untagged tree"
+        )
+    tagged_commit = git_output("rev-list", "-n", "1", tag)
+    head = git_output("rev-parse", "HEAD")
+    if tagged_commit != head:
+        raise ReleaseError(
+            f"tag {tag} does not point at current HEAD "
+            f"({tagged_commit[:12]} vs {head[:12]}); refusing to redeploy "
+            "a foreign tag"
+        )
+    artifacts = validate_and_build()
+    target = deploy_target()
+    deploy_release(artifacts, version, target)
+    print(f"Redeployed Magic-Hermes {tag} into {target}")
+
+
 def commit_and_tag(version: str, tag: str, default_branch: str) -> None:
     if not tag_exists(tag):
         if current_version() != version:
@@ -258,12 +425,18 @@ def commit_and_tag(version: str, tag: str, default_branch: str) -> None:
         staged = git_output("diff", "--cached", "--name-only")
         if staged:
             run("git", "commit", "-m", f"release: {tag}")
-        elif not git_output("log", "-1", "--format=%s").startswith(
-            f"release: {tag}"
+        elif not any(
+            subject.startswith(f"release: {tag}")
+            for subject in git_output("log", "--format=%s").splitlines()
         ):
+            # Clean tree at the release version but no release commit in
+            # history: an unexplained state, so refuse rather than tag it.
             raise ReleaseError(
                 "release version is set but no matching release commit exists"
             )
+        # Otherwise the release commit already exists in history (for
+        # example a squashed "release: v0.3.4 (#16)" with follow-up commits
+        # on top) and the tree carries the version metadata: tag HEAD.
 
         remaining = git_output("status", "--porcelain")
         if remaining:
@@ -387,12 +560,21 @@ def main() -> int:
         action="store_true",
         help="validate and build artifacts without committing, tagging, or publishing",
     )
+    parser.add_argument(
+        "--deploy",
+        action="store_true",
+        help=(
+            "after tagging, and before publishing, install and verify the "
+            "built wheel in the deploy target venv (default "
+            f"{DEFAULT_DEPLOY_VENV}; override with {DEPLOY_VENV_ENV})"
+        ),
+    )
     args = parser.parse_args()
 
     if args.next_patch and args.version:
         parser.error("version and --next-patch are mutually exclusive")
     if args.next_patch:
-        version = next_patch_version(current_version())
+        version = next_release_version()
     elif args.version:
         version = args.version.removeprefix("v")
     else:
@@ -406,7 +588,10 @@ def main() -> int:
     ensure_clean_or_release_version(version)
     default_branch = ensure_default_branch()
     if release_exists(tag):
-        raise ReleaseError(f"GitHub release {tag} already exists")
+        if not args.deploy:
+            raise ReleaseError(f"GitHub release {tag} already exists")
+        redeploy_release(version, tag)
+        return 0
 
     if current_version() != version:
         set_version(version)
@@ -421,6 +606,8 @@ def main() -> int:
         return 0
 
     commit_and_tag(version, tag, default_branch)
+    if args.deploy:
+        deploy_release(artifacts, version, deploy_target())
     publish_release(version, tag, artifacts, checksum)
     print(f"Published Magic-Hermes {tag}")
     return 0
