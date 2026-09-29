@@ -30,6 +30,12 @@ from .historian_guard import (
     guard_status,
     remove_guard,
 )
+from .provenance import (
+    EXPECTED_ORIGIN,
+    PROVENANCE_ENV,
+    check_state,
+    read_state,
+)
 from .runtime import (
     RuntimeClient,
     _package_version,
@@ -623,6 +629,45 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
             "No shared context DB yet — it is created on first successful "
             "runtime bind",
         )
+
+    # Repository provenance guard (maestro finding 4bc6f3a5b0c1): opt-in
+    # via MAGIC_HERMES_PROVENANCE_REPO, deliberately WARN-only in every
+    # bad state — never FAIL (the health contract holds the guard to the
+    # same rule as the historian guard) and never a write (repair is an
+    # explicit `magic-hermes provenance --repair` act). Unset → no check
+    # emitted at all, keeping the default doctor output byte-stable: CI
+    # clones over HTTPS while this pin is SSH, so a default-on check
+    # would WARN on every healthy CI run.
+    provenance_repo = os.environ.get(PROVENANCE_ENV)
+    if provenance_repo:
+        provenance_state = read_state(Path(provenance_repo).expanduser())
+        if not provenance_state.repo_readable:
+            reason = (
+                f" ({provenance_state.error})"
+                if provenance_state.error
+                else ""
+            )
+            report.add(
+                "WARN",
+                "Repository provenance check skipped: "
+                f"{provenance_repo} is not a readable git repo{reason}",
+            )
+        else:
+            provenance = check_state(provenance_state)
+            if provenance.healthy:
+                report.add(
+                    "PASS",
+                    "Repository provenance verified "
+                    f"({provenance.summary()})",
+                )
+            else:
+                report.add(
+                    "WARN",
+                    "Repository provenance drift — "
+                    f"{provenance.summary()}; run `magic-hermes provenance "
+                    f"--repair` to restore the pinned origin "
+                    f"{EXPECTED_ORIGIN}",
+                )
 
     handshake: dict[str, Any] | None = None
     bridge: dict[str, Any] | None = None
