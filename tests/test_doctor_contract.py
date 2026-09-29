@@ -537,8 +537,12 @@ class TestObserverBudgetMatrix:
 class TestDeploySmoke:
     """U17 deploy smoke — the interpreter maestro probes must carry the
     newest tagged release of magic-hermes. Gated behind
-    MAGIC_HERMES_DEPLOY_SMOKE=1 (the deploy lanes U19/U21 set it); the
-    ordinary test lane skips, so the rider adds no skips to it."""
+    MAGIC_HERMES_DEPLOY_SMOKE=1 (the ``release.py --deploy`` lane sets it);
+    the ordinary test lane skips, so the rider adds no skips to it.
+
+    With MAGIC_HERMES_DEPLOY_VENV set, the installed version is resolved by
+    the TARGET venv's own interpreter — the one maestro actually probes —
+    instead of this (development) interpreter, whose metadata can be stale."""
 
     def test_installed_version_matches_newest_tag(self):
         if os.environ.get("MAGIC_HERMES_DEPLOY_SMOKE") != "1":
@@ -559,7 +563,26 @@ class TestDeploySmoke:
         ).stdout.split()
         assert tags, "no v* tags found in the release repository"
         newest = max(tags, key=lambda t: tuple(map(int, t[1:].split("."))))
-        installed = metadata.version("magic-hermes")
+        target = os.environ.get("MAGIC_HERMES_DEPLOY_VENV")
+        if target:
+            probe = subprocess.run(
+                [
+                    str(Path(target) / "bin" / "python"),
+                    "-c",
+                    "import importlib.metadata as m; "
+                    "print(m.version('magic-hermes'))",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert probe.returncode == 0, (
+                f"deploy target venv {target} could not resolve magic-hermes "
+                f"metadata: {(probe.stderr or probe.stdout).strip()}"
+            )
+            installed = probe.stdout.strip()
+        else:
+            installed = metadata.version("magic-hermes")
         assert installed == newest[1:], (
             f"deployed interpreter has magic-hermes {installed} but the "
             f"newest tag is {newest}"

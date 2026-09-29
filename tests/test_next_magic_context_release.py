@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.next_magic_context_release import next_release_tag
+from scripts.next_magic_context_release import is_series_jump, next_release_tag
 
 
 def _release(tag: str, published_at: str, *, draft: bool = False) -> dict:
@@ -49,3 +49,21 @@ def test_next_release_tag_fails_closed_when_current_release_is_missing():
 
     with pytest.raises(ValueError, match=r"v0\.38\.0"):
         next_release_tag(releases, "0.38.0")
+
+
+def test_patch_update_is_not_a_series_jump():
+    assert not is_series_jump("0.43.2", "0.43.3")
+    assert not is_series_jump("v0.43.2", "v0.43.3")
+
+
+def test_minor_update_is_a_series_jump():
+    assert is_series_jump("0.43.2", "0.44.0")
+    assert is_series_jump("v0.43.2", "0.44.0")
+
+
+def test_major_update_is_a_series_jump():
+    assert is_series_jump("0.43.2", "1.0.0")
+
+
+def test_same_series_patch_chain_stays_in_series():
+    assert not is_series_jump("0.44.0", "0.44.1")
