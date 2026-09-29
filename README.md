@@ -170,30 +170,21 @@ export MAGIC_CONTEXT_PACKAGE_ROOT=/path/to/node_modules/@cortexkit/pi-magic-cont
 ### 3. Install Magic-Hermes into Hermes
 
 Install the latest published wheel into the Python environment used by Hermes. This
-repository is currently private, so authenticate GitHub CLI once with `gh auth login`,
-then run:
+repository is public, so install the release wheel directly from its GitHub Release
+URL (shown for v0.3.4; newer versions follow the same URL pattern on the
+[Releases](https://github.com/codeo1io/magic-hermes/releases) page):
 
 ```bash
-rm -rf /tmp/magic-hermes-install
-mkdir -p /tmp/magic-hermes-install
-
-gh release download --repo codeo1io/magic-hermes \
-  --pattern 'magic_hermes-*-py3-none-any.whl' \
-  --dir /tmp/magic-hermes-install
-
 uv pip install --python /path/to/hermes/venv/bin/python --no-deps \
-  /tmp/magic-hermes-install/magic_hermes-*-py3-none-any.whl
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.4/magic_hermes-0.3.4-py3-none-any.whl
 ```
 
 If `uv` is not installed, use the Hermes environment's `pip` instead:
 
 ```bash
 /path/to/hermes/venv/bin/python -m pip install --no-deps \
-  /tmp/magic-hermes-install/magic_hermes-*-py3-none-any.whl
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.4/magic_hermes-0.3.4-py3-none-any.whl
 ```
-
-When this repository becomes public, the release wheel can also be installed directly
-from its GitHub Release URL without the authenticated download step.
 
 For development from a local checkout, install the repository directly instead:
 
@@ -315,7 +306,7 @@ The adapter accepts only the major/minor series recorded in
 `src/magic_hermes/magic_context_compat.json` because it uses private symbols from
 the official Pi module. The repo-level `package.json`/`package-lock.json` pin the
 exact upstream release used for validation. `.github/workflows/sync-magic-context.yml`
-checks for new core `vX.Y.Z` releases every 15 minutes (and also supports immediate
+checks for new core `vX.Y.Z` releases daily at 00:07 UTC (and also supports immediate
 `repository_dispatch`), waits for the matching npm publication, and processes the
 oldest unseen core release first so intermediate releases are never skipped. Each
 validated upstream release updates the dependency pin and compatibility manifest,
