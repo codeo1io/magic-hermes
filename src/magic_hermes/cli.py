@@ -30,6 +30,16 @@ from .historian_guard import (
     guard_status,
     remove_guard,
 )
+from .provenance import (
+    EXPECTED_ORIGIN,
+    GIT_TIMEOUT_S,
+    PROVENANCE_ENV,
+    ProvenanceError,
+    ProvenanceReport,
+    check_state,
+    read_state,
+    repair,
+)
 from .runtime import (
     RuntimeClient,
     _package_version,
@@ -624,6 +634,45 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
             "runtime bind",
         )
 
+    # Repository provenance guard (maestro finding 4bc6f3a5b0c1): opt-in
+    # via MAGIC_HERMES_PROVENANCE_REPO, deliberately WARN-only in every
+    # bad state — never FAIL (the health contract holds the guard to the
+    # same rule as the historian guard) and never a write (repair is an
+    # explicit `magic-hermes provenance --repair` act). Unset → no check
+    # emitted at all, keeping the default doctor output byte-stable: CI
+    # clones over HTTPS while this pin is SSH, so a default-on check
+    # would WARN on every healthy CI run.
+    provenance_repo = os.environ.get(PROVENANCE_ENV)
+    if provenance_repo:
+        provenance_state = read_state(Path(provenance_repo).expanduser())
+        if not provenance_state.repo_readable:
+            reason = (
+                f" ({provenance_state.error})"
+                if provenance_state.error
+                else ""
+            )
+            report.add(
+                "WARN",
+                "Repository provenance check skipped: "
+                f"{provenance_repo} is not a readable git repo{reason}",
+            )
+        else:
+            provenance = check_state(provenance_state)
+            if provenance.healthy:
+                report.add(
+                    "PASS",
+                    "Repository provenance verified "
+                    f"({provenance.summary()})",
+                )
+            else:
+                report.add(
+                    "WARN",
+                    "Repository provenance drift — "
+                    f"{provenance.summary()}; run `magic-hermes provenance "
+                    f"--repair` to restore the pinned origin "
+                    f"{EXPECTED_ORIGIN}",
+                )
+
     handshake: dict[str, Any] | None = None
     bridge: dict[str, Any] | None = None
     if node and installations:
@@ -876,6 +925,179 @@ def run_guard(action: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# provenance command
+# ---------------------------------------------------------------------------
+
+
+def _provenance_default_repo() -> Path:
+    """The repository containing CWD (``git rev-parse --show-toplevel``).
+
+    Outside any repository this falls back to CWD itself, so ``read_state``
+    reports "not a readable git repository" and the command exits 1 with
+    that actionable message instead of a git traceback.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return Path.cwd()
+    root = proc.stdout.strip()
+    return Path(root) if proc.returncode == 0 and root else Path.cwd()
+
+
+def _provenance_facet_lines(report: ProvenanceReport) -> list[str]:
+    """One facet per line: ``ok`` / ``DRIFT`` (detached HEAD is INFO)."""
+
+    facets: list[tuple[str, str]] = [
+        ("repo_readable", "ok" if report.repo_readable else "DRIFT")
+    ]
+    if report.repo_readable:
+        facets.append(("origin_match", "ok" if report.origin_match else "DRIFT"))
+        facets.append(
+            ("pushurl_same_repo", "ok" if report.pushurl_same_repo else "DRIFT")
+        )
+        if report.branch_tracking is None:
+            facets.append(("branch_tracking", "n/a — detached HEAD (INFO)"))
+        else:
+            facets.append(
+                ("branch_tracking", "ok" if report.branch_tracking else "DRIFT")
+            )
+    return [f"facet {name}: {state}" for name, state in facets]
+
+
+def _render_provenance_header(report: ProvenanceReport) -> None:
+    """Box-drawing report header, in the style of ``run_guard``."""
+
+    print("┌  magic-hermes provenance")
+    print(f"│  repo: {report.repo}")
+    print(f"│  expected fetch: {report.expected}")
+    print(f"│  actual fetch:   {report.fetch_url or '<no origin remote>'}")
+    print(f"│  push url:       {report.push_url or 'same as fetch'}")
+    for line in _provenance_facet_lines(report):
+        print(f"│  {line}")
+
+
+def _provenance_payload(
+    report: ProvenanceReport, writes: list[str], error: str | None = None
+) -> dict[str, Any]:
+    """Machine-readable report: healthy / facets / repair (plan U2)."""
+
+    payload: dict[str, Any] = {
+        "repo": str(report.repo),
+        "expected": report.expected,
+        "fetch_url": report.fetch_url,
+        "push_url": report.push_url,
+        "branch": report.branch,
+        "healthy": report.healthy,
+        "drifted_facets": report.drifted_facets,
+        "facets": {
+            "repo_readable": report.repo_readable,
+            "origin_match": report.origin_match,
+            "pushurl_same_repo": report.pushurl_same_repo,
+            "branch_tracking": report.branch_tracking,
+        },
+        "summary": report.summary(),
+        "repair": writes,
+    }
+    if error is not None:
+        payload["error"] = error
+    return payload
+
+
+def run_provenance(
+    path: Path | None = None,
+    repair_requested: bool = False,
+    push_url: str | None = None,
+    json_output: bool = False,
+) -> int:
+    """Check — and with ``--repair``, explicitly restore — the pinned origin.
+
+    Check-only is read-only local git plumbing: exit 0 when healthy, 1
+    when drifted or when the path is not a readable repository — fail-loud
+    like ``guard apply`` so deploy scripts never mistake drift for
+    coverage. ``--repair`` prints each write, re-checks, and exits 0 only
+    when the repository is healthy afterwards; refusals (foreign
+    repository, no origin, unreadable path) exit 1 with an actionable
+    message and perform zero writes. ``--json`` keeps stdout one parseable
+    object; human errors go to stderr.
+    """
+
+    repo = Path(path).expanduser() if path is not None else _provenance_default_repo()
+
+    if push_url is not None and not repair_requested:
+        message = (
+            "--push-url writes remote.origin.pushurl, so it applies only "
+            "together with --repair; refusing an unflagged write"
+        )
+        if json_output:
+            print(
+                json.dumps(
+                    {
+                        "healthy": False,
+                        "facets": {},
+                        "repair": [],
+                        "error": message,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(message, file=sys.stderr)
+        return 1
+
+    state = read_state(repo)
+    report = check_state(state)
+
+    writes: list[str] = []
+    if repair_requested:
+        try:
+            writes = repair(repo, state=state, push_url=push_url).writes
+        except ProvenanceError as exc:
+            if json_output:
+                print(
+                    json.dumps(
+                        _provenance_payload(report, writes=[], error=str(exc)),
+                        indent=2,
+                    )
+                )
+            else:
+                _render_provenance_header(report)
+                print(f"└  repair refused: {exc}", file=sys.stderr)
+            return 1
+        # re-check from disk: exit 0 only when the repository is healthy
+        # after the repair, never on the repair's own say-so
+        report = check_state(read_state(repo))
+
+    if json_output:
+        print(json.dumps(_provenance_payload(report, writes=writes), indent=2))
+    else:
+        _render_provenance_header(report)
+        if repair_requested:
+            for write in writes:
+                print(f"│  repair: {write}")
+            if not writes:
+                print("│  repair: nothing to write — already at the pin")
+        if report.healthy:
+            print(
+                "└  provenance verified"
+                + (" after repair" if repair_requested else "")
+            )
+        else:
+            print(
+                "└  provenance drift in "
+                f"{', '.join(report.drifted_facets)} — run `magic-hermes "
+                "provenance --repair` to restore the pinned origin "
+                f"{EXPECTED_ORIGIN}"
+            )
+    return 0 if report.healthy else 1
+
+
+# ---------------------------------------------------------------------------
 # install command
 # ---------------------------------------------------------------------------
 
@@ -1037,6 +1259,36 @@ def build_parser() -> argparse.ArgumentParser:
         "status: read-only state",
     )
 
+    provenance = sub.add_parser(
+        "provenance",
+        help="check/repair the canonical git origin (provenance guard)",
+    )
+    provenance.add_argument(
+        "--path",
+        type=Path,
+        default=None,
+        help="repository to inspect (default: the repository containing "
+        "the current directory)",
+    )
+    provenance.add_argument(
+        "--repair",
+        action="store_true",
+        help="restore a drifted origin: rewrite the fetch URL to the pin, "
+        "carry the old URL to remote.origin.pushurl, fix branch tracking "
+        "(idempotent; refuses foreign repositories)",
+    )
+    provenance.add_argument(
+        "--push-url",
+        default=None,
+        help="explicit remote.origin.pushurl to set with --repair "
+        "(same repository only)",
+    )
+    provenance.add_argument(
+        "--json",
+        action="store_true",
+        help="machine-readable report + repair log",
+    )
+
     return parser
 
 
@@ -1051,6 +1303,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "guard":
         return run_guard(action=args.action)
+    if args.command == "provenance":
+        return run_provenance(
+            path=args.path,
+            repair_requested=args.repair,
+            push_url=args.push_url,
+            json_output=args.json,
+        )
     return run_doctor(json_output=args.json, full_integrity=args.full_integrity)
 
 

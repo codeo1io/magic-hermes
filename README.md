@@ -148,6 +148,61 @@ the early-return paths is validated: `RETIRES_AT_UPSTREAM` in
 `magic-hermes guard remove` drops the trigger (an idempotent no-op when
 absent). `MAGIC_CONTEXT_DB_PATH` overrides the store for testing.
 
+### 1d. Repository provenance guard
+
+Maestro's phase-1 probe pins this repository's canonical origin
+(`git@github.com:codeo1io/magic-hermes.git`) and FAILs the estate lane on
+any mismatch (finding 4bc6f3a5b0c1: an out-of-band operational action
+rewrote the canonical `remote.origin.url` to HTTPS on 2026-09-29 and
+mangled `[branch "master"] remote` — the finding then stayed open for
+30+ hours). The remote URL is shared mutable state — the canonical
+checkout and every conductor worktree share one `.git` — so this
+repository now owns the pin itself: `EXPECTED_ORIGIN` in
+`src/magic_hermes/provenance.py`. maestro keeps its own independent pin
+in its `config/phase1.toml`; the two are deliberate cross-checks, not a
+single point of truth.
+
+`magic-hermes provenance` checks the origin against that pin using
+maestro-parity normalization — both sides are compared lower-cased with
+`.git` stripped, exactly like the probe, so the guard's verdict can never
+diverge from the probe's — over four facets: origin match, pushurl
+same-repository, branch tracking, and repository readability.
+
+```bash
+magic-hermes provenance                        # check-only; exit 0 healthy / 1 drifted or refused
+magic-hermes provenance --path /work/projects/magic-hermes
+magic-hermes provenance --repair               # restore the pin, carry push intent
+magic-hermes provenance --repair --push-url https://github.com/codeo1io/magic-hermes.git
+magic-hermes provenance --json                 # machine-readable report + repair log
+```
+
+- Check is read-only local git config plumbing; check-only exits 0 when
+  healthy, 1 when drifted or refused.
+- `--repair` restores a drifted-but-same-repo origin while preserving the
+  operator's push intent: the drifted HTTPS fetch URL is carried to
+  `remote.origin.pushurl`, so the sanctioned steady state is SSH fetch +
+  HTTPS push (the probe reads the fetch URL and PASSes, while pushes ride
+  the `gh` credential helper instead of the intermittently flaky SSH
+  route). It also restores mangled branch tracking
+  (`branch.<b>.remote` / `branch.<b>.merge`). Repair is idempotent
+  (re-run on a healthy repo is a no-op) and refuses to touch a checkout
+  whose `origin` — or `pushurl` — identifies a different repository:
+  repair carries intent, it never guesses one.
+- The 2026-09-29 incident, as the guard sees it: fetch URL rewritten to
+  `https://github.com/codeo1io/magic-hermes.git`, `pushurl` unset,
+  `branch.master.remote` mangled — reported as drift in `origin_match`
+  and `branch_tracking`, repaired by one `provenance --repair` that
+  restores the SSH fetch URL, carries the HTTPS URL to `pushurl`, and
+  restores `branch.master.remote=origin` /
+  `branch.master.merge=refs/heads/master`.
+
+`doctor` surfaces the check only when `MAGIC_HERMES_PROVENANCE_REPO`
+points at the checkout to inspect: PASS when healthy, WARN when drifted
+or unreadable — never FAIL, and never a config write on doctor's behalf
+(repair stays an explicit operator act). With the variable unset the
+check is omitted entirely, so default doctor output is unchanged (CI
+clones over HTTPS and must not WARN against the SSH pin).
+
 ### 2. Manual install (fallback)
 
 Magic-Hermes delegates its context-management implementation to the official Magic
