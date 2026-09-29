@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: sync-magic-context-release
@@ -83,6 +84,22 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
+          # Series jumps (minor/major upgrades) can move the compatibility
+          # fence and migrate the shared store. They must go through an
+          # adoption PR instead of the direct auto-release path. An explicitly
+          # requested version is human intent and bypasses the gate.
+          if [[ -n "$REQUESTED_VERSION" ]]; then
+            echo "series_jump=false" >> "$GITHUB_OUTPUT"
+          elif python -c '
+            import sys
+            from scripts.next_magic_context_release import is_series_jump
+            sys.exit(0 if is_series_jump(sys.argv[1], sys.argv[2]) else 1)
+          ' "$current" "$version"; then
+            echo "series_jump=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "series_jump=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Synchronize dependency metadata
         if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true'
         run: |
@@ -92,8 +109,30 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund
           python scripts/sync_magic_context_release.py --check
 
+      - name: Open adoption PR for series jumps
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true' && steps.release.outputs.series_jump == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          branch="sync/magic-context-${tag}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ "$(gh pr list --head "$branch" --state open --json number --jq 'length')" != "0" ]]; then
+            echo "Adoption PR for $branch is already open; leaving it untouched."
+            exit 0
+          fi
+          git checkout -b "$branch"
+          git add package.json package-lock.json src/magic_hermes/magic_context_compat.json
+          git commit -m "sync: adopt Magic Context ${tag} (series bump, PR-gated)"
+          git push -u origin "$branch"
+          gh pr create \
+            --title "Adopt Magic Context ${tag} (series bump)" \
+            --body "Automated series adoption: a minor/major upgrade can move the compatibility fence and migrate the shared store, so the direct auto-release path is intentionally disabled. CI runs the full battery on this PR — merge only when it is green and the migration notes (ROADMAP rm-014) are reviewed. Nightly syncs will not duplicate this PR."
+
       - name: Prepare release environment
-        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true'
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true' && steps.release.outputs.series_jump != 'true'
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
@@ -102,7 +141,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Publish Magic-Hermes patch release
-        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true'
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.changed == 'true' && steps.release.outputs.series_jump != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: .venv/bin/python scripts/release.py --next-patch
