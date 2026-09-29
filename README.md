@@ -315,7 +315,7 @@ The adapter accepts only the major/minor series recorded in
 `src/magic_hermes/magic_context_compat.json` because it uses private symbols from
 the official Pi module. The repo-level `package.json`/`package-lock.json` pin the
 exact upstream release used for validation. `.github/workflows/sync-magic-context.yml`
-checks for new core `vX.Y.Z` releases every 15 minutes (and also supports immediate
+checks for new core `vX.Y.Z` releases daily at 00:07 UTC (and also supports immediate
 `repository_dispatch`), waits for the matching npm publication, and processes the
 oldest unseen core release first so intermediate releases are never skipped. Each
 validated upstream release updates the dependency pin and compatibility manifest,
@@ -346,6 +346,46 @@ gate, produces wheel and sdist artifacts plus `SHA256SUMS`, commits `release: vX
 creates and pushes an annotated tag, and creates the GitHub release with the
 artifacts attached. It refuses to publish when validation fails or unrelated working
 tree changes are present.
+
+### Deployment
+
+Landing a release on `master` does not by itself update the interpreter that
+operational probes run: maestro resolves `magic-hermes` through `PATH` to the
+Hermes agent venv, which keeps its own installed copy until something
+replaces it. The `--deploy` flag closes that delivery gap by making the
+deploy part of the release lane itself:
+
+```bash
+.venv/bin/python scripts/release.py X.Y.Z --deploy
+```
+
+After the release commit is tagged and pushed, and before the GitHub release
+object is created, the script installs the freshly built wheel into the deploy
+target with `<venv>/bin/python -m pip install --force-reinstall --no-deps
+<local wheel>` — a local file (no network) and no dependencies, so a shared
+venv never gains or upgrades unrelated packages. It then verifies the
+deployment *in the target interpreter*: `importlib.metadata.version`
+for `magic-hermes` must equal the release version and the
+`bin/magic-hermes` console script must exist. Deploying before publishing is
+deliberate: the tag already exists when bits land in the venv, and a deploy
+failure aborts the release loudly *before* the GitHub release object is
+created — never silently partial. Every step is idempotent, so re-running
+the command after a failure picks up where it left off.
+
+The deploy target defaults to `DEFAULT_DEPLOY_VENV`
+(`/home/agent/.hermes/hermes-agent/venv`, the interpreter maestro probes);
+set `MAGIC_HERMES_DEPLOY_VENV` to deploy elsewhere — tests and other hosts
+use this override. A missing venv or interpreter, missing pip, or a failed
+verification is a hard release error, never a silent skip.
+
+Setting `MAGIC_HERMES_DEPLOY_SMOKE=1` additionally runs
+`<venv>/bin/magic-hermes doctor` after installation and requires a clean
+exit, so the exact interpreter that was just deployed proves its own health.
+
+When the GitHub release already exists, `release.py X.Y.Z --deploy` takes a
+redeploy path instead of aborting: it requires the tag to exist and point at
+current `HEAD`, rebuilds the wheel from the tagged tree, and redeploys
+without committing or publishing again.
 
 ## License
 
