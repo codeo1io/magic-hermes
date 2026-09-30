@@ -196,6 +196,22 @@ magic-hermes provenance --json                 # machine-readable report + repai
   restores `branch.master.remote=origin` /
   `branch.master.merge=refs/heads/master`.
 
+The check also runs without an installed console script — a bare
+checkout, no `pip install`, no `.venv` (the package is stdlib-only).
+Both `-m` forms dispatch the same `cli.main`, so exits and output are
+identical to the commands above:
+
+```bash
+PYTHONPATH=src python3 -m magic_hermes.cli provenance --path /work/projects/magic-hermes
+PYTHONPATH=src python3 -m magic_hermes.provenance --repair --push-url https://github.com/codeo1io/magic-hermes.git
+```
+
+This is the source-runner vehicle for conductors, worktrees, and CI
+scratch clones; it supersedes the `.venv/bin/magic-hermes` shape an
+earlier remediation plan assumed. (`python -m magic_hermes.provenance`
+used to exit 0 silently; with the `__main__` guard it now behaves
+exactly like the subcommand.)
+
 `doctor` surfaces the check only when `MAGIC_HERMES_PROVENANCE_REPO`
 points at the checkout to inspect: PASS when healthy, WARN when drifted
 or unreadable — never FAIL, and never a config write on doctor's behalf

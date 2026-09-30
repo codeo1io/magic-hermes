@@ -31,7 +31,9 @@ the real estate config.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -444,6 +446,140 @@ class TestProvenanceCli:
         assert args.repair is False
         assert args.push_url is None
         assert args.json is False
+
+
+# --- module-runnable surface (U2 rider: -m entry points) --------------------
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _module_env() -> dict[str, str]:
+    """Env making the checkout's ``src/`` importable with no install step."""
+
+    src = str(_REPO_ROOT / "src")
+    existing = os.environ.get("PYTHONPATH")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = src if not existing else f"{src}{os.pathsep}{existing}"
+    # keep the checkout free of __pycache__ debris regardless of how the
+    # suite itself was invoked
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def _run_module(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run a ``python -m`` entry point exactly as an operator would."""
+
+    return subprocess.run(
+        [sys.executable, "-m", *argv],
+        cwd=_REPO_ROOT,
+        env=_module_env(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+    )
+
+
+class TestModuleRunnable:
+    """U2 rider — ``python -m`` entry points: the trap closed, parity pinned.
+
+    ``python3 -m magic_hermes.provenance`` used to import the module and
+    exit 0 silently on any input — a false-healthy no-op, observed against
+    the drifted canonical checkout on 2026-09-29. The rider routes both
+    ``-m`` forms through the same ``cli.main`` the installed console
+    script dispatches, so exit codes and output are identical by
+    construction; these tests pin that parity where it is observable —
+    exit codes and the load-bearing facets — never the exact output bytes.
+    """
+
+    def test_importing_the_module_stays_inert(self):
+        # the guard must never fire on import: cli imports provenance at
+        # module level, so a module-level back-import would cycle
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import magic_hermes.provenance, magic_hermes.cli"],
+            cwd=_REPO_ROOT,
+            env=_module_env(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+        )
+        assert proc.returncode == 0
+        assert proc.stdout == ""
+        assert proc.stderr == ""
+
+    def test_provenance_module_healthy_repo_exits_zero(self, tmp_path):
+        repo = _make_repo(tmp_path, "healthy", SSH)
+        proc = _run_module(
+            ["magic_hermes.provenance", "--path", str(repo)]
+        )
+        assert proc.returncode == 0
+        assert "provenance verified" in proc.stdout
+        assert proc.stderr == ""
+
+    def test_provenance_module_drift_exits_one_and_names_facets(
+        self, tmp_path
+    ):
+        repo = _make_repo(tmp_path, "drift", HTTPS, mangle_branch=True)
+        proc = _run_module(
+            ["magic_hermes.provenance", "--path", str(repo)]
+        )
+        assert proc.returncode == 1
+        assert "origin_match: DRIFT" in proc.stdout
+        assert "branch_tracking: DRIFT" in proc.stdout
+        assert "provenance --repair" in proc.stdout
+        assert proc.stderr == ""
+
+    def test_provenance_module_refusal_exits_one_zero_writes(self, tmp_path):
+        repo = _make_repo(tmp_path, "foreign", "git@github.com:other/repo.git")
+        config = repo / ".git" / "config"
+        before = config.read_text()
+        proc = _run_module(
+            ["magic_hermes.provenance", "--path", str(repo), "--repair"]
+        )
+        assert proc.returncode == 1
+        assert "repair refused" in proc.stderr
+        assert "different repository" in proc.stderr
+        assert config.read_text() == before
+
+    def test_provenance_module_repair_restores_the_pin(self, tmp_path):
+        repo = _make_repo(tmp_path, "drift", HTTPS, mangle_branch=True)
+        proc = _run_module(
+            ["magic_hermes.provenance", "--path", str(repo), "--repair"]
+        )
+        assert proc.returncode == 0
+        assert "provenance verified after repair" in proc.stdout
+        assert _cfg(repo, "remote.origin.url") == SSH
+        assert _cfg(repo, "remote.origin.pushurl") == HTTPS
+
+    def test_provenance_module_json_shape(self, tmp_path):
+        repo = _make_repo(tmp_path, "drift", HTTPS, mangle_branch=True)
+        proc = _run_module(
+            ["magic_hermes.provenance", "--path", str(repo), "--json"]
+        )
+        payload = json.loads(proc.stdout)
+        assert proc.returncode == 1
+        assert payload["healthy"] is False
+        assert payload["facets"]["origin_match"] is False
+        assert payload["facets"]["branch_tracking"] is False
+        assert payload["repair"] == []
+
+    def test_cli_module_provenance_parity_with_console_script(self, tmp_path):
+        repo = _make_repo(tmp_path, "drift", HTTPS, mangle_branch=True)
+        proc = _run_module(
+            ["magic_hermes.cli", "provenance", "--path", str(repo)]
+        )
+        assert "branch_tracking: DRIFT" in proc.stdout
+        # parity by construction: the -m form and cli.main are the same
+        # program — same rc, same bytes on both streams. Both sides move
+        # together as the output format evolves, so this pins parity,
+        # not the format itself.
+        rc, out, err = _run_cli(["provenance", "--path", str(repo)])
+        assert proc.returncode == rc == 1
+        assert proc.stdout == out
+        assert proc.stderr == err
 
 
 # --- doctor surface (D6: env-gated, WARN-only, never a write) ---------------
