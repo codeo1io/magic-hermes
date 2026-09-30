@@ -487,4 +487,4 @@ if __name__ == "__main__":  # ``python -m magic_hermes.provenance`` (U2 rider)
 
     from .cli import main as _main
 
-    raise SystemExit(_main(["provenance"] + sys.argv[1:]))
+    raise SystemExit(_main(["provenance", *sys.argv[1:]]))
