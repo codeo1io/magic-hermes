@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from . import _host_budget
 from .runtime import RuntimeClient, RuntimeErrorBase
 
 log = logging.getLogger(__name__)
@@ -331,6 +332,10 @@ class MagicContextEngine(_ContextEngineBase):
             return None
         prepared_started = False
         published_ok = False
+        # True when the pass unwound because the waiting Hermes host stopped
+        # waiting (cancelled or host budget spent). The abort outcome stays
+        # None so the bridge records a benign "aborted" row, not a failure.
+        host_stopped_waiting = False
         # Terminal classification handed to the bridge on abort so the shared
         # historian_runs table records why the pass ended. None (plain cancel)
         # lets the bridge default to a benign "aborted" outcome.
@@ -338,11 +343,13 @@ class MagicContextEngine(_ContextEngineBase):
         lease_stop = threading.Event()
         lease_thread: threading.Thread | None = None
         try:
+            _host_budget.checkpoint()
             client.call(
                 "bind",
                 {"session_id": session_id, "project_root": project_root},
                 timeout=60,
             )
+            _host_budget.tick()
             if self._model or self.context_length:
                 client.call(
                     "model_update",
@@ -354,6 +361,7 @@ class MagicContextEngine(_ContextEngineBase):
                     },
                     timeout=30,
                 )
+                _host_budget.tick()
             payload: dict[str, Any] = {
                 "session_id": session_id,
                 "messages": messages,
@@ -363,7 +371,9 @@ class MagicContextEngine(_ContextEngineBase):
             }
             if boundary_snapshot:
                 payload["boundary_snapshot"] = boundary_snapshot
+            _host_budget.checkpoint()
             prepared = client.call("historian_prepare", payload, timeout=60)
+            _host_budget.tick()
             if not prepared.get("ready"):
                 return None
             prepared_started = True
@@ -403,44 +413,55 @@ class MagicContextEngine(_ContextEngineBase):
             historian_timeout = max(
                 1.0, float(prepared.get("timeout_ms", 120_000)) / 1000
             )
+            _host_budget.checkpoint()
             output = self._complete(
                 system_prompt=prepared["system_prompt"],
                 prompt=prepared["prompt"],
                 task="mc_historian",
                 model=prepared.get("model", ""),
                 max_tokens=8192,
-                timeout=historian_timeout,
+                timeout=_host_budget.clamp_call_timeout(historian_timeout),
             )
+            _host_budget.tick()
+            _host_budget.checkpoint()
             published = client.call(
                 "historian_publish",
                 {"session_id": session_id, "output": output},
                 timeout=60,
             )
+            _host_budget.tick()
 
             if not published.get("ok") and published.get("repair_prompt"):
+                _host_budget.checkpoint()
                 repaired = self._complete(
                     system_prompt=published["system_prompt"],
                     prompt=published["repair_prompt"],
                     task="mc_historian",
                     model=prepared.get("model", ""),
                     max_tokens=8192,
-                    timeout=historian_timeout,
+                    timeout=_host_budget.clamp_call_timeout(historian_timeout),
                 )
+                _host_budget.tick()
+                _host_budget.checkpoint()
                 published = client.call(
                     "historian_publish",
                     {"session_id": session_id, "output": repaired},
                     timeout=60,
                 )
+                _host_budget.tick()
 
             if published.get("needs_editor"):
+                _host_budget.checkpoint()
                 edited = self._complete(
                     system_prompt=published["editor_system_prompt"],
                     prompt=published["editor_prompt"],
                     task="mc_historian",
                     model=prepared.get("model", ""),
                     max_tokens=8192,
-                    timeout=historian_timeout,
+                    timeout=_host_budget.clamp_call_timeout(historian_timeout),
                 )
+                _host_budget.tick()
+                _host_budget.checkpoint()
                 published = client.call(
                     "historian_publish",
                     {
@@ -450,6 +471,7 @@ class MagicContextEngine(_ContextEngineBase):
                     },
                     timeout=60,
                 )
+                _host_budget.tick()
 
             compacted = published.get("messages")
             if published.get("ok"):
@@ -468,6 +490,15 @@ class MagicContextEngine(_ContextEngineBase):
             log.warning(
                 "Magic Context historian output was rejected: %s",
                 rejection,
+            )
+        except _host_budget.HostBudgetExceeded:
+            # The waiting Hermes host stopped waiting (cancelled or budget
+            # spent). This is not a connector failure: leave the abort outcome
+            # unset so the bridge records a benign "aborted" row.
+            host_stopped_waiting = True
+            log.warning(
+                "Magic Context historian pass stopped within the host "
+                "compression budget; transcript is unchanged"
             )
         except Exception as error:
             terminal_outcome = {
@@ -494,6 +525,8 @@ class MagicContextEngine(_ContextEngineBase):
                 abort: dict[str, Any] = {"session_id": session_id}
                 if terminal_outcome is not None:
                     abort["outcome"] = terminal_outcome
+                if host_stopped_waiting:
+                    abort["reason"] = "host budget exceeded"
                 try:
                     client.call(
                         "historian_abort",
@@ -705,7 +738,18 @@ class MagicContextEngine(_ContextEngineBase):
         with self._historian_lock:
             running = self._historian_thread
         if running is not None and running.is_alive():
-            running.join()
+            # Hermes owns this synchronous attempt under a hard deadline; keep
+            # the wait bounded and abortable there. Outside Hermes the wait
+            # stays unbounded (historical behavior).
+            if not _host_budget.wait_for_worker(running):
+                log.warning(
+                    "Magic Context background historian still running; "
+                    "proceeding with the current view within the host budget"
+                )
+                rendered = self._render_current_context(messages)
+                if rendered != messages:
+                    return rendered
+                return messages
             rendered = self._render_current_context(messages)
             if rendered != messages:
                 return rendered
