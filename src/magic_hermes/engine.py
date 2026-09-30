@@ -245,7 +245,16 @@ class MagicContextEngine(_ContextEngineBase):
                 log.debug("Magic Context model-state update failed", exc_info=True)
 
     def update_from_response(self, usage: dict[str, Any]) -> None:
-        prompt = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        # Pressure must count the whole prompt. Hermes normalizes usage so that
+        # ``input_tokens`` is only the UNCACHED slice (Anthropic reports it that way,
+        # and Hermes subtracts cache buckets out of OpenAI-style totals), while
+        # ``prompt_tokens`` = input + cache_read + cache_write. With prompt caching on,
+        # ``input_tokens`` stays near zero however large the session grows.
+        prompt = usage.get("prompt_tokens") or (
+            int(usage.get("input_tokens") or 0)
+            + int(usage.get("cache_read_tokens") or 0)
+            + int(usage.get("cache_write_tokens") or 0)
+        )
         completion = usage.get("output_tokens") or usage.get("completion_tokens") or 0
         self.last_prompt_tokens = int(prompt)
         self.last_completion_tokens = int(completion)
