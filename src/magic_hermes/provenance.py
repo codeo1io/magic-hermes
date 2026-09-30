@@ -471,3 +471,20 @@ def _out(out: str) -> str:
     """Append captured stdout to an error message when git said anything."""
 
     return f": {out}" if out else ""
+
+
+if __name__ == "__main__":  # ``python -m magic_hermes.provenance`` (U2 rider)
+    # Module-runnable vehicle for the provenance command. Before this
+    # guard, ``python3 -m magic_hermes.provenance`` imported the module
+    # and exited 0 silently on any input — a false-healthy no-op observed
+    # against the drifted canonical checkout on 2026-09-29. Everything
+    # stays inside the guard, so the module's import surface is untouched
+    # and import-inert (``cli`` imports this module at module level, and
+    # importing it back here — at ``-m`` run time only — cannot cycle).
+    # Exit parity is by construction: this dispatches the same
+    # ``cli.main`` the installed console script uses.
+    import sys
+
+    from .cli import main as _main
+
+    raise SystemExit(_main(["provenance"] + sys.argv[1:]))
