@@ -106,6 +106,30 @@ lane, live sidecar handshake + DB quick_check + core-symbol check) with a
 summary line and non-zero exit on FAIL. `--json` emits machine-readable
 output.
 
+### 1b-2. Shared store migration toolkit (`magic-hermes db`)
+
+Upstream bumps the schema fence on series releases, and the shared store
+migrates lazily on the next harness boot — which upstream's
+migration-on-open guard refuses while any live Pi/OMP/OpenCode harness
+still runs the old plugin build. `magic-hermes db` turns the resulting
+recovery (lsof archaeology, holder/build attribution, drain-and-retry)
+into one command:
+
+```
+/path/to/hermes/venv/bin/magic-hermes db status     # fence gap + live holders
+/path/to/hermes/venv/bin/magic-hermes db blockers   # holders with builds (--json)
+/path/to/hermes/venv/bin/magic-hermes db migrate    # sanctioned openDatabase path
+```
+
+`db migrate` drives the same fence + holder-guard + `runMigrations()`
+path a real harness boot runs, via a one-shot Node driver. On refusal it
+names the blocking PIDs and exits 2; `--kill-blockers` drains them
+(SIGTERM, then SIGKILL; never unclassifiable PIDs — hermes bridges
+respawn lazily) and retries; `--wait SECONDS` bounds the retry loop.
+`db status`/`db blockers` are read-only. Holder classification mirrors
+upstream's arc-marker semantics so the utility names the same blockers
+upstream's guard would.
+
 ### 1c. Shared store classification guard
 
 Upstream `@cortexkit/pi-magic-context` (through 0.44.4) seeds historian run
