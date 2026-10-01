@@ -49,6 +49,37 @@ def test_sync_updates_exact_pin_and_supported_series(tmp_path):
     assert package["dependencies"][PACKAGE] == "0.39.2"
 
 
+def test_sync_moves_readme_pin_claims_forward(tmp_path):
+    """A pin bump must carry README 'through X.Y.Z' claims with it.
+
+    The docs-consistency battery runs before every auto-release and rejects
+    a README claim that lags the manifest — the 2026-09-30 nightly died
+    exactly there ("README claims upstream 0.43.2 but the manifest pins
+    0.44.0"), leaving the release stuck on the old core.
+    """
+    _seed(tmp_path)
+    (tmp_path / "README.md").write_text(
+        "Upstream `@cortexkit/pi-magic-context` (through 0.38.0) seeds historian\n"
+        "run telemetry. An unrelated mention of through 0.30.1 stays put.\n",
+        encoding="utf-8",
+    )
+
+    assert sync(tmp_path, "0.39.2", "v0.39.2") is True
+
+    readme = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "through 0.39.2" in readme
+    assert "through 0.38.0" not in readme
+    assert "through 0.30.1" in readme
+
+
+def test_sync_without_readme_leaves_release_metadata_consistent(tmp_path):
+    """No README in the tree (or no matching claim) must not break the sync."""
+    _seed(tmp_path)
+
+    assert sync(tmp_path, "0.39.0", "v0.39.0") is True
+    check(tmp_path)
+
+
 def test_sync_is_idempotent(tmp_path):
     _seed(tmp_path)
 

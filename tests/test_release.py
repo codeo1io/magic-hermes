@@ -66,7 +66,7 @@ def test_release_allows_magic_context_sync_changes_before_patch_bump(monkeypatch
 
 
 def test_release_rejects_unrelated_dirty_paths(monkeypatch):
-    monkeypatch.setattr(release, "git_output", lambda *args: " M README.md")
+    monkeypatch.setattr(release, "git_output", lambda *args: " M docs/unrelated.md")
 
     with pytest.raises(release.ReleaseError, match="outside the release transaction"):
         release.ensure_clean_or_release_version("0.2.1")
@@ -193,6 +193,9 @@ def _pending_release_repo(tmp_path, bump_subject):
     )
     (work / "src" / "magic_hermes" / "magic_context_compat.json").write_text(
         '{"tested_version": "0.43.2"}\n', encoding="utf-8"
+    )
+    (work / "README.md").write_text(
+        "# magic-hermes\n", encoding="utf-8"
     )
 
     def git(*args):

@@ -99,11 +99,7 @@ jobs:
           # adoption PR instead of the direct auto-release path — including
           # explicitly requested versions, which must be confirmed with the
           # allow_series_jump dispatch input before they resolve at all.
-          if python -c '
-            import sys
-            from scripts.next_magic_context_release import is_series_jump
-            sys.exit(0 if is_series_jump(sys.argv[1], sys.argv[2]) else 1)
-          ' "$current" "$version"; then
+          if python -c "import sys; from scripts.next_magic_context_release import is_series_jump; sys.exit(0 if is_series_jump(sys.argv[1], sys.argv[2]) else 1)" "$current" "$version"; then
             if [[ -n "$REQUESTED_VERSION" && "$ALLOW_SERIES_JUMP" != "true" ]]; then
               echo "::error::Refusing ${tag}: it is a series jump over v${current} and can move the compatibility fence / migrate the shared store. Re-dispatch with allow_series_jump=true to open the adoption PR (a series jump never direct-releases)."
               exit 1
@@ -138,7 +134,7 @@ jobs:
             exit 0
           fi
           git checkout -b "$branch"
-          git add package.json package-lock.json src/magic_hermes/magic_context_compat.json
+          git add package.json package-lock.json src/magic_hermes/magic_context_compat.json README.md
           git commit -m "sync: adopt Magic Context ${tag} (series bump, PR-gated)"
           # The branch is disposable tooling output; a stale remote copy left
           # behind by a closed PR would otherwise reject a non-fast-forward push.
