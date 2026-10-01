@@ -97,3 +97,18 @@ class TestSyncWorkflowGuardrails:
             "sync workflow must open an adoption PR instead of direct-releasing "
             "series jumps"
         )
+
+    def test_series_jump_gate_payload_compiles(self):
+        """The gate's ``python -c`` payload must be valid Python.
+
+        Regression for the 2026-09-30 nightly: the payload was a multi-line
+        string whose first code line was indented, so Python raised
+        IndentationError, the ``if`` took that as "not a series jump", and a
+        minor bump (0.43.2 -> 0.44.0) silently took the direct-release path
+        instead of the PR-gated adoption path.
+        """
+        text = SYNC_WORKFLOW.read_text(encoding="utf-8")
+        payloads = re.findall(r'python -c "([^"]+)"', text)
+        assert payloads, "sync workflow lost its inline series-jump gate command"
+        for payload in payloads:
+            compile(payload, "<series-jump-gate>", "exec")

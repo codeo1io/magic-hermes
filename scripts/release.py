@@ -23,6 +23,7 @@ MAGIC_CONTEXT_SYNC_FILES = {
     "package.json",
     "package-lock.json",
     "src/magic_hermes/magic_context_compat.json",
+    "README.md",
 }
 
 #: The interpreter operational probes resolve through PATH — the maestro

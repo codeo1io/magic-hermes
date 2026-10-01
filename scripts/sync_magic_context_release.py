@@ -37,6 +37,31 @@ def _series(version: str) -> list[int]:
     return [int(match.group(1)), int(match.group(2))]
 
 
+def _update_readme_claims(root: Path, previous_version: str, version: str) -> bool:
+    """Move README 'through X.Y.Z' pin claims from the old pin to the new one.
+
+    The docs-consistency battery rejects any README claim that disagrees with
+    the manifest, and the sync workflow runs that battery before releasing —
+    so a pin bump that leaves the README behind aborts the release. Claims
+    that do not name the previous pin are left untouched.
+    """
+    readme = root / "README.md"
+    if not readme.is_file():
+        return False
+    text = readme.read_text(encoding="utf-8")
+
+    def _bump(match: re.Match[str]) -> str:
+        if match.group(1) != previous_version:
+            return match.group(0)
+        return f"through {version}"
+
+    updated = re.sub(r"through (\d+\.\d+\.\d+)", _bump, text)
+    if updated == text:
+        return False
+    readme.write_text(updated, encoding="utf-8")
+    return True
+
+
 def sync(root: Path, version: str, release_tag: str | None = None) -> bool:
     series = _series(version)
     tag = release_tag or f"v{version}"
@@ -63,7 +88,9 @@ def sync(root: Path, version: str, release_tag: str | None = None) -> bool:
         "supported_series": series,
     }
     if compat != desired_compat:
+        previous_version = compat.get("tested_version")
         _write_json(compat_path, desired_compat)
+        _update_readme_claims(root, str(previous_version), version)
         changed = True
 
     if dependencies.get(PACKAGE) != version:
