@@ -55,6 +55,7 @@ const EXPOSED = [
   "getOrCreateSessionMeta",
   "updateSessionMeta",
   "resolveCacheTtl",
+  "resolveModelCacheTtl",
   "escalationBands",
   "createTagger",
   "createPiTranscript",
@@ -105,6 +106,38 @@ const FALLBACK_EXPORTS = [
 // working. Chunk file names are content-hashed and drift per release, so
 // match by stable prefix rather than exact name.
 const SPLIT_MODULE_PREFIXES = ["read-session-chunk-"];
+
+// Names a missing required export can be synthesized from when upstream
+// refactors instead of removing it. Upstream 0.44.x split the pure resolver
+// resolveCacheTtl(config, modelKey) -> string into resolveModelCacheTtl(
+// config, modelKey) -> { value, source, modelKey } plus session-frozen
+// persistence the bridge does not use. The bridge only needs the pure
+// string contract, so derive it from the replacement binding at load time
+// instead of failing the whole adapter. `requires` names module-scope
+// bindings that must have been exported for the synthesis to apply.
+const SYNTHESIZED_EXPORTS = {
+  // 0.44.x: resolveCacheTtl(config, modelKey) -> string was refactored into
+  // resolveModelCacheTtl(config, modelKey) -> { value, source, modelKey }.
+  // Derive the legacy string contract from the replacement binding.
+  resolveCacheTtl: {
+    requires: ["resolveModelCacheTtl"],
+    source:
+      "(resolveModelCacheTtl) => (cacheTtl, modelKey) => {" +
+      " const resolved = resolveModelCacheTtl(cacheTtl, modelKey);" +
+      " return resolved && typeof resolved === 'object'" +
+      " ? resolved.value : resolved; }",
+  },
+  // 0.43.x: only the legacy string resolver exists. The 0.44 bridge shim
+  // consumes the object primitive; wrap the legacy resolver so both series
+  // satisfy the same core-symbol contract.
+  resolveModelCacheTtl: {
+    requires: ["resolveCacheTtl"],
+    source:
+      "(resolveCacheTtl) => (cacheTtl, modelKey) => {" +
+      " const value = resolveCacheTtl(cacheTtl, modelKey);" +
+      " return { value: String(value), source: 'config', modelKey }; }",
+  },
+};
 
 // Stable specifiers for the split modules. The adapter URL is set by the
 // runtime before this loader loads, so the directory is derivable; chunk
@@ -204,6 +237,28 @@ export async function load(url, context, nextLoad) {
       const specifier = new URL(chunkUrl).pathname;
       suffix += "\nexport { " + fromChunk.map((name) => name + " as __mh_" + name).join(", ") + ' } from "' + specifier + '";\n';
       for (const name of fromChunk) remaining.delete(name);
+    }
+    if (remaining.size > 0) {
+      // Try to synthesize missing names whose upstream replacements are
+      // available (see SYNTHESIZED_EXPORTS). Each emitted binding closes
+      // over its `requires`-gate dependencies, so every dependency must
+      // itself be exported by the appended suffix — otherwise the
+      // synthesized module would reference an undeclared identifier at
+      // evaluation time.
+      const synthesized = [];
+      for (const name of [...remaining].sort()) {
+        const recipe = SYNTHESIZED_EXPORTS[name];
+        if (recipe === undefined) continue;
+        if (!recipe.requires.every((dep) => direct.includes(dep))) continue;
+        const binding = "__mh_" + name;
+        const deps = recipe.requires.join(", ");
+        suffix +=
+          "\nconst " + binding + " = (" +
+          recipe.source + ")(" + deps + ");\n";
+        suffix += "export { " + binding + " };\n";
+        synthesized.push(name);
+      }
+      for (const name of synthesized) remaining.delete(name);
     }
     if (remaining.size > 0) {
       throw new Error(
