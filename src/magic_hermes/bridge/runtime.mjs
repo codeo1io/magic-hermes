@@ -160,7 +160,8 @@ const CORE_REQUIRED_SYMBOLS = [
   "resolveHistorianFromConfig",
   "checkCompartmentTrigger",
   "acquireCompartmentLease",
-  "releaseCompartmentLease"
+  "releaseCompartmentLease",
+  "resolveModelCacheTtl"
 ];
 
 function missingSymbols(names) {
@@ -174,6 +175,20 @@ if (missingCoreSymbols.length > 0) {
     " is missing required magic-hermes runtime symbols: " +
     missingCoreSymbols.join(", ")
   );
+}
+
+// Adapter shim: Magic Context 0.44.x removed resolveCacheTtl in favor of
+// resolveModelCacheTtl(config, modelKey) -> {value, source, modelKey} and
+// made unset-config resolution model-aware (its own session resolution no
+// longer falls back to a flat "5m"). magic-hermes session policy needs the
+// 0.43 string contract, so restore it here on top of the 0.44 primitive.
+// resolveModelCacheTtl is in CORE_REQUIRED_SYMBOLS: if upstream removes the
+// primitive, startup fails loud at the check above instead of mid-session.
+function resolveCacheTtl(cacheTtl, modelKey) {
+  if (typeof cacheTtl === "string") {
+    return cacheTtl;
+  }
+  return adapter.__mh_resolveModelCacheTtl(cacheTtl, modelKey).value;
 }
 
 function textContent(value) {
@@ -741,7 +756,7 @@ function schedulerForSession(session) {
 function syncSessionPolicy(session) {
   const meta = mc("getOrCreateSessionMeta")(db, session.id);
   const modelKey = session.modelKey || meta.lastObservedModelKey || "";
-  const cacheTtl = mc("resolveCacheTtl")(session.config.cache_ttl, modelKey);
+  const cacheTtl = resolveCacheTtl(session.config.cache_ttl, modelKey);
   const updates = { cacheTtl };
   if (modelKey) {
     updates.lastObservedModelKey = modelKey;
@@ -766,7 +781,7 @@ function updateModel(args) {
   session.contextLimit = Math.max(0, Number(args.context_length || 0));
   session.provider = String(args.provider || "");
   session.modelKey = canonicalModelKey(args.provider, args.model);
-  const cacheTtl = mc("resolveCacheTtl")(
+  const cacheTtl = resolveCacheTtl(
     session.config.cache_ttl,
     session.modelKey
   );
