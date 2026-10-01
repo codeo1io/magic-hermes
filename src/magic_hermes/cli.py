@@ -1259,6 +1259,33 @@ def build_parser() -> argparse.ArgumentParser:
         "status: read-only state",
     )
 
+    db = sub.add_parser(
+        "db",
+        help="shared-store migration toolkit (status / blockers / migrate)",
+    )
+    db.add_argument(
+        "db_action",
+        choices=("status", "blockers", "migrate"),
+        help="status: read-only fence + holder report; blockers: live "
+        "holders with build attribution; migrate: drive the sanctioned "
+        "upstream migration (openDatabase) with drain support",
+    )
+    db.add_argument("--json", action="store_true", help="machine-readable output")
+    db.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="migrate: keep retrying until the fence is satisfied or the "
+        "budget expires (default: single attempt)",
+    )
+    db.add_argument(
+        "--kill-blockers",
+        action="store_true",
+        help="migrate: SIGTERM/SIGKILL blocking old-build holders between "
+        "attempts (never unclassifiable PIDs; bridges respawn lazily)",
+    )
+
     provenance = sub.add_parser(
         "provenance",
         help="check/repair the canonical git origin (provenance guard)",
@@ -1303,6 +1330,17 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "guard":
         return run_guard(action=args.action)
+    if args.command == "db":
+        from .db_toolkit import main_db
+
+        return main_db(
+            [
+                args.db_action,
+                *(["--json"] if args.json else []),
+                *(["--wait", str(args.wait)] if args.wait is not None else []),
+                *(["--kill-blockers"] if args.kill_blockers else []),
+            ]
+        )
     if args.command == "provenance":
         return run_provenance(
             path=args.path,
