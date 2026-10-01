@@ -14,15 +14,30 @@ def _release(tag: str, published_at: str, *, draft: bool = False) -> dict:
     }
 
 
-def test_next_release_tag_returns_oldest_unseen_core_release():
+def test_next_release_tag_returns_newest_stable_release_above_pin():
+    # Upstream published a whole series between nightly syncs; the sync
+    # must catch up to the newest stable release in one step, not adopt
+    # an already-superseded intermediate (observed 0.43.2 -> 0.44.0).
     releases = [
-        _release("v0.40.0", "2026-08-22T00:00:00Z"),
-        _release("dashboard-v0.14.0", "2026-08-21T12:00:00Z"),
-        _release("v0.39.0", "2026-08-21T00:00:00Z"),
-        _release("v0.38.0", "2026-08-20T00:00:00Z"),
+        _release("v0.43.2", "2026-09-20T00:00:00Z"),
+        _release("v0.44.0", "2026-09-28T11:46:59Z"),
+        _release("v0.44.1", "2026-09-28T19:25:03Z"),
+        _release("v0.44.2", "2026-09-29T18:28:04Z"),
+        _release("v0.44.3", "2026-09-29T23:28:57Z"),
+        _release("v0.44.4", "2026-09-30T09:18:25Z"),
     ]
 
-    assert next_release_tag(releases, "0.38.0") == "v0.39.0"
+    assert next_release_tag(releases, "0.43.2") == "v0.44.4"
+
+
+def test_next_release_tag_skips_series_ahead_of_newer_series():
+    releases = [
+        _release("v0.38.0", "2026-08-20T00:00:00Z"),
+        _release("v0.39.0", "2026-08-21T00:00:00Z"),
+        _release("v0.40.0", "2026-08-22T00:00:00Z"),
+    ]
+
+    assert next_release_tag(releases, "0.38.0") == "v0.40.0"
 
 
 def test_next_release_tag_returns_none_when_current_is_latest():
@@ -42,6 +57,21 @@ def test_next_release_tag_ignores_drafts_and_non_core_tags():
     ]
 
     assert next_release_tag(releases, "0.38.0") is None
+
+
+def test_next_release_tag_ignores_prerelease_flagged_releases():
+    def flagged(tag: str, published_at: str) -> dict:
+        item = _release(tag, published_at)
+        item["prerelease"] = True
+        return item
+
+    releases = [
+        _release("v0.38.0", "2026-08-20T00:00:00Z"),
+        _release("v0.39.0", "2026-08-21T00:00:00Z"),
+        flagged("v0.39.1", "2026-08-21T12:00:00Z"),
+    ]
+
+    assert next_release_tag(releases, "0.38.0") == "v0.39.0"
 
 
 def test_next_release_tag_fails_closed_when_current_release_is_missing():
