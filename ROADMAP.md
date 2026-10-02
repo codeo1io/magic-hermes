@@ -14,10 +14,10 @@
 
 ## Open items
 
-### Add test coverage for 9 untested module(s)
+### Add test coverage for 11 untested module(s)
 - id: `rm-003` | track: reliability | priority: 100.0 | status: candidate
-- signals: reliability.no_tests:src/magic_hermes/_host_budget.py, reliability.no_tests:src/magic_hermes/bridge/loader.mjs, reliability.no_tests:src/magic_hermes/cli.py, reliability.no_tests:src/magic_hermes/engine.py, reliability.no_tests:src/magic_hermes/historian_guard.py (+4 more)
-- acceptance: Every module in ['src/magic_hermes/_host_budget.py', 'src/magic_hermes/bridge/loader.mjs', 'src/magic_hermes/cli.py', 'src/magic_hermes/engine.py', 'src/magic_hermes/historian_guard.py', 'src/magic_hermes/memory_provider.py', 'src/magic_hermes/plugin.py', 'src/magic_hermes/provenance.py', 'src/magic_hermes/runtime.py'] has a corresponding test file with at least one passing test
+- signals: reliability.no_tests:src/magic_hermes/_host_budget.py, reliability.no_tests:src/magic_hermes/bridge/loader.mjs, reliability.no_tests:src/magic_hermes/bridge/migrate-hooks.mjs, reliability.no_tests:src/magic_hermes/cli.py, reliability.no_tests:src/magic_hermes/db_toolkit.py (+6 more)
+- acceptance: Every module in ['src/magic_hermes/_host_budget.py', 'src/magic_hermes/bridge/loader.mjs', 'src/magic_hermes/bridge/migrate-hooks.mjs', 'src/magic_hermes/cli.py', 'src/magic_hermes/db_toolkit.py', 'src/magic_hermes/engine.py', 'src/magic_hermes/historian_guard.py', 'src/magic_hermes/memory_provider.py', 'src/magic_hermes/plugin.py', 'src/magic_hermes/provenance.py', 'src/magic_hermes/runtime.py'] has a corresponding test file with at least one passing test
 - evidence: full suite green (python -m pytest -q) at HEAD; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 
 ### Complete the v0.3.4 release/deploy chain and fix the pending-version skip
@@ -32,7 +32,7 @@
 
 ### Refactor 20 high-complexity function(s)
 - id: `rm-001` | track: reliability | priority: 90.0 | status: candidate
-- signals: reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L117, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L166, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L179, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L199, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L217 (+15 more)
+- signals: reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L117, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L167, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L187, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L194, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L214 (+15 more)
 - acceptance: Each flagged function is decomposed below the branch threshold with behavior locked by characterization tests
 - evidence: ast-based branch-count check passes at HEAD (full suite green; conductor validation digest validation:v1:<sha> recorded in the shipping PR)
 
