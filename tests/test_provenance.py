@@ -20,8 +20,12 @@ in this repository owned, pinned, or checked. These tests pin forever:
 - normalization stays byte-parity with the probe, so this guard and the
   probe can never disagree on any input;
 - the ``provenance`` CLI is fail-loud (exit 1 on drift/refusal) and the
-  ``doctor`` surface is env-gated WARN-only — never FAIL, never a write,
-  and omitted entirely when the variable is unset.
+  ``doctor`` surface is default-on and context-scoped (the KTD1 policy
+  matrix: an env pin and the estate-canonical row FAIL on drift — the
+  escalation lane the estate's continuous verifier exercises — while a
+  same-repo non-canonical checkout merely WARNs advisingly, a CI run
+  states an INFO skip, and a foreign checkout stays byte-silent); every
+  row is read-only — the doctor never writes, repair is always explicit.
 
 Every fixture is a real throwaway git repository under ``tmp_path`` —
 the git state layer is never mocked, and no test touches the network or
@@ -30,6 +34,7 @@ the real estate config.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import subprocess
@@ -582,7 +587,7 @@ class TestModuleRunnable:
         assert proc.stderr == err
 
 
-# --- doctor surface (D6: env-gated, WARN-only, never a write) ---------------
+# --- doctor surface (D6/KTD1: default-on matrix, strict rows, no writes) ---
 
 
 @pytest.fixture
@@ -593,7 +598,13 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
     # a leaked opt-in must never turn the unset-contract test flaky
     monkeypatch.delenv(provenance.PROVENANCE_ENV, raising=False)
+    # ... and neither may a leaked CI marker: the matrix keys off it
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     return home
+
+
+_DOCTOR_RUN_SEQ = itertools.count()
 
 
 def _wire_hermes_config():
@@ -611,18 +622,24 @@ def _wire_hermes_config():
     )
 
 
-def _run_doctor_json(tmp_path, monkeypatch, capsys):
-    """run_doctor --json against a faked sidecar; returns (rc, payload)."""
+def _run_doctor(tmp_path, monkeypatch, capsys, json_output=True):
+    """run_doctor against a faked sidecar; returns (rc, payload|text).
+
+    Safe to call repeatedly within one test: every invocation builds a
+    fresh fixture DB (the historian fixture DDL does not tolerate
+    re-creation over an existing file).
+    """
 
     from magic_hermes import historian_guard as hg
 
-    db = tmp_path / "context.db"
+    run = next(_DOCTOR_RUN_SEQ)
+    db = tmp_path / f"context-{run}.db"
     hg.make_fixture_db(db)
     monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
     _wire_hermes_config()
 
     tested = cli.tested_magic_context_version()
-    package = tmp_path / "pkg"
+    package = tmp_path / f"pkg-{run}"
     package.mkdir()
     (package / "package.json").write_text(
         json.dumps({"name": "@cortexkit/pi-magic-context", "version": tested}),
@@ -655,9 +672,15 @@ def _run_doctor_json(tmp_path, monkeypatch, capsys):
         mock.patch.object(cli, "RuntimeClient", return_value=client),
         mock.patch.object(cli, "_SIDECAR_RETRY_BACKOFF_S", 0.0),
     ):
-        rc = cli.run_doctor(json_output=True)
-    payload = json.loads(capsys.readouterr().out)
-    return rc, payload
+        rc = cli.run_doctor(json_output=json_output)
+    out = capsys.readouterr().out
+    return (rc, out) if not json_output else (rc, json.loads(out))
+
+
+def _run_doctor_json(tmp_path, monkeypatch, capsys):
+    """run_doctor --json against a faked sidecar; returns (rc, payload)."""
+
+    return _run_doctor(tmp_path, monkeypatch, capsys, json_output=True)
 
 
 def _provenance_rows(payload):
@@ -668,12 +691,38 @@ def _provenance_rows(payload):
     ]
 
 
-class TestDoctorProvenanceSurface:
-    """The opt-in check: PASS/WARN only, rc 0, no writes, unset → absent."""
+def _nonrepo_dir(tmp_path) -> Path:
+    plain = tmp_path / "plain"
+    plain.mkdir(exist_ok=True)  # idempotent: called per-run within a test
+    return plain
 
-    def test_unset_env_omits_the_check_entirely(
+
+def _pin_canonical(monkeypatch, repo: Path) -> Path:
+    """Point the seam's canonical-path constant (KTD3) at ``repo``.
+
+    Both import sites are pinned — the module constant and the name the
+    CLI binds — so the rows below hold whichever one the facet reads,
+    and no test ever reads the live estate path (KTD2).
+    """
+
+    monkeypatch.setattr(provenance, "EXPECTED_REPO_PATH", repo)
+    monkeypatch.setattr(cli, "EXPECTED_REPO_PATH", repo)
+    return repo
+
+
+class TestDoctorProvenanceSurface:
+    """The env-pinned row and the always-true invariants.
+
+    An explicit ``MAGIC_HERMES_PROVENANCE_REPO`` pin is the strictest
+    row of the KTD1 matrix: drift FAILs and flips the exit code, an
+    unreadable pin degrades to a WARN skip, and no row ever writes. The
+    default-on bare rows are pinned in TestDoctorProvenanceEscalation.
+    """
+
+    def test_unset_env_in_nonrepo_cwd_emits_nothing(
         self, tmp_path, monkeypatch, isolated_home, capsys
     ):
+        monkeypatch.chdir(_nonrepo_dir(tmp_path))
         rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
         assert rc == 0
         assert _provenance_rows(payload) == []
@@ -691,7 +740,7 @@ class TestDoctorProvenanceSurface:
         assert rc == 0
         assert payload["summary"]["fail"] == 0
 
-    def test_drifted_repo_warns_never_fails(
+    def test_drifted_env_pinned_repo_fails_loud(
         self, tmp_path, monkeypatch, isolated_home, capsys
     ):
         repo = _make_repo(tmp_path, "drift", HTTPS, mangle_branch=True)
@@ -701,12 +750,12 @@ class TestDoctorProvenanceSurface:
         rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
         rows = _provenance_rows(payload)
         assert len(rows) == 1
-        assert rows[0]["status"] == "WARN"
+        assert rows[0]["status"] == "FAIL"
         assert "origin_match" in rows[0]["message"]
         assert "provenance --repair" in rows[0]["message"]
-        # WARN-only: the health contract keeps rc 0 and FAIL 0
-        assert rc == 0
-        assert payload["summary"]["fail"] == 0
+        # strict row: drift flips the exit code — the escalation contract
+        assert rc == 1
+        assert payload["summary"]["fail"] >= 1
         # and the doctor never mutates git config (repair is explicit)
         assert config.read_text() == before
 
@@ -734,3 +783,260 @@ class TestDoctorProvenanceSurface:
         assert all(
             "FAIL 0" not in check["message"] for check in payload["checks"]
         )
+
+
+class TestDoctorProvenanceEscalation:
+    """KTD1's default-on rows — the blind-verifier class, closed.
+
+    The 2026-10-02 escalation finding: the daemon-facing ``doctor`` ran
+    the provenance facet env-gated OFF while the estate's actual
+    verifier (maestro phase-1, ``root_cause_repo='magic-hermes'``)
+    FAILed continuously — the estate's own health surface was
+    structurally blind to the drift class it was suffering. These rows
+    pin the standing enforcement matrix:
+
+    - the estate-canonical row is strict: drift FAILs and flips the
+      exit code (the escalation lane maestro exercises), health PASSes
+      with a ``FAIL 0`` summary;
+    - a same-repo non-canonical checkout (every conductor worktree and
+      any https dev clone) WARNs advisingly — never FAIL — so the
+      standing battery stays green inside worktrees pre-repair;
+    - a CI run states an INFO skip (https clones are legitimate there);
+    - a foreign repository or plain directory stays byte-silent.
+
+    Every row resolves through the real seam: cwd and the canonical
+    constant are pinned to throwaway fixtures, never the live estate
+    (KTD2), and no row ever writes (repair is always explicit).
+    """
+
+    def test_canonical_drift_fails_and_names_the_repair(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # the blind-verifier class, reproduced exactly: a drifted
+        # canonical-shaped checkout surfaced through the default-on row
+        repo = _make_repo(tmp_path, "canon", HTTPS, mangle_branch=True)
+        _pin_canonical(monkeypatch, repo)
+        monkeypatch.chdir(repo)
+        rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        rows = _provenance_rows(payload)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "FAIL"
+        assert "origin_match" in rows[0]["message"]
+        assert "branch_tracking" in rows[0]["message"]
+        assert "provenance --repair" in rows[0]["message"]
+        assert rc == 1
+        assert payload["summary"]["fail"] >= 1
+
+    def test_canonical_drift_flips_the_gate_grep_shape(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # maestro's phase-2 gate is rc==0 AND 'FAIL 0' in stdout: the
+        # drifted canonical row must break BOTH halves of that conjunct
+        repo = _make_repo(tmp_path, "canon", HTTPS, mangle_branch=True)
+        _pin_canonical(monkeypatch, repo)
+        monkeypatch.chdir(repo)
+        rc, out = _run_doctor(tmp_path, monkeypatch, capsys, json_output=False)
+        assert rc == 1
+        assert "FAIL 1" in out
+        assert "FAIL 0" not in out
+        assert "provenance --repair" in out
+
+    def test_healthy_canonical_passes_with_fail_zero(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        repo = _make_repo(tmp_path, "canon-ok", SSH)
+        _pin_canonical(monkeypatch, repo)
+        monkeypatch.chdir(repo)
+        rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        rows = _provenance_rows(payload)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "PASS"
+        assert SSH in rows[0]["message"]
+        assert rc == 0
+        assert payload["summary"]["fail"] == 0
+        rc, out = _run_doctor(tmp_path, monkeypatch, capsys, json_output=False)
+        assert rc == 0
+        assert "FAIL 0" in out
+
+    @pytest.mark.parametrize(
+        ("ci_var", "ci_val"), [("CI", "1"), ("GITHUB_ACTIONS", "true")]
+    )
+    def test_ci_environment_states_an_info_skip(
+        self, tmp_path, monkeypatch, isolated_home, capsys, ci_var, ci_val
+    ):
+        # even a would-be-strict drifted canonical cwd is skipped in CI
+        repo = _make_repo(tmp_path, "cidev", HTTPS, mangle_branch=True)
+        _pin_canonical(monkeypatch, repo)
+        monkeypatch.chdir(repo)
+        monkeypatch.setenv(ci_var, ci_val)
+        rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        rows = _provenance_rows(payload)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "INFO"
+        assert "skip" in rows[0]["message"].lower()
+        assert rc == 0
+        assert payload["summary"]["fail"] == 0
+
+    def test_foreign_repo_cwd_stays_silent(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # foreign default: byte-stable output, no row at all
+        repo = _make_repo(tmp_path, "foreign", "git@github.com:other/repo.git")
+        _pin_canonical(
+            monkeypatch, _make_repo(tmp_path, "canon", SSH)
+        )
+        monkeypatch.chdir(repo)
+        rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        assert _provenance_rows(payload) == []
+        assert rc == 0
+
+    def test_no_repo_cwd_stays_silent(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        monkeypatch.chdir(_nonrepo_dir(tmp_path))
+        rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        assert _provenance_rows(payload) == []
+        assert rc == 0
+
+    def test_same_repo_non_canonical_drift_is_advisory_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # a drifted same-repo checkout away from the canonical path:
+        # advisory WARN, never a FAIL — this is the row that keeps the
+        # standing battery green inside conductor worktrees pre-repair
+        repo = _make_repo(tmp_path, "devclone", HTTPS, mangle_branch=True)
+        _pin_canonical(
+            monkeypatch, _make_repo(tmp_path, "canon", SSH)
+        )
+        monkeypatch.chdir(repo)
+        rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        rows = _provenance_rows(payload)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "WARN"
+        assert "origin_match" in rows[0]["message"]
+        assert "provenance --repair" in rows[0]["message"]
+        assert rc == 0
+        assert payload["summary"]["fail"] == 0
+
+    def test_same_repo_non_canonical_healthy_passes(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        repo = _make_repo(tmp_path, "wt", SSH)
+        _pin_canonical(
+            monkeypatch, _make_repo(tmp_path, "canon", SSH)
+        )
+        monkeypatch.chdir(repo)
+        rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        rows = _provenance_rows(payload)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "PASS"
+        assert rc == 0
+        assert payload["summary"]["fail"] == 0
+
+    def test_repair_then_redrift_is_detected_again(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # no caching anywhere: the row reads live git state every run
+        repo = _make_repo(tmp_path, "cycle", HTTPS, mangle_branch=True)
+        _pin_canonical(monkeypatch, repo)
+        monkeypatch.chdir(repo)
+
+        rc, p1 = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        assert rc == 1
+        assert _provenance_rows(p1)[0]["status"] == "FAIL"
+
+        provenance.repair(repo)  # heal: SSH fetch, https push carried
+        rc, p2 = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        assert rc == 0
+        assert _provenance_rows(p2)[0]["status"] == "PASS"
+
+        _git(repo, "remote", "set-url", "origin", HTTPS)
+        _git(repo, "config", "branch.master.remote", "branch.master.merge")
+        _git(repo, "config", "--unset", "branch.master.merge")
+        rc, p3 = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        assert rc == 1
+        assert _provenance_rows(p3)[0]["status"] == "FAIL"
+
+    def test_doctor_never_writes_even_while_failing(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        repo = _make_repo(tmp_path, "nowrite", HTTPS, mangle_branch=True)
+        _pin_canonical(monkeypatch, repo)
+        monkeypatch.chdir(repo)
+        before = _git(repo, "config", "--local", "--list")
+        rc, _payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        assert rc == 1
+        assert _git(repo, "config", "--local", "--list") == before
+
+
+class TestProvenanceDoctorTargetSeam:
+    """KTD2 — the resolution matrix itself, as the seam sees it.
+
+    Precedence: env pin → CI skip → estate canonical → same-repo root
+    → silent. Every input is test-controlled (env vars, cwd, and the
+    KTD3 canonical constant are all pinned to fixtures) — the seam is
+    never allowed to read live estate state from the test lane.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _neutral_context(self, tmp_path, monkeypatch):
+        for var in (provenance.PROVENANCE_ENV, "CI", "GITHUB_ACTIONS"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.chdir(_nonrepo_dir(tmp_path))
+
+    def test_env_pin_wins_over_ci_and_canonical_cwd(
+        self, tmp_path, monkeypatch
+    ):
+        canon = _make_repo(tmp_path, "canon", SSH)
+        pinned = tmp_path / "pinned"
+        pinned.mkdir()
+        _pin_canonical(monkeypatch, canon)
+        monkeypatch.chdir(canon)
+        monkeypatch.setenv("CI", "1")
+        monkeypatch.setenv(provenance.PROVENANCE_ENV, str(pinned))
+        target, strict = cli._provenance_doctor_target()
+        assert target == pinned
+        assert strict is True
+
+    def test_ci_skip_beats_canonical_cwd(self, tmp_path, monkeypatch):
+        repo = _make_repo(tmp_path, "canon", SSH)
+        _pin_canonical(monkeypatch, repo)
+        monkeypatch.chdir(repo)
+        monkeypatch.setenv("CI", "1")
+        assert cli._provenance_doctor_target()[0] is None
+
+    def test_canonical_cwd_resolves_strict(self, tmp_path, monkeypatch):
+        repo = _make_repo(tmp_path, "canon", HTTPS, mangle_branch=True)
+        _pin_canonical(monkeypatch, repo)
+        monkeypatch.chdir(repo)
+        target, strict = cli._provenance_doctor_target()
+        assert target == repo
+        assert strict is True
+
+    def test_same_repo_non_canonical_cwd_resolves_advisory(
+        self, tmp_path, monkeypatch
+    ):
+        repo = _make_repo(tmp_path, "devclone", HTTPS)
+        _pin_canonical(
+            monkeypatch, _make_repo(tmp_path, "canon", SSH)
+        )
+        monkeypatch.chdir(repo)
+        target, strict = cli._provenance_doctor_target()
+        assert target == repo
+        assert strict is False
+
+    def test_foreign_repo_cwd_resolves_no_target(
+        self, tmp_path, monkeypatch
+    ):
+        repo = _make_repo(tmp_path, "foreign", "git@github.com:other/repo.git")
+        _pin_canonical(
+            monkeypatch, _make_repo(tmp_path, "canon", SSH)
+        )
+        monkeypatch.chdir(repo)
+        assert cli._provenance_doctor_target()[0] is None
+
+    def test_no_repo_cwd_resolves_no_target(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(_nonrepo_dir(tmp_path))
+        assert cli._provenance_doctor_target()[0] is None
