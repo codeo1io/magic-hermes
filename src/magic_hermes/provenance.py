@@ -24,9 +24,12 @@ expectation, and no check. This module makes the repository its own owner:
   is an explicit operator act, idempotent, and refuses foreign
   repositories.
 
-``doctor`` surfaces the check only when ``MAGIC_HERMES_PROVENANCE_REPO``
-is set (WARN-only, never FAIL, never a write); the CLI subcommand wiring
-lives in ``cli.py``.
+``doctor`` surfaces the check through the context-scoped policy matrix
+resolved by ``cli._provenance_doctor_target`` (an explicit env pin and
+the estate canonical checkout FAIL on drift; a same-repo non-canonical
+checkout WARNs advisingly; CI states a skip; foreign checkouts stay
+silent) and never writes; the CLI subcommand wiring lives in
+``cli.py``.
 
 Ref: maestro finding 4bc6f3a5b0c1.
 """
@@ -43,12 +46,22 @@ from pathlib import Path
 #: the two pins are deliberate cross-checks, not a single point of truth.
 EXPECTED_ORIGIN = "git@github.com:codeo1io/magic-hermes.git"
 
-#: Environment variable opting ``doctor`` into the provenance check.
-#: Unset → the check is omitted entirely, keeping default doctor output
-#: byte-stable: CI clones over HTTPS while this pin is SSH, so a
-#: default-on check would WARN on every healthy CI run (and break the
-#: exact-count doctor contract tests). Single definition — ``cli.py``
-#: imports it.
+#: The estate's canonical checkout of this repository — the strict row
+#: of doctor's provenance policy matrix (``cli._provenance_doctor_target``).
+#: maestro independently hardcodes the same path when it polls
+#: ``magic-hermes doctor`` with cwd = the canonical checkout, so drift
+#: there FAILs the estate's continuous verifier within one polling
+#: cycle. A same-repo checkout at any other path (conductor worktrees
+#: share this ``.git``; https dev clones) resolves advisory instead,
+#: and foreign checkouts stay silent.
+EXPECTED_REPO_PATH = Path("/work/projects/magic-hermes")
+
+#: Environment variable pinning ``doctor``'s provenance check to an
+#: explicit repository — the strictest row of the doctor matrix: drift
+#: FAILs. With it unset the check is context-scoped by matrix instead
+#: (canonical strict → same-repo advisory → CI stated skip → foreign
+#: silent), which is the standing-enforcement design; see
+#: ``cli._provenance_doctor_target`` for the precedence.
 PROVENANCE_ENV = "MAGIC_HERMES_PROVENANCE_REPO"
 
 #: Per-git-call timeout. Every call this module makes is a local config

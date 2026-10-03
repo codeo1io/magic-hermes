@@ -32,6 +32,7 @@ from .historian_guard import (
 )
 from .provenance import (
     EXPECTED_ORIGIN,
+    EXPECTED_REPO_PATH,
     GIT_TIMEOUT_S,
     PROVENANCE_ENV,
     ProvenanceError,
@@ -39,6 +40,7 @@ from .provenance import (
     check_state,
     read_state,
     repair,
+    same_repo,
 )
 from .runtime import (
     RuntimeClient,
@@ -634,17 +636,35 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
             "runtime bind",
         )
 
-    # Repository provenance guard (maestro finding 4bc6f3a5b0c1): opt-in
-    # via MAGIC_HERMES_PROVENANCE_REPO, deliberately WARN-only in every
-    # bad state — never FAIL (the health contract holds the guard to the
-    # same rule as the historian guard) and never a write (repair is an
-    # explicit `magic-hermes provenance --repair` act). Unset → no check
-    # emitted at all, keeping the default doctor output byte-stable: CI
-    # clones over HTTPS while this pin is SSH, so a default-on check
-    # would WARN on every healthy CI run.
-    provenance_repo = os.environ.get(PROVENANCE_ENV)
-    if provenance_repo:
-        provenance_state = read_state(Path(provenance_repo).expanduser())
+    # Repository provenance guard (maestro finding 4bc6f3a5b0c1) — the
+    # standing-enforcement policy matrix (KTD1), default-on and
+    # context-scoped, resolved exclusively through
+    # _provenance_doctor_target() (KTD2). Strict rows — an explicit
+    # MAGIC_HERMES_PROVENANCE_REPO pin and the estate-canonical
+    # checkout (EXPECTED_REPO_PATH) — FAIL on drift, so the estate's
+    # continuous verifier (which polls this command with cwd = the
+    # canonical checkout and gates on rc==0 and "FAIL 0" in stdout)
+    # escalates provenance drift within one polling cycle. A same-repo
+    # non-canonical checkout — every conductor worktree shares the
+    # canonical .git, and https dev clones are legitimate — WARNs
+    # advisingly; a CI run states an INFO skip (https clones are the
+    # norm there); a foreign checkout stays byte-silent. The
+    # dual-signal consequence is intentional and documented: during a
+    # drift window the maestro repo contract AND the doctor-gated
+    # context contract fail together, both attributing
+    # root_cause_repo=magic-hermes — louder, not ambiguous. In every
+    # row the doctor itself never writes: repair is an explicit
+    # `magic-hermes provenance --repair` act.
+    provenance_target, provenance_strict = _provenance_doctor_target()
+    if provenance_target is None:
+        if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+            report.add(
+                "INFO",
+                "Repository provenance check skipped: CI environment "
+                "(https clones are legitimate here)",
+            )
+    else:
+        provenance_state = read_state(provenance_target)
         if not provenance_state.repo_readable:
             reason = (
                 f" ({provenance_state.error})"
@@ -654,7 +674,7 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
             report.add(
                 "WARN",
                 "Repository provenance check skipped: "
-                f"{provenance_repo} is not a readable git repo{reason}",
+                f"{provenance_target} is not a readable git repo{reason}",
             )
         else:
             provenance = check_state(provenance_state)
@@ -666,7 +686,7 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                 )
             else:
                 report.add(
-                    "WARN",
+                    "FAIL" if provenance_strict else "WARN",
                     "Repository provenance drift — "
                     f"{provenance.summary()}; run `magic-hermes provenance "
                     f"--repair` to restore the pinned origin "
@@ -948,6 +968,37 @@ def _provenance_default_repo() -> Path:
         return Path.cwd()
     root = proc.stdout.strip()
     return Path(root) if proc.returncode == 0 and root else Path.cwd()
+
+
+def _provenance_doctor_target() -> tuple[Path | None, bool]:
+    """Resolve ``doctor``'s provenance row (the KTD1 policy matrix).
+
+    Returns ``(target, strict)``. Precedence: an explicit env pin — the
+    strictest row, FAIL on drift — then a CI skip (https clones are
+    legitimate there), then the estate-canonical checkout (strict —
+    the escalation lane the estate's continuous verifier exercises,
+    resolving doctor at ``EXPECTED_REPO_PATH``), then a same-repo
+    non-canonical checkout (advisory), else silent. ``run_doctor``
+    consumes ONLY this seam; no other code path may resolve a
+    provenance target.
+    """
+
+    pinned = os.environ.get(PROVENANCE_ENV)
+    if pinned:
+        return Path(pinned).expanduser(), True
+    if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+        return None, False
+    root = _provenance_default_repo()
+    if root == EXPECTED_REPO_PATH:
+        return root, True
+    state = read_state(root)
+    if (
+        state.repo_readable
+        and state.fetch_url
+        and same_repo(state.fetch_url, EXPECTED_ORIGIN)
+    ):
+        return root, False
+    return None, False
 
 
 def _provenance_facet_lines(report: ProvenanceReport) -> list[str]:
