@@ -42,6 +42,7 @@ const EXPOSED = [
   "composeMagicContextSystemPrompt",
   "processSystemPromptForCache",
   "buildReferenceBlocks",
+  "fitHistorianPrompt",
   "buildCompartmentAgentPrompt",
   "validateHistorianOutput",
   "buildHistorianRepairPrompt",
@@ -78,6 +79,7 @@ const EXPOSED = [
   "sweepGitCommits",
   "embedUnembeddedMemoriesForProject",
   "sweepStaleEmbeddingIdentitiesForProject",
+  "drainStaleEmbeddingIdentitiesForProject",
   "runDueCompiledSmartNoteChecks",
   "acquireLease",
   "getEmbeddingCoverageStatus",
@@ -136,6 +138,59 @@ const SYNTHESIZED_EXPORTS = {
       "(resolveCacheTtl) => (cacheTtl, modelKey) => {" +
       " const value = resolveCacheTtl(cacheTtl, modelKey);" +
       " return { value: String(value), source: 'config', modelKey }; }",
+  },
+  // 0.45.x: buildReferenceBlocks({sessionId, chunkStart, sessionCompartments})
+  // -> { seedExamples, sessionReferences } was folded into the budget-fitted
+  // fitHistorianPrompt(args) renderer. With no window facts, upstream's
+  // producerInputTokenLimit resolves to undefined and the renderer takes its
+  // unguarded path — exactly the legacy full-window rendering. The bridge
+  // renders projectMemory itself (renderMemoryBlockV2 over
+  // trimMemoriesToBudgetV2), so the fitted projectMemory field is ignored.
+  buildReferenceBlocks: {
+    requires: ["fitHistorianPrompt"],
+    source:
+      "(fitHistorianPrompt) => ({ sessionId, chunkStart, sessionCompartments }) => {" +
+      " const fitted = fitHistorianPrompt({" +
+      " sessionId, chunkStart, sessionCompartments," +
+      " memories: [], requestedChunkTokens: 0," +
+      " window: {} });" +
+      " return { seedExamples: fitted.seedExamples ?? ''," +
+      " sessionReferences: fitted.sessionReferences ?? ''," +
+      " projectMemory: fitted.projectMemory ?? '' }; }",
+  },
+  // 0.45.x: sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity) ->
+  // count became the async batch-budgeted drainStaleEmbeddingIdentitiesForProject
+  // (db, projectIdentity, budgetMs) which loops the same internal sweep to
+  // completion and returns the identical counter shape (plus
+  // trackingRowsDeleted). The bridge call site awaits the shim; awaiting the
+  // 0.44.x sync sweep's plain object is a no-op.
+  sweepStaleEmbeddingIdentitiesForProject: {
+    requires: ["drainStaleEmbeddingIdentitiesForProject"],
+    source:
+      "(drainStaleEmbeddingIdentitiesForProject) => (db, projectIdentity) =>" +
+      " drainStaleEmbeddingIdentitiesForProject(db, projectIdentity)",
+  },
+  // 0.44.x reverse: fitHistorianPrompt does not exist; derive the fitted
+  // renderer from the legacy pure renderer. Unguarded full-window rendering,
+  // which is exactly what the 0.45 shim below requests.
+  fitHistorianPrompt: {
+    requires: ["buildReferenceBlocks"],
+    source:
+      "(buildReferenceBlocks) => (args) => ({" +
+      " ok: true, guarded: false, trimmed: false," +
+      " chunkTokens: Math.max(0, Math.floor(args.requestedChunkTokens || 0))," +
+      " ...buildReferenceBlocks({ sessionId: args.sessionId," +
+      " chunkStart: args.chunkStart," +
+      " sessionCompartments: args.sessionCompartments }) })",
+  },
+  // 0.44.x reverse: the async budgeted drain does not exist; the legacy sync
+  // sweep already runs to completion in one call — wrap it in an async
+  // function so await works uniformly across series.
+  drainStaleEmbeddingIdentitiesForProject: {
+    requires: ["sweepStaleEmbeddingIdentitiesForProject"],
+    source:
+      "(sweepStaleEmbeddingIdentitiesForProject) => async (db, projectIdentity) =>" +
+      " sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity)",
   },
 };
 
