@@ -1595,7 +1595,9 @@ async function maintenanceRun(args) {
     );
   }
 
-  const stale = mc("sweepStaleEmbeddingIdentitiesForProject")(
+  // 0.45.x synthesizes this legacy name from the async drain* replacement;
+  // awaiting the 0.44.x sync sweep's plain object is a no-op.
+  const stale = await mc("sweepStaleEmbeddingIdentitiesForProject")(
     db,
     session.projectIdentity
   );
