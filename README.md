@@ -402,9 +402,10 @@ The adapter accepts only the major/minor series recorded in
 the official Pi module. The repo-level `package.json`/`package-lock.json` pin the
 exact upstream release used for validation. `.github/workflows/sync-magic-context.yml`
 checks for new core `vX.Y.Z` releases daily at 00:07 UTC (and also supports immediate
-`repository_dispatch`), waits for the matching npm publication, and processes the
-oldest unseen core release first so intermediate releases are never skipped. Each
-validated upstream release updates the dependency pin and compatibility manifest,
+`repository_dispatch`), waits for the matching npm publication, and adopts the
+newest stable core release above the pinned version, catching up in a single sync
+(drafts and prereleases are never adopted). Each validated upstream release
+updates the dependency pin and compatibility manifest,
 increments the Magic-Hermes patch version (for example `0.2.0` to `0.2.1`), runs the
 full Python/Node/build gate, commits and tags the release, and publishes the wheel,
 sdist, and checksums as a GitHub release. A missing dependency or unvalidated series
