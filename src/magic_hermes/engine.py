@@ -89,6 +89,10 @@ class MagicContextEngine(_ContextEngineBase):
         )
         self._session_id = session_id or "magic-hermes-bootstrap"
         self._bound_identity: tuple[str, str] | None = None
+        # Sidecar generation the bind was performed against; a reap+respawn
+        # (idle sweeper, crash) invalidates the bind even though the cached
+        # identity matches (issue #53).
+        self._bound_generation = -1
         self._tool_schemas: list[dict[str, Any]] = []
         self._config: dict[str, Any] = {}
         self._compaction_enabled = True
@@ -151,6 +155,7 @@ class MagicContextEngine(_ContextEngineBase):
                 log.debug("Magic Context session-route cleanup failed", exc_info=True)
         self._client.close()
         self._bound_identity = None
+        self._bound_generation = -1
 
     def __del__(self) -> None:
         """Best-effort cleanup when a host lifecycle omits explicit ``close()``."""
@@ -158,9 +163,17 @@ class MagicContextEngine(_ContextEngineBase):
         with contextlib.suppress(Exception):
             self.close()
 
+    def _client_generation(self) -> int:
+        """Sidecar generation, tolerant of stand-in clients without one."""
+
+        return getattr(self._client, "generation", 0)
+
     def _bind(self) -> bool:
         identity = (self._session_id, self._project_root)
-        if self._bound_identity == identity:
+        if (
+            self._bound_identity == identity
+            and self._bound_generation == self._client_generation()
+        ):
             return True
         try:
             result = self._client.call(
@@ -176,6 +189,7 @@ class MagicContextEngine(_ContextEngineBase):
             return False
 
         self._bound_identity = identity
+        self._bound_generation = self._client_generation()
         self._config = dict(result.get("config") or {})
         self._compaction_enabled = bool(
             self._config.get("compaction_enabled", True)
@@ -876,6 +890,7 @@ class MagicContextEngine(_ContextEngineBase):
             str(Path(root).resolve()) if root else _resolve_host_project_root()
         )
         self._bound_identity = None
+        self._bound_generation = -1
         if self._session_route is not None:
             self._session_route(self._session_id, self._project_root)
         if self._bind():
@@ -932,6 +947,7 @@ class MagicContextEngine(_ContextEngineBase):
                 log.debug("Magic Context session finalization failed", exc_info=True)
         self._client.close()
         self._bound_identity = None
+        self._bound_generation = -1
         if self._session_route is not None:
             self._session_route(self._session_id, None)
 
@@ -946,6 +962,7 @@ class MagicContextEngine(_ContextEngineBase):
         self._client.close()
         self._session_id = "magic-hermes-bootstrap"
         self._bound_identity = None
+        self._bound_generation = -1
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         self._bind()
@@ -957,18 +974,36 @@ class MagicContextEngine(_ContextEngineBase):
         if not self._bind():
             return json.dumps({"error": "Magic Context runtime is unavailable"})
         try:
-            result = self._client.call(
-                "tool",
-                {
-                    "session_id": self._session_id,
-                    "name": name,
-                    "arguments": args,
-                    "messages": kwargs.get("messages") or [],
-                },
-                timeout=60,
-            )
+            return self._call_engine_tool(name, args, kwargs)
         except RuntimeErrorBase as exc:
-            return json.dumps({"error": str(exc)})
+            if "Session is not bound" not in str(exc):
+                return json.dumps({"error": str(exc)})
+            # The sidecar was replaced between bind and this call (idle reap,
+            # crash). Generation tracking already re-binds on the next
+            # _bind(); retry once here so the tool call still lands (issue
+            # #53 — previously this surfaced to the model and armed the
+            # 30s failure cooldown).
+            self._bound_generation = -1
+            if not self._bind():
+                return json.dumps({"error": "Magic Context runtime is unavailable"})
+            try:
+                return self._call_engine_tool(name, args, kwargs)
+            except RuntimeErrorBase as retry_exc:
+                return json.dumps({"error": str(retry_exc)})
+
+    def _call_engine_tool(
+        self, name: str, args: dict[str, Any], kwargs: dict[str, Any]
+    ) -> str:
+        result = self._client.call(
+            "tool",
+            {
+                "session_id": self._session_id,
+                "name": name,
+                "arguments": args,
+                "messages": kwargs.get("messages") or [],
+            },
+            timeout=60,
+        )
         payload: dict[str, Any] = {"content": result.get("text", "")}
         if result.get("is_error"):
             payload["error"] = True

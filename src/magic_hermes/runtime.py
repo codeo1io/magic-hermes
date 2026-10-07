@@ -344,6 +344,13 @@ class RuntimeClient:
         self._process: subprocess.Popen[str] | None = None
         self._closed = False
         self._next_id = 1
+        # Increments every time a NEW sidecar process is spawned. A fresh
+        # process has an empty session map, so callers that cache bind state
+        # (MagicContextEngine._bind) compare this to detect a stale bind
+        # instead of learning it from a "Session is not bound" error (issue
+        # #53: first ctx_* call after an idle reap failed and armed the 30s
+        # failure cooldown).
+        self._generation = 0
         self._stderr_thread: threading.Thread | None = None
         self._last_activity = time.monotonic()
         self._failure_cooldown_until = 0.0
@@ -467,8 +474,15 @@ class RuntimeClient:
             if process is not None:
                 self._dispose(process)
             process = self._start()
+            self._generation += 1
             self._failure_cooldown_until = 0.0
         return process
+
+    @property
+    def generation(self) -> int:
+        """Current sidecar process generation (0 = never spawned)."""
+
+        return self._generation
 
     def _write_payload(
         self,
