@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -199,3 +201,111 @@ def test_dreamer_registration_failure_still_registers_context_engine(
     assert context.engine.name == "magic-context"
     assert context.tasks == {"mc_historian": context.tasks["mc_historian"]}
     assert context.tools == {}
+
+
+class RecordingLifecycle:
+    """Stands in for Hermes' subagent lifecycle registry.
+
+    Reproduces the deployed dedup contract from subagent_lifecycle.py: a
+    launch whose (parent_session_id, correlation_id) pair was already used
+    (and not yet reaped) raises immediately — the exact mechanism behind
+    issue #52's second bug.
+    """
+
+    def __init__(self):
+        self.launches = []
+        self._correlations = set()
+
+    def launch(self, request):
+        key = (getattr(request, "parent_session_id", None), request.correlation_id)
+        if request.correlation_id and key in self._correlations:
+            raise RuntimeError("Duplicate correlation_id for this parent session")
+        self._correlations.add(key)
+        self.launches.append(request)
+        return SimpleNamespace(handle=str(len(self.launches)))
+
+    def wait(self, handle, timeout_seconds=None):
+        return SimpleNamespace(completed=True)
+
+    def result(self, handle):
+        return SimpleNamespace(
+            terminal_state="succeeded",
+            ready=True,
+            summary="ok",
+            error_message=None,
+            error_classification=None,
+            handle=SimpleNamespace(
+                parent_session_id="parent-1", model="test-model"
+            ),
+        )
+
+
+class RecordingLaunchRequest:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+        self.parent_session_id = None
+
+
+class _StubSubagentState:
+    SUCCEEDED = "succeeded"
+
+
+@pytest.fixture
+def hermes_lifecycle_stubs(monkeypatch):
+    """Make _run_child's runtime import resolve without the Hermes venv."""
+    stubs = types.ModuleType("agent")
+    lifecycle_module = types.ModuleType("agent.subagent_lifecycle")
+    lifecycle_module.SubagentLaunchRequest = RecordingLaunchRequest
+    lifecycle_module.SubagentState = _StubSubagentState
+    stubs.subagent_lifecycle = lifecycle_module
+    monkeypatch.setitem(sys.modules, "agent", stubs)
+    monkeypatch.setitem(sys.modules, "agent.subagent_lifecycle", lifecycle_module)
+
+
+def _prompt_params(virtual_session_id, directory, prompt="p"):
+    return {
+        "virtual_session_id": virtual_session_id,
+        "system": "s",
+        "prompt": prompt,
+        "model": "",
+        "directory": directory,
+        "agent": "dreamer",
+    }
+
+
+def test_second_child_prompt_on_same_virtual_session_launches(
+    tmp_path, hermes_lifecycle_stubs, monkeypatch
+):
+    bridge = plugin._DreamerHostBridge(FakeContext())
+    recording = RecordingLifecycle()
+    bridge._lifecycle = recording
+    # Trace correlation happens out-of-band via lifecycle hooks; skip the
+    # 1s ready-wait so the test exercises launch addressing only.
+    monkeypatch.setattr(bridge, "_matching_trace", lambda **kwargs: [])
+
+    for prompt_text in ("first prompt", "second prompt"):
+        out = bridge.handle(
+            "dreamer_child_prompt",
+            _prompt_params("mh-dream-x", str(tmp_path), prompt_text),
+        )
+        assert out["handle"] == "mh-dream-x"
+        assert out["text"] == "ok"
+
+    assert [req.correlation_id for req in recording.launches] == [
+        "mh-dream-x",
+        "mh-dream-x#l2",
+    ]
+
+
+def test_launch_seq_map_is_bounded(tmp_path, hermes_lifecycle_stubs, monkeypatch):
+    bridge = plugin._DreamerHostBridge(FakeContext())
+    bridge._lifecycle = RecordingLifecycle()
+    monkeypatch.setattr(bridge, "_matching_trace", lambda **kwargs: [])
+
+    for index in range(300):
+        bridge.handle(
+            "dreamer_child_prompt",
+            _prompt_params(f"mh-dream-{index}", str(tmp_path)),
+        )
+
+    assert len(bridge._launch_seq) <= 256

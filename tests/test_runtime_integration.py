@@ -2915,3 +2915,189 @@ def test_historian_publish_last_compartment_ids_match_full_fetch(
         assert row["compartment_id_min"] == low
         assert row["compartment_id_max"] == high
     assert_no_unclassified_hermes_failures(db_path)
+
+
+def test_retrospective_scan_window_respects_hermes_child_contract(tmp_path):
+    """Issue #52: the bridge must inject resolveRetrospectiveUsableInputTokens.
+
+    Without the injection the engine sizes the retrospective scan window from
+    the model context limit (~1.31M tokens for glm-5.3), so the assembled
+    child prompt exceeds Hermes' public subagent contract (goal <= 16k +
+    context <= 32k chars, 48k combined) and the host rejects every run
+    before any LLM call. With the clamp the window keeps only what fits a
+    contract-safe token budget. The host stub below enforces the same
+    48,000-char combined contract as plugin._request_text.
+    """
+    config_dir = tmp_path / ".cortexkit"
+    config_dir.mkdir()
+    (config_dir / "magic-context.jsonc").write_text(
+        json.dumps(
+            {
+                "dreamer": {"tasks": {"retrospective": {"schedule": ""}}},
+                "embedding": {"provider": "off"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "retro-clamp.db"
+    prompts = []
+    rejections = []
+
+    def callback(method, params):
+        if method == "dreamer_child_abort":
+            return {"accepted": True}
+        assert method == "dreamer_child_prompt"
+        system = str(params.get("system", ""))
+        prompt = str(params.get("prompt", ""))
+        prompts.append((system, prompt))
+        # Enforce the same combined contract as plugin._request_text.
+        if len(system) + len(prompt) > 48_000:
+            rejections.append(len(system) + len(prompt))
+            raise RuntimeError(
+                "Magic Context Dreamer prompt is too long for Hermes' public "
+                "subagent goal/context contract: 48,000 characters combined "
+                "(goal <= 16,000, context <= 32,000); reduce the length of "
+                "the messages and retry with a smaller source window"
+            )
+        if "conservative friction detector" in system:
+            return {"text": "y: 1", "tool_history": []}
+        assert "retrospective learning agent" in system.lower()
+        return {
+            "text": (
+                '<learnings><learning route="none">'
+                "</learning></learnings>"
+            ),
+            "tool_history": [],
+        }
+
+    with RuntimeClient(
+        db_path=db_path, timeout=60, callback_handler=callback
+    ) as client:
+        client.call(
+            "bind",
+            {"session_id": "retro-clamp", "project_root": str(tmp_path)},
+            timeout=60,
+        )
+        base = 1_790_000_000_000
+        # Realistic conversational lines (mixed characters, ~786 chars,
+        # ~150 BPE tokens each): 80 lines = ~62.9k chars / ~12k tokens of
+        # history. Unclamped, the window default (128k tokens) admits ALL
+        # of them -> 62.9k chars busts the 48k-char host contract (the
+        # exact issue #52 failure). The injected 10k-token clamp keeps
+        # only ~2/3 of the lines -> fits the contract.
+        unit = (
+            "We traced the duplicate-correlation failure through the "
+            "lifecycle registry, confirmed the 3600s terminal retention "
+            "window, and verified the launch-sequence scheme against the "
+            "dedup key. Ledger entries agreed; the reconcile pass "
+            "re-derived the same verdict twice."
+        )
+        filler = unit * 3
+        messages = [{"role": "system", "content": "System."}]
+        for index in range(80):
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"note {index}: {filler}",
+                    "timestamp": base + index * 1_000,
+                }
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "ack",
+                    "timestamp": base + index * 1_000 + 500,
+                }
+            )
+        client.call(
+            "observe",
+            {"session_id": "retro-clamp", "messages": messages},
+            timeout=60,
+        )
+        result = client.call(
+            "dreamer_run_manual",
+            {"session_id": "retro-clamp", "task": "retrospective"},
+            timeout=180,
+        )
+        assert result["failed"] == [], result.get("failureDetails") or result
+        assert result["ran"] == ["retrospective"]
+
+    assert prompts, "retrospective never called the host callback"
+    assert not rejections, f"contract-size rejections: {rejections}"
+    for system, prompt in prompts:
+        combined = len(system) + len(prompt)
+        assert combined <= 48_000, (
+            f"child prompt exceeds Hermes contract: {combined} chars"
+        )
+
+
+def test_retrospective_usable_input_tokens_override(tmp_path):
+    """dreamer.tasks.retrospective.usable_input_tokens overrides the default."""
+    config_dir = tmp_path / ".cortexkit"
+    config_dir.mkdir()
+    (config_dir / "magic-context.jsonc").write_text(
+        json.dumps(
+            {
+                "dreamer": {
+                    "tasks": {
+                        "retrospective": {
+                            "schedule": "",
+                            "usable_input_tokens": 16000,
+                        }
+                    }
+                },
+                "embedding": {"provider": "off"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "retro-override.db"
+    sizes = []
+
+    def callback(method, params):
+        if method == "dreamer_child_abort":
+            return {"accepted": True}
+        assert method == "dreamer_child_prompt"
+        sizes.append(
+            len(str(params.get("system", "")))
+            + len(str(params.get("prompt", "")))
+        )
+        system = str(params.get("system", ""))
+        if "conservative friction detector" in system:
+            return {"text": "y: 1", "tool_history": []}
+        return {
+            "text": '<learnings><learning route="none"></learning></learnings>',
+            "tool_history": [],
+        }
+
+    with RuntimeClient(
+        db_path=db_path, timeout=60, callback_handler=callback
+    ) as client:
+        client.call(
+            "bind",
+            {"session_id": "retro-ovr", "project_root": str(tmp_path)},
+            timeout=60,
+        )
+        base = 1_790_000_000_000
+        messages = [{"role": "system", "content": "System."}]
+        for index in range(60):
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"line {index} " + "y" * 300,
+                    "timestamp": base + index * 1_000,
+                }
+            )
+        client.call(
+            "observe",
+            {"session_id": "retro-ovr", "messages": messages},
+            timeout=60,
+        )
+        client.call(
+            "dreamer_run_manual",
+            {"session_id": "retro-ovr", "task": "retrospective"},
+            timeout=180,
+        )
+
+    assert sizes, "retrospective never called the host callback"
+    assert max(sizes) <= 48_000

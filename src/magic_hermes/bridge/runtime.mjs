@@ -2531,12 +2531,28 @@ async function dreamerExecution(session) {
     session.config.language
   );
   const client = createHermesDreamerClient(session);
+  // Issue #52: without this dep the engine sizes the retrospective scan
+  // window from the model context limit (e.g. glm-5.3 ~1.31M tokens), so the
+  // assembled prompt always exceeds Hermes' public subagent contract
+  // (goal <= 16k + context <= 32k, 48k chars combined) and every run dies at
+  // _request_text before any LLM call. 8k tokens keeps the assembled
+  // friction-detector prompt at ~39k chars for English prose (~4.9
+  // chars/token, measured against the 0.45 estimator). The engine still
+  // adapts downward via retrospectiveOverflow when a run overflows.
+  const retrospectiveTokensConfig = Number(
+    dreamer?.tasks?.retrospective?.usable_input_tokens || 0
+  );
+  const retrospectiveUsableInputTokens =
+    Number.isFinite(retrospectiveTokensConfig) && retrospectiveTokensConfig > 0
+      ? Math.floor(retrospectiveTokensConfig)
+      : 8000;
   const executor = mc("createDreamTaskExecutor")({
     client,
     sessionDirectory: session.projectRoot,
     openOpenCodeDb: () => null,
     retrospectiveRawProvider: () =>
       createHermesRetrospectiveProvider(session.projectIdentity),
+    resolveRetrospectiveUsableInputTokens: () => retrospectiveUsableInputTokens,
     primerRawProviderFactory: createHermesPrimerRawProvider,
     userMemoryCollectionEnabled: mc("userMemoryCollectionEnabled")(dreamer),
     ensureProjectRegistered: (directory, database) =>
