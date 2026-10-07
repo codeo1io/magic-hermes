@@ -636,21 +636,31 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
             "runtime bind",
         )
 
-    # Repository provenance guard (maestro finding 4bc6f3a5b0c1) — the
-    # standing-enforcement policy matrix (KTD1), default-on and
-    # context-scoped, resolved exclusively through
-    # _provenance_doctor_target() (KTD2). Strict rows — an explicit
-    # MAGIC_HERMES_PROVENANCE_REPO pin and the estate-canonical
-    # checkout (EXPECTED_REPO_PATH) — FAIL on drift, so the estate's
-    # continuous verifier (which polls this command with cwd = the
-    # canonical checkout and gates on rc==0 and "FAIL 0" in stdout)
-    # escalates provenance drift within one polling cycle. A same-repo
+    # Repository provenance guard (maestro findings 4bc6f3a5b0c1 strict,
+    # d59758598379 advisory) — the standing-enforcement policy matrix
+    # (KTD1), default-on and context-scoped, resolved exclusively
+    # through _provenance_doctor_target() (KTD2), with a TIERED
+    # verdict: strict rows — an explicit MAGIC_HERMES_PROVENANCE_REPO
+    # pin and the estate-canonical checkout (EXPECTED_REPO_PATH) —
+    # FAIL only on security-bearing drift (report.drifted_facets:
+    # mangled fetch URL, foreign pushurl, or tracking remote
+    # retargeted off origin — the 2026-09-29 class, pushes can be
+    # silently sent elsewhere), so the estate's continuous verifier
+    # (which polls this command with cwd = the canonical checkout and
+    # gates on rc==0 and "FAIL 0" in stdout) escalates retargetable
+    # drift within one polling cycle. Same-origin merge-residue
+    # (report.advisory_facets, branch_merge_tracking — the git push -u
+    # residue behind d59758598379, 2026-10-07) WARNs in EVERY row: the
+    # verifier's gate stays green through workflow noise while the
+    # WARN still names `magic-hermes provenance --repair`, and the
+    # explicit provenance audit keeps exiting 1 until repaired. A
+    # same-repo
     # non-canonical checkout — every conductor worktree shares the
     # canonical .git, and https dev clones are legitimate — WARNs
     # advisingly; a CI run states an INFO skip (https clones are the
     # norm there); a foreign checkout stays byte-silent. The
     # dual-signal consequence is intentional and documented: during a
-    # drift window the maestro repo contract AND the doctor-gated
+    # STRICT drift window the maestro repo contract AND the doctor-gated
     # context contract fail together, both attributing
     # root_cause_repo=magic-hermes — louder, not ambiguous. In every
     # row the doctor itself never writes: repair is an explicit
@@ -685,8 +695,14 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                     f"({provenance.summary()})",
                 )
             else:
+                # tiered severity (d59758598379): only drifted_facets —
+                # the retargetable, security-bearing class — FAIL a
+                # strict row; advisory-only residue WARNs every row so
+                # the rc==0/"FAIL 0" gate rides through benign residue
                 report.add(
-                    "FAIL" if provenance_strict else "WARN",
+                    "FAIL"
+                    if (provenance_strict and provenance.drifted_facets)
+                    else "WARN",
                     "Repository provenance drift — "
                     f"{provenance.summary()}; run `magic-hermes provenance "
                     f"--repair` to restore the pinned origin "
@@ -974,7 +990,7 @@ def _provenance_doctor_target() -> tuple[Path | None, bool]:
     """Resolve ``doctor``'s provenance row (the KTD1 policy matrix).
 
     Returns ``(target, strict)``. Precedence: an explicit env pin — the
-    strictest row, FAIL on drift — then a CI skip (https clones are
+    strictest row, FAIL on strict drift — then a CI skip (https clones are
     legitimate there), then the estate-canonical checkout (strict —
     the escalation lane the estate's continuous verifier exercises,
     resolving doctor at ``EXPECTED_REPO_PATH``), then a same-repo
@@ -1046,6 +1062,7 @@ def _provenance_payload(
         "branch": report.branch,
         "healthy": report.healthy,
         "drifted_facets": report.drifted_facets,
+        "advisory_facets": report.advisory_facets,
         "facets": {
             "repo_readable": report.repo_readable,
             "origin_match": report.origin_match,
@@ -1139,9 +1156,20 @@ def run_provenance(
                 + (" after repair" if repair_requested else "")
             )
         else:
+            # tier-aware tail (D4 wording): strict facets first, the
+            # advisory tier named in parentheses — the explicit audit
+            # fails on BOTH tiers, so the repair advice always prints
+            strict_facets = ", ".join(report.drifted_facets)
+            advisory_facets = ", ".join(report.advisory_facets)
+            if strict_facets and advisory_facets:
+                facets = f"{strict_facets} (advisory: {advisory_facets})"
+            elif advisory_facets:
+                facets = f"{advisory_facets} (advisory)"
+            else:
+                facets = strict_facets
             print(
                 "└  provenance drift in "
-                f"{', '.join(report.drifted_facets)} — run `magic-hermes "
+                f"{facets} — run `magic-hermes "
                 "provenance --repair` to restore the pinned origin "
                 f"{EXPECTED_ORIGIN}"
             )
