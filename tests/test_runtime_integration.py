@@ -3101,3 +3101,62 @@ def test_retrospective_usable_input_tokens_override(tmp_path):
 
     assert sizes, "retrospective never called the host callback"
     assert max(sizes) <= 48_000
+
+
+def test_engine_tool_call_survives_sidecar_reap(tmp_path):
+    """Issue #53: a cached bind must not outlive the sidecar process.
+
+    The idle sweeper kills a quiet sidecar after 300s; the next call spawns
+    a fresh Node process whose session map is empty. Previously the engine
+    skipped rebind (cached identity matched) and the first ctx_* tool call
+    failed with 'Session is not bound', arming the 30s failure cooldown.
+    Generation tracking must transparently rebind instead.
+    """
+    from magic_hermes.engine import MagicContextEngine
+
+    config_dir = tmp_path / ".cortexkit"
+    config_dir.mkdir()
+    (config_dir / "magic-context.jsonc").write_text(
+        json.dumps({"embedding": {"provider": "off"}}),
+        encoding="utf-8",
+    )
+    engine = MagicContextEngine(
+        project_root=str(tmp_path), session_id="reap-race"
+    )
+    try:
+        assert engine._bind() is True
+        # First tool call works on the live sidecar.
+        first = engine.handle_tool_call(
+            "ctx_note",
+            {"action": "write", "content": "pre-reap note"},
+        )
+        assert json.loads(first).get("error") is not True, first
+
+        # Simulate the idle sweeper: kill the sidecar process. The next
+        # client call spawns a fresh process (generation bumps) with an
+        # EMPTY session map — the cached bind is now a lie.
+        client = engine._client
+        with client._lock:
+            process = client._process
+        assert process is not None
+        with client._lock:
+            client._dispose(process)
+        # The engine must transparently rebind; the tool call lands and no
+        # 'Session is not bound' error escapes to the model.
+        second = engine.handle_tool_call(
+            "ctx_note", {"action": "write", "content": "post-reap note"}
+        )
+        assert json.loads(second).get("error") is not True, second
+        # Generation invariant (new code only): the cached bind tracks the
+        # live sidecar generation after the transparent rebind.
+        if hasattr(engine, "_bound_generation") and hasattr(
+            engine._client, "generation"
+        ):
+            assert engine._bound_generation == engine._client.generation
+
+        readback = engine.handle_tool_call("ctx_note", {"action": "read"})
+        payload = json.loads(readback)
+        assert payload.get("error") is not True, readback
+        assert "post-reap note" in payload.get("content", "")
+    finally:
+        engine.close()
