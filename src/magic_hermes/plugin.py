@@ -34,6 +34,7 @@ class _DreamerHostBridge:
         self._trace_ready = threading.Condition(self._lock)
         self._stop_events: list[dict[str, Any]] = []
         self._handles: dict[str, Any] = {}
+        self._launch_seq: dict[str, int] = {}
         self._launch_local = threading.local()
         self._child_projects: dict[str, str] = {}
         self._child_capabilities: dict[str, str] = {}
@@ -170,8 +171,10 @@ class _DreamerHostBridge:
         )
         if len(combined) > 48_000:
             raise RuntimeError(
-                "Magic Context Dreamer prompt exceeds Hermes' public subagent "
-                "goal/context contract (48,000 characters combined)"
+                "Magic Context Dreamer prompt is too long for Hermes' public "
+                "subagent goal/context contract: 48,000 characters combined "
+                "(goal <= 16,000, context <= 32,000); reduce the length of "
+                "the messages and retry with a smaller source window"
             )
         context = combined[:32_000]
         remainder = combined[32_000:]
@@ -306,6 +309,23 @@ class _DreamerHostBridge:
         started_at = time.monotonic()
         self._launch_local.project_root = str(params.get("directory") or "")
         self._launch_local.capability = self._capability_for_task(params)
+        # Hermes' lifecycle registry dedups by (parent_session_id,
+        # correlation_id) and retains terminal correlations for 1h, so the
+        # engine's SECOND dreamer_child_prompt on one virtual session (retry
+        # after a classification follow-up, or a second prompt) must not reuse
+        # the correlation id: launch-sequence suffix keeps every launch
+        # addressable while the first stays identical for old state.
+        with self._lock:
+            seq = self._launch_seq.get(virtual_session_id, 0) + 1
+            self._launch_seq[virtual_session_id] = seq
+            # Virtual sessions are single dreamer runs (minutes); cap the map
+            # by evicting the oldest half long before any live session ages out.
+            if len(self._launch_seq) > 256:
+                for stale in list(self._launch_seq)[:128]:
+                    del self._launch_seq[stale]
+        correlation = (
+            virtual_session_id if seq == 1 else f"{virtual_session_id}#l{seq}"
+        )
         try:
             handle = self._lifecycle.launch(
                 SubagentLaunchRequest(
@@ -314,7 +334,7 @@ class _DreamerHostBridge:
                     role="leaf",
                     model=model,
                     allowed_toolsets=self._toolsets_for_task(params),
-                    correlation_id=virtual_session_id,
+                    correlation_id=correlation,
                     metadata={
                         "owner": "magic-context",
                         "task": str(params.get("agent") or "dreamer"),
