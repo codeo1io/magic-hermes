@@ -76,6 +76,35 @@ def test_readme_pin_claim_when_present_matches_manifest():
         )
 
 
+def test_readme_adoption_policy_matches_resolver():
+    """README's sync-adoption claim must match the resolver's actual policy.
+
+    Regression for the 2026-10 PR #41 review: 29d4bfe made the sync adopt
+    the newest stable release strictly above the pin, but the README still
+    described the older publish-order stepping, so the claim drifted through
+    two green syncs with no guard to catch it.
+    """
+    readme = README.read_text(encoding="utf-8")
+    assert re.search(r"oldest\s+unseen\s+core\s+release", readme) is None, (
+        "README still claims the sync processes the oldest unseen core "
+        "release first; since 29d4bfe the resolver adopts the newest stable "
+        "release above the pin; update the README claim and this test together"
+    )
+    assert re.search(r"newest\s+stable\s+core\s+release", readme), (
+        "README does not state that the sync adopts the newest stable core "
+        "release above the pinned version; update the README claim and this "
+        "test together"
+    )
+    resolver = (ROOT / "scripts" / "next_magic_context_release.py").read_text(
+        encoding="utf-8"
+    )
+    assert "newest stable release strictly above the current pin" in resolver, (
+        "scripts/next_magic_context_release.py no longer states the "
+        "newest-stable-above-pin contract in next_release_tag's docstring; "
+        "update the README claim and this test together"
+    )
+
+
 class TestSyncWorkflowGuardrails:
     """The auto-release workflow must keep its series-jump guard intact."""
 
