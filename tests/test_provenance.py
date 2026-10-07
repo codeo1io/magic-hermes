@@ -67,12 +67,19 @@ def _make_repo(
     origin_url: str,
     *,
     mangle_branch: bool = False,
+    residue_branch: bool = False,
 ) -> Path:
     """A real throwaway repo: one commit, origin set, healthy tracking.
 
     ``mangle_branch=True`` reproduces the exact 2026-09-29 incident
     state: ``branch.master.remote`` rewritten to the literal
     ``branch.master.merge`` and ``branch.master.merge`` unset.
+
+    ``residue_branch=True`` reproduces the exact 2026-10-07 incident
+    state (finding d59758598379): SSH fetch pinned, the sanctioned
+    HTTPS pushurl carried, ``branch.master.remote`` still ``origin``,
+    and ``branch.master.merge`` pointing at the fix branch a
+    ``git push -u`` left tracked — same-origin residue, advisory tier.
     """
 
     repo = root / name
@@ -89,6 +96,14 @@ def _make_repo(
     if mangle_branch:
         _git(repo, "config", "branch.master.remote", "branch.master.merge")
         _git(repo, "config", "--unset", "branch.master.merge")
+    if residue_branch:
+        _git(repo, "remote", "set-url", "--push", "origin", HTTPS)
+        _git(
+            repo,
+            "config",
+            "branch.master.merge",
+            "refs/heads/fix/issue-52-retrospective-contract",
+        )
     return repo
 
 
@@ -569,6 +584,15 @@ class TestModuleRunnable:
         assert payload["healthy"] is False
         assert payload["facets"]["origin_match"] is False
         assert payload["facets"]["branch_tracking"] is False
+        # both tier columns are present; this drift fixture is
+        # strict-tier (mangled tracking remote) so the advisory column
+        # is empty — the residue tier is pinned below in
+        # TestDoctorProvenanceMergeResidueTier (T6)
+        assert payload["drifted_facets"] == [
+            "origin_match",
+            "branch_tracking",
+        ]
+        assert payload["advisory_facets"] == []
         assert payload["repair"] == []
 
     def test_cli_module_provenance_parity_with_console_script(self, tmp_path):
@@ -967,6 +991,213 @@ class TestDoctorProvenanceEscalation:
         rc, _payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
         assert rc == 1
         assert _git(repo, "config", "--local", "--list") == before
+
+
+class TestDoctorProvenanceMergeResidueTier:
+    """The 2026-10-07 residue class (d59758598379) — advisory, not FAIL.
+
+    The estate's canonical checkout drifted to
+    ``branch.master.merge=refs/heads/fix/...`` — same-origin residue
+    of a ``git push -u`` to a fix branch: every push still aimed at
+    the RIGHT repository, yet the strict doctor row FAILed maestro's
+    operational contract over workflow noise. Under the tiered
+    verdict the residue WARNs every doctor row — the estate's
+    rc==0/"FAIL 0" gate stays green — while the message still names
+    ``magic-hermes provenance --repair`` and the explicit audit keeps
+    exiting 1 until repaired (T5). The 2026-09-29 class — a tracking
+    REMOTE off origin, pushes retargetable — stays strict (T4 pins
+    it WITHOUT origin_match drift, alongside the mangle_branch
+    fixtures above). T1-T7 follow the plan's regression matrix.
+    """
+
+    def test_t1_canonical_residue_warns_and_keeps_gate_green(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # the estate's exact 2026-10-07 state on the canonical path:
+        # advisory WARN, not FAIL — rc stays 0 and "FAIL 0" stays in
+        # stdout, so maestro's gate rides through benign residue while
+        # the row still names the repair and the doctor never writes
+        repo = _make_repo(tmp_path, "canon", SSH, residue_branch=True)
+        _pin_canonical(monkeypatch, repo)
+        monkeypatch.chdir(repo)
+        config = repo / ".git" / "config"
+        before = config.read_text()
+        rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        rows = _provenance_rows(payload)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "WARN"
+        assert "branch_merge_tracking" in rows[0]["message"]
+        assert "provenance --repair" in rows[0]["message"]
+        assert rc == 0
+        assert payload["summary"]["fail"] == 0
+        rc, out = _run_doctor(
+            tmp_path, monkeypatch, capsys, json_output=False
+        )
+        assert rc == 0
+        assert "FAIL 0" in out
+        assert config.read_text() == before
+
+    def test_t2_env_pinned_residue_warns_not_fails(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # the env pin is the strictest row of the matrix — it too WARNs
+        # on advisory-only residue: only drifted_facets FAIL a row
+        repo = _make_repo(tmp_path, "pinned", SSH, residue_branch=True)
+        monkeypatch.setenv(provenance.PROVENANCE_ENV, str(repo))
+        rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        rows = _provenance_rows(payload)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "WARN"
+        assert "branch_merge_tracking" in rows[0]["message"]
+        assert rc == 0
+        assert payload["summary"]["fail"] == 0
+
+    def test_t3_same_repo_non_canonical_residue_warns(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # the advisory lane is unchanged by the tier split — residue
+        # in a conductor-worktree-shaped checkout WARNs with the
+        # advisory facet named
+        repo = _make_repo(tmp_path, "wt", SSH, residue_branch=True)
+        _pin_canonical(monkeypatch, _make_repo(tmp_path, "canon", SSH))
+        monkeypatch.chdir(repo)
+        rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        rows = _provenance_rows(payload)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "WARN"
+        assert "branch_merge_tracking" in rows[0]["message"]
+        assert rc == 0
+        assert payload["summary"]["fail"] == 0
+
+    def test_t4_retargeted_tracking_remote_still_fails_strict(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # the escalation lane survives for the class it was built for:
+        # tracking REMOTE off origin (pushes retargetable, the
+        # 2026-09-29 class) FAILs the canonical row with ONLY
+        # branch_tracking drifted — no origin_match drift needed
+        repo = _make_repo(tmp_path, "canon", SSH)
+        _git(repo, "config", "branch.master.remote", "other")
+        _pin_canonical(monkeypatch, repo)
+        monkeypatch.chdir(repo)
+        report = provenance.check_state(provenance.read_state(repo))
+        assert report.drifted_facets == ["branch_tracking"]
+        assert report.advisory_facets == []
+        rc, payload = _run_doctor_json(tmp_path, monkeypatch, capsys)
+        rows = _provenance_rows(payload)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "FAIL"
+        assert "branch_tracking" in rows[0]["message"]
+        assert "branch_merge_tracking" not in rows[0]["message"]
+        assert "origin_match" not in rows[0]["message"]
+        assert "provenance --repair" in rows[0]["message"]
+        assert rc == 1
+        assert payload["summary"]["fail"] >= 1
+
+    def test_t5_audit_fails_on_residue_and_single_write_heals(
+        self, tmp_path
+    ):
+        # the explicit audit stays strict through the tier split:
+        # residue exits 1 naming the advisory facet; --repair performs
+        # exactly one write — the mechanical merge restore — and
+        # verifies after; the pinned fetch and carried pushurl are
+        # left byte-untouched (D6: repair() unchanged)
+        repo = _make_repo(tmp_path, "residue", SSH, residue_branch=True)
+        rc, out, err = _run_cli(["provenance", "--path", str(repo)])
+        assert rc == 1
+        assert "branch_merge_tracking" in out
+        assert "provenance --repair" in out
+        assert err == ""
+        rc, out, _err = _run_cli(
+            ["provenance", "--path", str(repo), "--repair"]
+        )
+        assert rc == 0
+        assert "provenance verified after repair" in out
+        assert out.count("│  repair:") == 1
+        assert "branch.master.merge: refs/heads/master" in out
+        assert _cfg(repo, "branch.master.merge") == "refs/heads/master"
+        assert _cfg(repo, "remote.origin.url") == SSH
+        assert _cfg(repo, "remote.origin.pushurl") == HTTPS
+        twin = _make_repo(tmp_path, "twin", SSH, residue_branch=True)
+        rc, out, _err = _run_cli(
+            ["provenance", "--path", str(twin), "--json", "--repair"]
+        )
+        payload = json.loads(out)
+        assert rc == 0
+        assert payload["healthy"] is True
+        assert payload["repair"] == [
+            "branch.master.merge: refs/heads/master"
+        ]
+
+    def test_t6_json_payload_carries_both_tiers(self, tmp_path):
+        # D5: advisory_facets alongside drifted_facets, composite
+        # branch_tracking kept — machine consumers see the tier split
+        repo = _make_repo(tmp_path, "residue", SSH, residue_branch=True)
+        rc, out, _ = _run_cli(
+            ["provenance", "--path", str(repo), "--json"]
+        )
+        payload = json.loads(out)
+        assert rc == 1
+        assert payload["advisory_facets"] == ["branch_merge_tracking"]
+        assert payload["drifted_facets"] == []
+        assert payload["facets"]["branch_tracking"] is False
+        assert payload["healthy"] is False
+        healthy = _make_repo(tmp_path, "healthy", SSH)
+        rc, out, _ = _run_cli(
+            ["provenance", "--path", str(healthy), "--json"]
+        )
+        payload = json.loads(out)
+        assert rc == 0
+        assert payload["advisory_facets"] == []
+        assert payload["drifted_facets"] == []
+
+    def test_t7_summary_wording_names_the_tier(self):
+        # pure verdict wording (D4) plus the D1 edge cases: strict-only
+        # / advisory-only / both / unset tracking remote (strict) /
+        # unset merge with remote=origin (advisory)
+        def _report(fetch, branch_remote, branch_merge):
+            state = provenance.RepoRemoteState(
+                repo=Path("/fixture"),
+                repo_readable=True,
+                fetch_url=fetch,
+                push_url=None,
+                branch="master",
+                branch_remote=branch_remote,
+                branch_merge=branch_merge,
+            )
+            return provenance.check_state(state)
+
+        strict_only = _report(HTTPS, "origin", "refs/heads/master")
+        assert strict_only.drifted_facets == ["origin_match"]
+        assert strict_only.advisory_facets == []
+        assert strict_only.summary().startswith("drift in origin_match: ")
+
+        advisory_only = _report(
+            SSH, "origin", "refs/heads/fix/issue-52-retrospective-contract"
+        )
+        assert advisory_only.branch_tracking is False  # composite stays
+        assert advisory_only.drifted_facets == []
+        assert advisory_only.advisory_facets == ["branch_merge_tracking"]
+        assert advisory_only.summary().startswith(
+            "advisory drift in branch_merge_tracking: "
+        )
+
+        both = _report(
+            HTTPS, "origin", "refs/heads/fix/issue-52-retrospective-contract"
+        )
+        assert both.drifted_facets == ["origin_match"]
+        assert both.advisory_facets == ["branch_merge_tracking"]
+        assert both.summary().startswith(
+            "drift in origin_match (advisory: branch_merge_tracking): "
+        )
+
+        unset_remote = _report(SSH, None, "refs/heads/master")
+        assert unset_remote.drifted_facets == ["branch_tracking"]
+        assert unset_remote.advisory_facets == []
+
+        merge_unset = _report(SSH, "origin", None)
+        assert merge_unset.drifted_facets == []
+        assert merge_unset.advisory_facets == ["branch_merge_tracking"]
 
 
 class TestProvenanceDoctorTargetSeam:
