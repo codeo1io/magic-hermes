@@ -844,13 +844,38 @@ def test_upstream_dreamer_maps_verifies_and_classifies_memories(tmp_path):
     assert len(runs) >= 4
 
 
-def test_historian_candidates_flow_through_user_memory_and_primer_dreamer(tmp_path):
+def test_historian_candidates_flow_through_user_memory_and_primer_dreamer(
+    monkeypatch, tmp_path
+):
     src = tmp_path / "src"
     src.mkdir()
     (src / "sample.py").write_text(
         "def durable_answer():\n    return 'primer-refresh-grounding'\n",
         encoding="utf-8",
     )
+    # Isolate the child's user-level config the way the sibling tests in this
+    # file do. CI seeds only a historian model under ~/.config/cortexkit, which
+    # leaves embedding at its default local provider
+    # (Xenova/all-MiniLM-L6-v2 via transformers.js). That provider downloads an
+    # ~87MB model from the HuggingFace hub on first use, inside this test's
+    # 120s dreamer budget — quick when the CDN is warm, a hard timeout when it
+    # is slow (observed failing three fresh CI runners on 2026-10-06). Seeding
+    # embedding "off" at the user level keeps promote-primers on the
+    # deterministic text-clustering path with no network dependency; the
+    # historian model key is preserved so historian_prepare stays ready.
+    user_home = tmp_path / "xdg"
+    user_dir = user_home / "cortexkit"
+    user_dir.mkdir(parents=True)
+    (user_dir / "magic-context.jsonc").write_text(
+        json.dumps(
+            {
+                "historian": {"pi": {"model": "anthropic/claude-sonnet-4-5"}},
+                "embedding": {"provider": "off"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
     config_dir = tmp_path / ".cortexkit"
     config_dir.mkdir()
     (config_dir / "magic-context.jsonc").write_text(

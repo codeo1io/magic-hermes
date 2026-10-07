@@ -25,10 +25,16 @@ adoption and the verdict is recorded in that adoption's entry.
 
 ## 2026-10-06 — adopt 0.45.0 (series jump 0.44.4 → 0.45.0)
 
-First live exercise of rm-016's series-jump guardrail (ROADMAP.md rm-016,
+Third bot exercise of rm-016's series-jump guardrail (ROADMAP.md rm-016,
 in_progress: "a series-change or fence-move release pauses for approval … or
-opens a PR instead of direct master push"). Facts, all re-verified
-2026-10-06:
+opens a PR instead of direct master push"), and the first whose
+historian-guard re-evaluation is durably recorded (below). Prior exercises:
+PR #42 "Adopt Magic Context v0.44.4 (series bump)" — bot-authored, merged
+by `codeo1io` 2026-10-01T14:20:11Z (`e35df17`; pin 0.43.2 → 0.44.4,
+`supported_series` 43 → 44) — and PR #41 "Adopt Magic Context v0.44.0
+(series bump)" — bot-authored, opened 2026-10-01T05:37:04Z, closed
+unmerged. The adoption-PR step itself landed 2026-09-29 (`cae53bc`), before
+both. Facts, all re-verified 2026-10-06:
 
 - **PR** [#46](https://github.com/codeo1io/magic-hermes/pull/46) "Adopt
   Magic Context v0.45.0 (series bump)", authored by `github-actions[bot]`
@@ -67,7 +73,11 @@ Next re-evaluation: at the next series adoption recorded in this ledger.
 
 - **Leg 1 — this entry**: the PR-gated series-jump path was exercised live,
   end to end — bot PR → green checks → maintainer merge → documented
-  rollback → release train on top.
+  rollback → release train on top. Not the first such exercise: PR #42
+  (merged `e35df17`, 2026-10-01) traversed the same path before this entry,
+  and PR #41 (closed unmerged, same day) exercised the open-then-close
+  side. rm-016 evidence for those adoptions was not recorded in this ledger
+  at the time.
 - Remaining acceptance legs ("three consecutive scheduled runs green")
   accrue from scheduled sync runs and are not tracked in this ledger.
 
