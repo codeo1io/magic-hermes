@@ -24,14 +24,30 @@ expectation, and no check. This module makes the repository its own owner:
   is an explicit operator act, idempotent, and refuses foreign
   repositories.
 
+A second incident split the branch-tracking verdict into two tiers
+(maestro finding d59758598379, 2026-10-07): the canonical checkout
+drifted to ``branch.master.merge=refs/heads/fix/...`` — same-origin
+residue of a ``git push -u`` to a fix branch, so every push still
+aimed at the right repository — and the strict doctor row FAILed the
+estate's operational contract over workflow noise. The tiers live on
+:class:`ProvenanceReport`: a tracking REMOTE that is not ``origin``
+(the 2026-09-29 class, finding 4bc6f3a5b0c1) is strict —
+:attr:`ProvenanceReport.drifted_facets`, FAILs the doctor's strict
+rows; same-origin merge-residue (d59758598379) is advisory —
+:attr:`ProvenanceReport.advisory_facets`, WARNs every doctor row
+while ``healthy`` — and the explicit ``provenance`` audit that keys
+its exit code on it — still fails until repaired.
+
 ``doctor`` surfaces the check through the context-scoped policy matrix
 resolved by ``cli._provenance_doctor_target`` (an explicit env pin and
-the estate canonical checkout FAIL on drift; a same-repo non-canonical
+the estate canonical checkout FAIL on strict drift and WARN on
+advisory residue; a same-repo non-canonical
 checkout WARNs advisingly; CI states a skip; foreign checkouts stay
 silent) and never writes; the CLI subcommand wiring lives in
 ``cli.py``.
 
-Ref: maestro finding 4bc6f3a5b0c1.
+Ref: maestro findings 4bc6f3a5b0c1 (strict tier) and d59758598379
+(advisory tier).
 """
 
 from __future__ import annotations
@@ -160,12 +176,19 @@ class RepoRemoteState:
 class ProvenanceReport:
     """Pure verdict over :class:`RepoRemoteState` — no git calls.
 
-    ``healthy`` ⇔ no drifted facet. ``origin_match`` mirrors the probe's
-    whole-string normalized equality exactly (healthy ⇒ probe PASS); the
-    pushurl and branch-tracking facets are deliberately stricter, because
-    this guard owns more of the 2026-09-29 incident than the probe gates
-    on. When the repo is unreadable, ``repo_readable`` is the only
-    drifted facet — the others were never evaluated.
+    ``healthy`` ⇔ audit-clean: no strict drift AND no advisory drift.
+    ``origin_match`` mirrors the probe's whole-string normalized
+    equality exactly (healthy ⇒ probe PASS); the pushurl and
+    branch-tracking facets are deliberately stricter, because this
+    guard owns more of the 2026-09-29 incident than the probe gates
+    on. Branch-tracking drift is TIERED (finding d59758598379): a
+    tracking remote that is not ``origin`` (finding 4bc6f3a5b0c1) —
+    pushes can be retargeted — is strict (:attr:`drifted_facets`);
+    same-origin merge-residue is advisory (:attr:`advisory_facets`):
+    it WARNs the doctor's rows while ``healthy`` — and the explicit
+    ``provenance`` audit keying its exit code on it — still fails
+    until repaired. When the repo is unreadable, ``repo_readable``
+    is the only drifted facet — the others were never evaluated.
     """
 
     repo: Path
@@ -186,6 +209,14 @@ class ProvenanceReport:
 
     @property
     def drifted_facets(self) -> list[str]:
+        """Security-bearing drift — the FAIL tier of the verdict.
+
+        ``branch_tracking`` is strict ONLY when the tracking REMOTE is
+        not ``origin`` — the 2026-09-29 incident class (finding
+        4bc6f3a5b0c1): a mangled or retargeted remote can silently
+        send pushes elsewhere. Same-origin merge-residue (finding
+        d59758598379) is NOT strict — see :attr:`advisory_facets`.
+        """
         if not self.repo_readable:
             return ["repo_readable"]
         facets: list[str] = []
@@ -193,13 +224,44 @@ class ProvenanceReport:
             facets.append("origin_match")
         if not self.pushurl_same_repo:
             facets.append("pushurl_same_repo")
-        if self.branch_tracking is False:
+        if self.branch_tracking is False and self.branch_remote != "origin":
             facets.append("branch_tracking")
         return facets
 
     @property
+    def advisory_facets(self) -> list[str]:
+        """Non-security drift — WARNs the doctor, still fails the audit.
+
+        Same-origin branch-tracking merge-residue (finding
+        d59758598379, 2026-10-07): ``branch.<b>.merge`` points at a
+        same-origin fix branch — the state ``git push -u origin
+        <fix-branch>`` leaves behind. Worst case is pushing to the
+        wrong branch of the RIGHT repository, and :func:`repair`
+        restores it mechanically, so the doctor's operational rows
+        WARN instead of FAILing — while ``healthy`` (hence the
+        explicit ``provenance`` audit) stays False until repaired.
+        Named ``branch_merge_tracking`` to stay distinct from the
+        strict ``branch_tracking`` facet. Unreachable when the repo
+        is unreadable or the HEAD is detached (``branch_tracking``
+        is None — branch tracking does not apply).
+        """
+        if (
+            self.branch_tracking is False
+            and self.branch_remote == "origin"
+        ):
+            return ["branch_merge_tracking"]
+        return []
+
+    @property
     def healthy(self) -> bool:
-        return not self.drifted_facets
+        """Audit-clean: no strict AND no advisory drift.
+
+        The explicit ``magic-hermes provenance`` audit keys its exit
+        code on this, so advisory residue still exits 1 there; only
+        the doctor's operational-contract rows downgrade advisory
+        drift to WARN.
+        """
+        return not self.drifted_facets and not self.advisory_facets
 
     def summary(self) -> str:
         """One-line human verdict naming fetch/push URLs and drift."""
@@ -221,7 +283,16 @@ class ProvenanceReport:
             bits.append("no current branch (detached HEAD)")
         if self.healthy:
             return ", ".join(bits)
-        return f"drift in {', '.join(self.drifted_facets)}: " + ", ".join(bits)
+        drift = ", ".join(self.drifted_facets)
+        advisory = ", ".join(self.advisory_facets)
+        if drift and advisory:
+            return (
+                f"drift in {drift} (advisory: {advisory}): "
+                + ", ".join(bits)
+            )
+        if advisory:
+            return f"advisory drift in {advisory}: " + ", ".join(bits)
+        return f"drift in {drift}: " + ", ".join(bits)
 
 
 @dataclass

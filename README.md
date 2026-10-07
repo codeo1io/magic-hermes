@@ -219,6 +219,19 @@ magic-hermes provenance --json                 # machine-readable report + repai
   restores the SSH fetch URL, carries the HTTPS URL to `pushurl`, and
   restores `branch.master.remote=origin` /
   `branch.master.merge=refs/heads/master`.
+- The verdict is **tiered** since finding d59758598379 (2026-10-07):
+  the canonical checkout drifted to
+  `branch.master.merge=refs/heads/fix/…` — same-origin residue of a
+  `git push -u` to a fix branch, every push still aimed at the right
+  repository — and the strict doctor row FAILed the estate's
+  operational contract over workflow noise. Facets that can retarget
+  a push — origin mismatch, foreign `pushurl`, a tracking remote that
+  is not `origin` (finding 4bc6f3a5b0c1) — stay **strict**: they FAIL
+  the doctor's strict rows (the escalation lane). Same-origin
+  merge-residue is **advisory** (`branch_merge_tracking`): it WARNs
+  every doctor row — the maestro contract (`rc==0`, `FAIL 0`) stays
+  green through benign residue — while the explicit `provenance`
+  audit still exits 1 and names the repair.
 
 The check also runs without an installed console script — a bare
 checkout, no `pip install`, no `.venv` (the package is stdlib-only).
@@ -236,12 +249,14 @@ earlier remediation plan assumed. (`python -m magic_hermes.provenance`
 used to exit 0 silently; with the `__main__` guard it now behaves
 exactly like the subcommand.)
 
-`doctor` surfaces the check only when `MAGIC_HERMES_PROVENANCE_REPO`
-points at the checkout to inspect: PASS when healthy, WARN when drifted
-or unreadable — never FAIL, and never a config write on doctor's behalf
-(repair stays an explicit operator act). With the variable unset the
-check is omitted entirely, so default doctor output is unchanged (CI
-clones over HTTPS and must not WARN against the SSH pin).
+`doctor` surfaces the check standing, scoped by context: strict rows —
+an explicit `MAGIC_HERMES_PROVENANCE_REPO` pin and the estate
+canonical checkout `/work/projects/magic-hermes` — FAIL on strict
+drift and WARN on advisory residue; a same-repo non-canonical checkout
+(conductor worktrees, HTTPS dev clones) WARNs advisingly; CI states an
+INFO skip (HTTPS clones are the norm there); foreign checkouts stay
+silent. In every row the doctor never writes — repair stays an
+explicit operator act (`magic-hermes provenance --repair`).
 
 ### 2. Manual install (fallback)
 
