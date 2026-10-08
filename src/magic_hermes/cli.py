@@ -455,6 +455,36 @@ def db_schema_lane(db_path: Path) -> int | None:
     return int(row[0]) if row and row[0] is not None else None
 
 
+# Upstream's storage-fence refusal sentence (finding c7d63424): the
+# stable user-facing form @cortexkit/pi-magic-context prints when the
+# shared store's migration lane exceeds what the running binary
+# supports. It is the authoritative source for the store/support lane
+# numbers — the typed verdict below never derives them from the store
+# or the bundle itself, so a minified bundle or a lane arithmetic
+# change upstream cannot desync this match from the refusal it types.
+_LANE_SKEW_FENCE_RE = re.compile(
+    r"upstream migration lane v([0-9]+) is newer than this binary "
+    r"supports \(max v([0-9]+)\)"
+)
+
+
+def _shared_store_lane_skew(failures: list[str]) -> tuple[int, int] | None:
+    """Return (store_lane, supported_max) when the fence refused the store.
+
+    Searches every accumulated sidecar failure text — a fence refusal
+    repeats in each fast-fail retry, and only one typed row is wanted.
+    No match returns None and the caller keeps today's generic
+    sidecar-failure row (fail-open: an upstream rewording degrades to
+    the old verdict, never to a crash or a masked verdict).
+    """
+
+    for text in failures:
+        match = _LANE_SKEW_FENCE_RE.search(text)
+        if match is not None:
+            return int(match.group(1)), int(match.group(2))
+    return None
+
+
 def _doctor_wall_budget_s() -> float:
     """Resolve the doctor's total wall budget (U15, finding c7d63424).
 
@@ -787,7 +817,37 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                 "'magic-hermes doctor --full-integrity'",
             )
         elif not sidecar_healthy:
-            if len(sidecar_failures) == 2:
+            # Typed lane-skew verdict (finding c7d63424): when upstream's
+            # storage fence refused the shared store, the generic
+            # sidecar-failure row hides the actionable cause. The typed
+            # row REPLACES it (exactly one FAIL either way, D5), quotes
+            # the fence's own numbers, and names the sanctioned adoption
+            # path — never a write: repair is an explicit operator act.
+            # The underlying refusal text stays quoted for evidence.
+            skew = _shared_store_lane_skew(sidecar_failures)
+            if skew is not None:
+                store_lane, supported_max = skew
+                if len(sidecar_failures) == 2:
+                    underlying = (
+                        f"{sidecar_failures[0]} (fast-fail retry) "
+                        f"{sidecar_failures[1]}"
+                    )
+                else:
+                    underlying = sidecar_failures[0]
+                report.add(
+                    "FAIL",
+                    "Magic Context shared-store lane skew: the shared store "
+                    f"is on migration lane v{store_lane}, newer than the "
+                    "validated @cortexkit/pi-magic-context supports (max "
+                    f"v{supported_max}) — a newer copy on this machine "
+                    "migrated the store (see the Other copies / "
+                    "version-drift rows); adopt the newer series via "
+                    "scripts/next_magic_context_release.py + "
+                    "scripts/sync_magic_context_release.py (series jumps "
+                    "are PR-gated), release, then run `magic-hermes "
+                    f"install`. Underlying failure: {underlying}",
+                )
+            elif len(sidecar_failures) == 2:
                 report.add(
                     "FAIL",
                     f"{sidecar_failures[0]} (fast-fail retry) "

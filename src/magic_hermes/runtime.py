@@ -190,6 +190,28 @@ def magic_context_package_candidates() -> list[Path]:
         ]
     )
 
+    # Widened discovery (finding c7d63424): the breaking newer copy
+    # lived only in a non-default Pi profile root
+    # (~/.pi/agent-cliproxy-only/npm) that no candidate above covers,
+    # so the doctor could not see the copy that migrated the shared
+    # store ahead of the validated pin. Every Pi profile's npm root and
+    # OMP's own npm root are scanned AFTER the fixed candidates, so the
+    # Hermes-managed root still wins and the resolve-dedupe below drops
+    # the re-found default-profile copy. glob ignores unreadable or
+    # dangling profile directories instead of failing the scan.
+    for profile_copy in sorted(
+        (home / ".pi").glob("*/npm/node_modules/@cortexkit/pi-magic-context")
+    ):
+        candidates.append(profile_copy)
+    candidates.append(
+        home
+        / ".omo"
+        / "npm"
+        / "node_modules"
+        / "@cortexkit"
+        / "pi-magic-context"
+    )
+
     for base in (Path.cwd(), runtime_script_path().parent):
         for parent in (base, *base.parents):
             candidates.append(

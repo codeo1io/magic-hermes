@@ -258,6 +258,25 @@ INFO skip (HTTPS clones are the norm there); foreign checkouts stay
 silent. In every row the doctor never writes — repair stays an
 explicit operator act (`magic-hermes provenance --repair`).
 
+The shared store's migration lane joins the same row vocabulary
+(finding c7d63424: a newer `@cortexkit/pi-magic-context` copy living
+only in a non-default Pi profile migrated the shared store ahead of
+the validated pin, and the sidecar refused to open it). When that
+refusal names a migration lane newer than the binary supports,
+`doctor` renders a typed **FAIL** — shared-store lane skew — quoting
+the fence's own lane numbers and pointing at the sanctioned adoption
+path: `scripts/next_magic_context_release.py` +
+`scripts/sync_magic_context_release.py` (series jumps are PR-gated),
+release, then `magic-hermes install` — not upstream's
+`npx @cortexkit/magic-context@latest doctor --force` advice, which
+does not re-pin Hermes. Discovery meanwhile covers every copy the
+schema fence can follow — all Pi profile roots (`~/.pi/*/npm`), the
+OMP home (`~/.omo/npm`), and the classic Pi/OpenCode locations — and
+the version-drift WARN fires when any discovered copy is newer than
+the build-validated pin, not just the primary, because the shared
+store migrates with the newest copy on the machine. Here too the
+doctor never writes.
+
 ### 2. Manual install (fallback)
 
 Magic-Hermes delegates its context-management implementation to the official Magic

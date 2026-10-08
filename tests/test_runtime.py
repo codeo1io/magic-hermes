@@ -398,3 +398,116 @@ def test_dispose_kills_the_process_group_on_posix(monkeypatch):
 
     assert signals == [(999111, signal.SIGTERM)]
     assert "SIGTERM" not in process.terminated  # group kill replaced bare terminate
+
+
+def _make_package(root, version):
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "package.json").write_text(
+        json.dumps({"name": "@cortexkit/pi-magic-context", "version": version}),
+        encoding="utf-8",
+    )
+    (root / "dist").mkdir(exist_ok=True)
+    (root / "dist" / "index.js").write_text("// stub\n", encoding="utf-8")
+    return root
+
+
+class TestDiscoveryWidening:
+    """U1 (finding c7d63424) — candidates cover every Pi profile root and
+    the OMP home, appended after the fixed candidates, deduped, with the
+    env override still first.
+
+    The breaking newer copy lived only in ~/.pi/agent-cliproxy-only/npm;
+    before this unit no candidate family scanned it, so the doctor could
+    not see the copy that migrated the shared store ahead of the pin.
+    """
+
+    @staticmethod
+    def _isolate_home(monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        script = tmp_path / "runtime.mjs"
+        script.write_text("", encoding="utf-8")
+        monkeypatch.setattr(runtime.Path, "home", lambda: home)
+        monkeypatch.setattr(runtime, "runtime_script_path", lambda: script)
+        monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
+        monkeypatch.delenv("MAGIC_CONTEXT_PACKAGE_ROOT", raising=False)
+        # keep the cwd-walk tail inside the fabricated tree
+        monkeypatch.chdir(tmp_path)
+        return home
+
+    def test_all_profile_and_omo_copies_discovered_in_order(
+        self, monkeypatch, tmp_path
+    ):
+        home = self._isolate_home(monkeypatch, tmp_path)
+        managed = _make_package(
+            home / ".local" / "share" / "magic-hermes" / "node_modules"
+            / "@cortexkit" / "pi-magic-context",
+            "0.45.0",
+        )
+        default_pi = _make_package(
+            home / ".pi" / "agent" / "npm" / "node_modules" / "@cortexkit"
+            / "pi-magic-context",
+            "0.45.0",
+        )
+        cliproxy = _make_package(
+            home / ".pi" / "agent-cliproxy-only" / "npm" / "node_modules"
+            / "@cortexkit" / "pi-magic-context",
+            "0.46.0",
+        )
+        omo = _make_package(
+            home / ".omo" / "npm" / "node_modules" / "@cortexkit"
+            / "pi-magic-context",
+            "0.45.0",
+        )
+
+        candidates = runtime.magic_context_package_candidates()
+        resolved = [str(c) for c in candidates]
+
+        assert resolved[0] == str(managed.resolve()), "managed root stays first"
+        for copy in (managed, default_pi, cliproxy, omo):
+            key = str(copy.resolve())
+            assert resolved.count(key) == 1, f"{key} must appear exactly once"
+        # fixed families stay ahead of the widened glob family (D6)
+        assert resolved.index(str(default_pi.resolve())) < resolved.index(
+            str(cliproxy.resolve())
+        )
+        assert runtime.find_magic_context_package() == managed.resolve()
+
+    def test_profile_without_package_or_broken_profile_contributes_nothing(
+        self, monkeypatch, tmp_path
+    ):
+        home = self._isolate_home(monkeypatch, tmp_path)
+        _make_package(
+            home / ".pi" / "agent" / "npm" / "node_modules" / "@cortexkit"
+            / "pi-magic-context",
+            "0.45.0",
+        )
+        # a profile dir whose npm root has no upstream package
+        (home / ".pi" / "bare-profile" / "npm").mkdir(parents=True)
+        # a dangling profile symlink must not crash the glob
+        (home / ".pi" / "broken-profile").symlink_to(home / ".no-such-target")
+
+        candidates = runtime.magic_context_package_candidates()
+
+        assert not any("bare-profile" in str(c) for c in candidates)
+        assert not any("broken-profile" in str(c) for c in candidates)
+        assert any(
+            str(c).endswith(".pi/agent/npm/node_modules/@cortexkit/"
+                            "pi-magic-context")
+            for c in candidates
+        )
+
+    def test_override_root_still_wins_and_is_first(self, monkeypatch, tmp_path):
+        home = self._isolate_home(monkeypatch, tmp_path)
+        override = _make_package(tmp_path / "override-pkg", "0.45.0")
+        _make_package(
+            home / ".pi" / "agent-cliproxy-only" / "npm" / "node_modules"
+            / "@cortexkit" / "pi-magic-context",
+            "0.46.0",
+        )
+        monkeypatch.setenv("MAGIC_CONTEXT_PACKAGE_ROOT", str(override))
+
+        candidates = runtime.magic_context_package_candidates()
+
+        assert candidates[0] == override.resolve()
+        assert runtime.find_magic_context_package() == override.resolve()

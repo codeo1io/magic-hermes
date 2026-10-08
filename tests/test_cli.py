@@ -957,3 +957,188 @@ class TestDoctorSkipWording:
         assert "WARN" in out
         assert "deadline" in out
         assert "probe reads succeeded" in out
+
+
+class TestDoctorOtherCopiesRow:
+    """U1 (finding c7d63424) — widened discovery makes the doctor's
+    enumeration honest: every discovered copy beyond the primary renders
+    in ONE INFO row, version per copy, so the copy that migrated the
+    shared store is visible in the verdict itself.
+    """
+
+    @staticmethod
+    def _wire_config():
+        config = Path(cli.hermes_config_path())
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n"
+            "  engine: magic-context\n"
+            "memory:\n"
+            "  provider: magic_context\n"
+            "plugins:\n"
+            "  enabled:\n"
+            "    - magic-hermes\n",
+            encoding="utf-8",
+        )
+
+    def test_multiple_copies_render_one_info_row_with_versions(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        self._wire_config()
+
+        tested = cli.tested_magic_context_version()
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+        primary = make_package(tmp_path / "managed-pkg", tested)
+        newer = make_package(tmp_path / "cliproxy-pkg", "0.46.0")
+        unreadable = tmp_path / "omo-pkg"
+        unreadable.mkdir()
+        (unreadable / "package.json").write_text("{", encoding="utf-8")
+        (unreadable / "dist").mkdir()
+        (unreadable / "dist" / "index.js").write_text("", encoding="utf-8")
+
+        sidecar = mock.MagicMock()
+        sidecar.call.side_effect = lambda method, params=None, timeout=60: {
+            "hello": {"harness": "hermes", "package_version": tested},
+            "doctor": {
+                "database_health": "ok",
+                "core_symbols_ready": True,
+                "supported_series": series,
+            },
+        }[method]
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+
+        with (
+            mock.patch.object(
+                cli,
+                "discover_installations",
+                return_value=[
+                    (primary, tested),
+                    (newer, "0.46.0"),
+                    (unreadable, None),
+                ],
+            ),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+        ):
+            code = cli.run_doctor(json_output=False)
+        out = capsys.readouterr().out
+        assert code == 0
+        assert out.count("Other copies discovered:") == 1
+        assert f"0.46.0 @ {newer}" in out
+        assert f"? @ {unreadable}" in out
+
+
+class TestDoctorLaneSkewVerdict:
+    """U3 (finding c7d63424) — a sidecar refusal naming upstream's storage
+    fence renders ONE typed FAIL row (shared-store lane skew) with the
+    fence's own lane numbers, the sanctioned adoption path, and the
+    underlying refusal quoted; any other failure keeps today's generic
+    row unchanged (fail-open, D1). The typed row REPLACES the generic one
+    (D5): a skew estate still renders exactly FAIL 1.
+    """
+
+    # the exact stderr shape the fence refusal produces through the
+    # RuntimeClient exit-error path (sentence verified against the
+    # upstream 0.46.0 bundle: "upstream migration lane vN is newer than
+    # this binary supports (max vM).")
+    FENCE_TEXT = (
+        "Runtime exited during hello (status 1); "
+        "stderr: [magic-context] storage fatal: refusing to open "
+        "/home/agent/.local/share/cortexkit/magic-context/context.db; "
+        "upstream migration lane v95 is newer than this binary supports "
+        "(max v94). A pinned or stale plugin is likely sharing this "
+        "database with a newer instance; update or unpin Magic Context "
+        "with 'npx @cortexkit/magic-context@latest doctor --force', "
+        "then restart."
+    )
+
+    def _run(self, tmp_path, monkeypatch, isolated_home, scripts, **kwargs):
+        harness = TestDoctorSidecarRetry()
+        return harness._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, scripts, **kwargs
+        )
+
+    def test_fence_refusal_renders_one_typed_fail_row(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        calls = {"n": 0}
+
+        def fence(method, tested, series):
+            calls["n"] += 1
+            raise RuntimeError(f"{self.FENCE_TEXT} tail-{calls['n']}")
+
+        code, attempts = self._run(
+            tmp_path, monkeypatch, isolated_home, [fence, fence]
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert len(attempts) == 2  # fast-fail retry still happens
+        assert out.count("◆  FAIL") == 1  # typed row REPLACES, not adds (D5)
+        assert "shared-store lane skew" in out
+        assert "lane v95" in out
+        assert "max v94" in out
+        # D3: the sanctioned adoption path, not upstream's npx advice,
+        # is the guidance
+        assert "scripts/next_magic_context_release.py" in out
+        assert "scripts/sync_magic_context_release.py" in out
+        assert "PR-gated" in out
+        assert "magic-hermes install" in out
+        # the underlying refusal stays quoted for evidence (both tails)
+        assert "storage fatal" in out
+        assert "tail-1" in out and "tail-2" in out
+        # one-FAIL-row count semantics: the summary still says FAIL 1
+        assert "/ FAIL 1" in out
+        # wording invariant: no FAIL-status message hides "FAIL 0"
+        for line in out.splitlines():
+            if "◆  FAIL" in line:
+                assert "FAIL 0" not in line
+
+    def test_generic_failure_keeps_the_generic_row_unchanged(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        calls = {"n": 0}
+
+        def always_fail(method, tested, series):
+            calls["n"] += 1
+            raise RuntimeError(
+                f"Runtime exited during {method} (status 1); "
+                f"stderr: SQLITE_BUSY tail-{calls['n']}"
+            )
+
+        code, _ = self._run(
+            tmp_path, monkeypatch, isolated_home, [always_fail, always_fail]
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert out.count("◆  FAIL") == 1
+        assert "shared-store lane skew" not in out  # fail-open (D1)
+        assert "Magic Context sidecar failed:" in out
+        assert "(fast-fail retry)" in out
+        assert "tail-1" in out and "tail-2" in out
+
+    def test_fence_refusal_on_slow_single_failure_renders_typed_row(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        def slow_fence(method, tested, series):
+            raise RuntimeError(f"{self.FENCE_TEXT} tail-slow")
+
+        # a zero gate makes the failure "slow": no retry, one text —
+        # the typed verdict must not depend on the retry shape
+        code, attempts = self._run(
+            tmp_path, monkeypatch, isolated_home, [slow_fence], fast_fail_s=0.0
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert len(attempts) == 1
+        assert out.count("◆  FAIL") == 1
+        assert "shared-store lane skew" in out
+        assert "lane v95" in out and "max v94" in out
+        assert "tail-slow" in out
+        assert "(fast-fail retry)" not in out
