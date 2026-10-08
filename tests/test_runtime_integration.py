@@ -251,9 +251,15 @@ def test_official_runtime_indexes_tools_memories_and_compartments(tmp_path):
         assert "<session-history>" in rendered_text
         assert rendered["synthetic_leading_count"] == 2
 
-        # Historian completion is an upstream note-nudge trigger. The first
-        # render anchors/defer-delivers on the trigger-time user message; the
-        # next user turn receives the canonical deferred-note instruction.
+        # Historian completion is an upstream note-nudge trigger. Magic
+        # Context 0.46.0 rewrote nudge delivery: the render that applies the
+        # freshly published history is a cache-busting pass, which upstream's
+        # new serve-eligibility treats as a first-serve delivery, so the
+        # canonical deferred-note instruction lands on the trigger-time user
+        # message, anchored sticky; later renders replay it on that same
+        # anchored message, and a cooldown keeps following user turns from
+        # receiving a second copy. (0.45.0 instead deferred past the
+        # trigger-time message and delivered on the next user turn.)
         followup = [*messages, {"role": "user", "content": "Continue after historian."}]
         nudged = client.call(
             "render_context",
@@ -263,12 +269,26 @@ def test_official_runtime_indexes_tools_memories_and_compartments(tmp_path):
                 "history_budget_tokens": 8_000,
             },
         )
+        trigger_user = next(
+            message
+            for message in nudged["messages"]
+            if "amber-10" in str(message.get("content", ""))
+        )
         followup_user = next(
             message
             for message in nudged["messages"]
             if "Continue after historian." in str(message.get("content", ""))
         )
-        assert '<instruction name="deferred_notes">' in followup_user["content"]
+        if supported_magic_context_series() >= (0, 46):
+            # Sticky replay keeps the delivered nudge anchored to the
+            # trigger-time user message ...
+            assert '<instruction name="deferred_notes">' in trigger_user["content"]
+            assert "Recheck the runtime adapter" in trigger_user["content"]
+            # ... and the delivery cooldown means the new user turn does not
+            # carry a second nudge.
+            assert '<instruction name="deferred_notes">' not in followup_user["content"]
+        else:
+            assert '<instruction name="deferred_notes">' in followup_user["content"]
 
     with RuntimeClient(db_path=db_path, timeout=60) as restarted:
         restarted.call(
