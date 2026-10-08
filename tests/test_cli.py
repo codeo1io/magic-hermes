@@ -256,6 +256,211 @@ class TestDoctorReport:
         assert cli.db_schema_lane(fake_db) == 99
 
 
+class TestDoctorVersionDrift:
+    """U2 (finding c7d63424) — the version-drift WARN is keyed to every
+    discovered installation, not just the primary copy: in the breaking
+    configuration the Hermes-managed copy still matches the build's
+    validated pin while a newer copy elsewhere on the machine has
+    already forward-migrated the shared store, so a primary-only
+    comparison can never fire."""
+
+    @staticmethod
+    def _wire_config():
+        config = Path(cli.hermes_config_path())
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n"
+            "  engine: magic-context\n"
+            "memory:\n"
+            "  provider: magic_context\n"
+            "plugins:\n"
+            "  enabled:\n"
+            "    - magic-hermes\n",
+            encoding="utf-8",
+        )
+
+    def _run_doctor_with_installations(
+        self, tmp_path, monkeypatch, isolated_home, installations
+    ):
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        self._wire_config()
+
+        tested = cli.tested_magic_context_version()
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+        sidecar = mock.MagicMock()
+        sidecar.call.side_effect = lambda method, params=None, timeout=60: {
+            "hello": {"harness": "hermes", "package_version": tested},
+            "doctor": {
+                "database_health": "ok",
+                "core_symbols_ready": True,
+                "supported_series": series,
+            },
+        }[method]
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+
+        with (
+            mock.patch.object(
+                cli, "discover_installations", return_value=installations
+            ),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+        ):
+            code = cli.run_doctor(json_output=False)
+        return code
+
+    @staticmethod
+    def _relative_versions():
+        pin = cli._semver_tuple(cli.tested_magic_context_version())
+        newer = f"{pin[0]}.{pin[1] + 1}.{pin[2]}"
+        older = f"{pin[0]}.{pin[1] - 1}.{pin[2]}"
+        return newer, older
+
+    def test_newer_foreign_copy_warns_even_when_primary_matches(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        """The incident shape: the primary (Hermes-managed) copy still
+        matches the validated pin while a newer copy elsewhere on the
+        machine has already forward-migrated the shared store — the
+        primary-only comparison could never see it."""
+        tested = cli.tested_magic_context_version()
+        newer, _older = self._relative_versions()
+        primary = make_package(tmp_path / "managed", tested)
+        foreign = make_package(
+            isolated_home / ".pi" / "agent-cliproxy-only" / "npm"
+            / "node_modules" / "@cortexkit" / "pi-magic-context",
+            newer,
+        )
+        code = self._run_doctor_with_installations(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            [(primary, tested), (foreign, newer)],
+        )
+        out = capsys.readouterr().out
+        assert code == 0  # drift is WARN, not FAIL (D2)
+        assert out.count("fence follows the newest copy") == 1
+        assert f"newer than the validated v{tested}: {newer} @ {foreign}" in out
+        # D3: the sanctioned adoption path, not upstream's npx advice
+        assert "scripts/next_magic_context_release.py" in out
+        assert "scripts/sync_magic_context_release.py" in out
+        assert "PR-gated" in out
+        assert "magic-hermes install" in out
+        # the primary PASS rows are unchanged
+        assert f"{cli.UPSTREAM_PACKAGE} {tested} found at {primary}" in out
+        assert "matches the version validated by this build" in out
+        # honesty invariant: the verdict string never rides in the row
+        # itself (the summary line's own FAIL 0 is the contract, not a row)
+        drift_row = next(
+            line for line in out.splitlines() if "fence follows the newest copy" in line
+        )
+        assert "FAIL 0" not in drift_row
+
+    def test_all_copies_matching_pin_render_no_drift_warning(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested = cli.tested_magic_context_version()
+        primary = make_package(tmp_path / "managed", tested)
+        second = make_package(
+            isolated_home / ".pi" / "agent" / "npm" / "node_modules"
+            / "@cortexkit" / "pi-magic-context",
+            tested,
+        )
+        code = self._run_doctor_with_installations(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            [(primary, tested), (second, tested)],
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "newer than the validated" not in out
+        assert "fence follows the newest copy" not in out
+
+    def test_primary_newer_than_pin_still_warns_once(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        """No regression: the estate the old primary-only WARN covered
+        (the primary itself newer) still renders exactly one WARN, now
+        naming the copy and the adoption path."""
+        tested = cli.tested_magic_context_version()
+        newer, _older = self._relative_versions()
+        primary = make_package(tmp_path / "managed", newer)
+        code = self._run_doctor_with_installations(
+            tmp_path, monkeypatch, isolated_home, [(primary, newer)]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert out.count("fence follows the newest copy") == 1
+        assert f"newer than the validated v{tested}: {newer} @ {primary}" in out
+        # a newer primary renders neither the PASS-match nor the differs row
+        assert "matches the version validated by this build" not in out
+        assert "differs from validated" not in out
+        drift_row = next(
+            line for line in out.splitlines() if "fence follows the newest copy" in line
+        )
+        assert "FAIL 0" not in drift_row
+
+    def test_older_foreign_copy_alone_does_not_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested = cli.tested_magic_context_version()
+        _newer, older = self._relative_versions()
+        primary = make_package(tmp_path / "managed", tested)
+        foreign = make_package(
+            isolated_home / ".omo" / "npm" / "node_modules" / "@cortexkit"
+            / "pi-magic-context",
+            older,
+        )
+        code = self._run_doctor_with_installations(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            [(primary, tested), (foreign, older)],
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "newer than the validated" not in out
+        assert "fence follows the newest copy" not in out
+        assert "matches the version validated by this build" in out
+
+    def test_primary_older_with_newer_foreign_warns_and_keeps_info_row(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        """D1 max-over-all: the WARN keys off the newest copy anywhere,
+        while the older-primary INFO row is unchanged and only strictly
+        newer copies are named."""
+        tested = cli.tested_magic_context_version()
+        newer, older = self._relative_versions()
+        primary = make_package(tmp_path / "managed", older)
+        foreign = make_package(
+            isolated_home / ".pi" / "agent-cliproxy-only" / "npm"
+            / "node_modules" / "@cortexkit" / "pi-magic-context",
+            newer,
+        )
+        code = self._run_doctor_with_installations(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            [(primary, older), (foreign, newer)],
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert out.count("fence follows the newest copy") == 1
+        assert f"{newer} @ {foreign}" in out
+        assert f"{older} @ {primary}" not in out  # only newer copies named
+        assert f"Upstream {older} differs from validated v{tested}" in out
+        drift_row = next(
+            line for line in out.splitlines() if "fence follows the newest copy" in line
+        )
+        assert "FAIL 0" not in drift_row
+
+
 class TestGuardParser:
     def test_guard_subcommand_accepts_all_three_actions(self):
         parser = cli.build_parser()
