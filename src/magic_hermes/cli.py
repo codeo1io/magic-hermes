@@ -94,6 +94,20 @@ def _semver_tuple(version: str) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups()[:3])  # type: ignore[return-value]
 
 
+# Typed shared-store lane-skew detection (finding c7d63424, plan U3):
+# when a newer @cortexkit/pi-magic-context on the machine has already
+# forward-migrated the shared store, upstream's storage fence refuses
+# the open with this stable user-facing sentence.  The doctor quotes the
+# lane numbers straight from upstream's message (the authoritative
+# source) instead of deriving them from the bundle or the store, and
+# fails open to the generic sidecar-failure row when upstream rewords
+# it.
+_LANE_SKEW_FENCE = re.compile(
+    r"upstream migration lane v(\d+) is newer than this binary supports "
+    r"\(max v(\d+)\)"
+)
+
+
 # ---------------------------------------------------------------------------
 # detection helpers
 # ---------------------------------------------------------------------------
@@ -788,13 +802,44 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
             )
         elif not sidecar_healthy:
             if len(sidecar_failures) == 2:
-                report.add(
-                    "FAIL",
+                combined_failures = (
                     f"{sidecar_failures[0]} (fast-fail retry) "
-                    f"{sidecar_failures[1]}",
+                    f"{sidecar_failures[1]}"
                 )
             else:
-                report.add("FAIL", sidecar_failures[0])
+                combined_failures = sidecar_failures[0]
+            # Typed verdict (plan U3/D5): a lane-skew fence refusal renders
+            # ONE actionable FAIL row that REPLACES the generic one, so a
+            # skewed estate still counts exactly FAIL 1 for maestro's
+            # contract.  The match runs over the raw failure texts joined
+            # by spaces (the "Magic Context sidecar failed:" wrapper this
+            # function adds is stripped first), so a fence sentence split
+            # across the fast-fail retry pair still matches; the rendered
+            # evidence keeps the wrapper and retry marker.  No match fails
+            # open to today's generic row, byte-for-byte.
+            lane_skew = _LANE_SKEW_FENCE.search(
+                " ".join(
+                    failure.removeprefix("Magic Context sidecar failed: ")
+                    for failure in sidecar_failures
+                )
+            )
+            if lane_skew is not None:
+                store_lane, binary_max = lane_skew.group(1), lane_skew.group(2)
+                report.add(
+                    "FAIL",
+                    "Magic Context shared-store lane skew: the shared store's "
+                    f"migration lane v{store_lane} is newer than the validated "
+                    f"upstream's supported max v{binary_max} — a newer copy "
+                    f"of {UPSTREAM_PACKAGE} on this machine already migrated "
+                    "the shared store (see the 'Other copies discovered' row "
+                    "and the version-drift warning). Adopt the newer series "
+                    "via scripts/next_magic_context_release.py + "
+                    "scripts/sync_magic_context_release.py (series jumps are "
+                    "PR-gated), release, then `magic-hermes install`. "
+                    f"Underlying failure: {combined_failures}",
+                )
+            else:
+                report.add("FAIL", combined_failures)
         if isinstance(bridge, dict):
             health = str(bridge.get("database_health", "unknown"))
             if health == "ok":

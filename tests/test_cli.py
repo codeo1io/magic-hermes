@@ -528,6 +528,80 @@ class TestDoctorGuardPosture:
         assert payload["summary"]["fail"] == 0
 
 
+class TestDoctorInstallEnumeration:
+    """U1 (finding c7d63424) — every discovered copy shows up in the
+    doctor's enumeration row, so a lane-migrating copy in a widened scan
+    family (Pi profile homes, OMP home) is visible in the verdict."""
+
+    def test_other_copies_render_in_one_info_row(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        config = Path(cli.hermes_config_path())
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n"
+            "  engine: magic-context\n"
+            "memory:\n"
+            "  provider: magic_context\n"
+            "plugins:\n"
+            "  enabled:\n"
+            "    - magic-hermes\n",
+            encoding="utf-8",
+        )
+
+        tested = cli.tested_magic_context_version()
+        primary = make_package(tmp_path / "managed", tested)
+        cliproxy = make_package(
+            isolated_home / ".pi" / "agent-cliproxy-only" / "npm"
+            / "node_modules" / "@cortexkit" / "pi-magic-context",
+            "0.46.0",
+        )
+        omo = make_package(
+            isolated_home / ".omo" / "npm" / "node_modules" / "@cortexkit"
+            / "pi-magic-context",
+            "0.44.2",
+        )
+
+        sidecar = mock.MagicMock()
+        sidecar.call.side_effect = lambda method, params=None, timeout=60: {
+            "hello": {"harness": "hermes", "package_version": tested},
+            "doctor": {
+                "database_health": "ok",
+                "core_symbols_ready": True,
+                "supported_series": ".".join(
+                    map(str, cli.supported_magic_context_series())
+                ),
+            },
+        }[method]
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+
+        with (
+            mock.patch.object(
+                cli,
+                "discover_installations",
+                return_value=[(primary, tested), (cliproxy, "0.46.0"), (omo, "0.44.2")],
+            ),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+        ):
+            code = cli.run_doctor(json_output=False)
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert out.count("Other copies discovered:") == 1
+        assert f"0.46.0 @ {cliproxy}" in out
+        assert f"0.44.2 @ {omo}" in out
+        # the primary (Hermes-managed, == tested) PASS row is unchanged
+        assert f"{cli.UPSTREAM_PACKAGE} {tested} found at {primary}" in out
+
+
 class TestDoctorSidecarRetry:
     """R2 (finding c7d63424) — the doctor sidecar pair (hello + doctor)
     gets exactly one retry, and only when the first failure was fast.
@@ -642,6 +716,104 @@ class TestDoctorSidecarRetry:
         assert len(attempts) == 2  # one retry, then stop
         assert out.count("◆  FAIL") == 1  # exactly one FAIL entry
         assert "tail-1" in out and "tail-2" in out  # both attempts quoted
+
+    def test_persistent_lane_skew_renders_typed_fail_once(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        """U3 (finding c7d63424) — the upstream fence refusal renders ONE
+        typed, actionable FAIL row (adoption path named, upstream's own
+        lane numbers quoted) instead of the opaque generic one."""
+
+        def fence_refusal(method, tested, series):
+            raise RuntimeError(
+                "Runtime exited during hello (status 1); stderr: "
+                "[magic-context] storage fatal: refusing to open "
+                "context.db; upstream migration lane v95 is newer than "
+                "this binary supports (max v94)"
+            )
+
+        code, attempts = self._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [fence_refusal, fence_refusal]
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        # the R2 pair is preserved: fast-fail retry, no extra spawns
+        assert len(attempts) == 2
+        # D5: the typed row REPLACES the generic one — still FAIL 1
+        assert out.count("◆  FAIL") == 1
+        # typed: upstream's own numbers, quoted verbatim
+        assert "shared-store lane skew" in out
+        assert "lane v95" in out
+        assert "max v94" in out
+        # actionable: the sanctioned adoption path, not upstream's npx advice
+        assert "scripts/next_magic_context_release.py" in out
+        assert "scripts/sync_magic_context_release.py" in out
+        assert "PR-gated" in out
+        assert "magic-hermes install" in out
+        # the upstream evidence is preserved, never suppressed
+        assert "storage fatal" in out
+        assert "refusing to open context.db" in out
+        # honesty invariant: a FAIL row must never embed the verdict string
+        assert "FAIL 0" not in out
+
+    def test_generic_failure_does_not_render_lane_skew_wording(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        """Fail-open guard: a sidecar failure without the fence sentence
+        keeps today's generic row, byte-for-byte."""
+
+        calls = {"n": 0}
+
+        def always_fail(method, tested, series):
+            calls["n"] += 1
+            raise RuntimeError(
+                f"Runtime exited during {method} (status 1); "
+                f"stderr: SQLITE_BUSY tail-generic-{calls['n']}"
+            )
+
+        code, _attempts = self._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [always_fail, always_fail]
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert "lane skew" not in out
+        assert "next_magic_context_release.py" not in out
+        # unchanged from the pre-U3 rendering: both attempts' texts ride
+        # in the single generic row, wrapper and all
+        assert out.count("Magic Context sidecar failed") == 2
+
+    def test_lane_skew_sentence_split_across_retry_pair_matches_once(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        """Edge: the fence sentence split across the two fast-fail retry
+        texts still matches — and still renders exactly one FAIL row."""
+
+        def first_half(method, tested, series):
+            raise RuntimeError(
+                "Runtime exited during hello (status 1); stderr: "
+                "[magic-context] storage fatal: upstream migration lane "
+                "v95 is newer than this binary"
+            )
+
+        def second_half(method, tested, series):
+            # a differently-shaped failure whose message begins exactly
+            # where the first attempt's tail was cut: the wrapper-stripped
+            # join must reconstruct the sentence across the pair
+            raise RuntimeError(
+                "supports (max v94) — refusing to open context.db"
+            )
+
+        code, attempts = self._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, [first_half, second_half]
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert len(attempts) == 2
+        assert out.count("◆  FAIL") == 1
+        assert "shared-store lane skew" in out
+        assert "lane v95" in out
+        assert "max v94" in out
+        assert "FAIL 0" not in out
 
     def test_slow_first_failure_skips_the_retry(
         self, tmp_path, monkeypatch, isolated_home, capsys

@@ -287,6 +287,18 @@ class TestHonestyInvariant:
                 {"database_health": "skipped:store-size 3690000000 > 1610612736"},
                 None,
             ),
+            (
+                # U3 (finding c7d63424): the typed lane-skew FAIL row is a
+                # FAIL-status message too — it must not embed the verdict
+                # substring any more than the generic one
+                {},
+                RuntimeError(
+                    "Runtime exited during hello (status 1); stderr: "
+                    "[magic-context] storage fatal: refusing to open "
+                    "context.db; upstream migration lane v95 is newer "
+                    "than this binary supports (max v94)"
+                ),
+            ),
         ],
     )
     def test_no_fail_message_contains_fail_zero(
@@ -303,6 +315,72 @@ class TestHonestyInvariant:
         payload = json.loads(capsys.readouterr().out)
         fails = [c for c in payload["checks"] if c["status"] == "FAIL"]
         assert all("FAIL 0" not in c["message"] for c in fails)
+
+
+class TestLaneSkewContract:
+    """U3 (finding c7d63424) — the typed lane-skew verdict under the
+    maestro contract.
+
+    The skewed-store estate (a newer copy migrated the shared store; the
+    validated binary's fence refuses it) renders exactly one FAIL row:
+    typed (upstream's own lane numbers, the sanctioned adoption path)
+    with unchanged count semantics — FAIL 1, never a second row, never a
+    verdict-string collision.  The row adds zero sidecar spawns beyond
+    the R2 fast-fail pair (pinned in test_cli.py's retry suite and by
+    TestRetryBudget's constants)."""
+
+    _FENCE_ERROR = RuntimeError(
+        "Runtime exited during hello (status 1); stderr: "
+        "[magic-context] storage fatal: refusing to open context.db; "
+        "upstream migration lane v95 is newer than this binary supports "
+        "(max v94)"
+    )
+
+    def test_lane_skew_is_one_typed_fail_row(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            json_output=True,
+            sidecar_error=self._FENCE_ERROR,
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 1
+        fails = [c for c in payload["checks"] if c["status"] == "FAIL"]
+        assert len(fails) == 1  # D5: replaces the generic row, no second row
+        message = fails[0]["message"]
+        # typed: upstream's own numbers, verbatim
+        assert "lane v95" in message
+        assert "max v94" in message
+        # actionable: the sanctioned adoption path
+        assert "scripts/next_magic_context_release.py" in message
+        assert "scripts/sync_magic_context_release.py" in message
+        assert "PR-gated" in message
+        assert "magic-hermes install" in message
+        # the upstream evidence rides along, never suppressed
+        assert "storage fatal" in message
+        # count semantics unchanged for the contract greps
+        assert payload["summary"]["fail"] == 1
+        assert "FAIL 0" not in message
+
+    def test_lane_skew_text_summary_counts_stay_consistent(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            sidecar_error=self._FENCE_ERROR,
+        )
+        out = capsys.readouterr().out
+        assert out.count("shared-store lane skew") == 1
+        summary_line = next(line for line in out.splitlines() if "Summary:" in line)
+        assert "FAIL 1" in summary_line
+        assert "FAIL 0" not in out
 
 
 class TestFullIntegrityPlumbing:

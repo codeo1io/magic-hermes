@@ -6,6 +6,7 @@ import json
 import signal
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -398,3 +399,93 @@ def test_dispose_kills_the_process_group_on_posix(monkeypatch):
 
     assert signals == [(999111, signal.SIGTERM)]
     assert "SIGTERM" not in process.terminated  # group kill replaced bare terminate
+
+
+class TestPackageCandidatesDiscovery:
+    """U1 (finding c7d63424) — candidate discovery sees every Pi profile
+    home (``~/.pi/*/npm``) and the OMP home (``~/.omo/npm``), after the
+    canonical roots and before the cwd-walk tail, deduped.
+
+    The breaking estate had the only 0.46.0-capable copy in
+    ``~/.pi/agent-cliproxy-only/npm`` — invisible to the doctor's scan,
+    so the shared store's forward migration looked unattributable.
+    """
+
+    @staticmethod
+    def _isolate_home(monkeypatch, tmp_path):
+        """Point every home-relative scan at a fabricated home."""
+
+        home = tmp_path / "home"
+        home.mkdir()
+        script = tmp_path / "runtime.mjs"
+        script.write_text("", encoding="utf-8")
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
+        monkeypatch.delenv("MAGIC_CONTEXT_PACKAGE_ROOT", raising=False)
+        monkeypatch.setattr(runtime, "runtime_script_path", lambda: script)
+        monkeypatch.chdir(tmp_path)
+        return home
+
+    @staticmethod
+    def _make_copy(base: Path) -> Path:
+        root = base / "npm" / "node_modules" / "@cortexkit" / "pi-magic-context"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def test_profiles_and_omo_homes_are_discovered(self, monkeypatch, tmp_path):
+        home = self._isolate_home(monkeypatch, tmp_path)
+        managed = (
+            home
+            / ".local"
+            / "share"
+            / "magic-hermes"
+            / "node_modules"
+            / "@cortexkit"
+            / "pi-magic-context"
+        )
+        managed.mkdir(parents=True)
+        agent = self._make_copy(home / ".pi" / "agent")
+        cliproxy = self._make_copy(home / ".pi" / "agent-cliproxy-only")
+        future = self._make_copy(home / ".pi" / "some-future-profile")
+        omo = self._make_copy(home / ".omo")
+
+        candidates = runtime.magic_context_package_candidates()
+
+        for copy in (managed, agent, cliproxy, future, omo):
+            assert candidates.count(copy.resolve()) == 1, (
+                f"{copy} must appear exactly once (deduped), got "
+                f"{candidates.count(copy.resolve())}"
+            )
+        # priority preserved: the Hermes-managed root still wins binding
+        assert candidates[0] == managed.resolve()
+        for copy in (agent, cliproxy, future, omo):
+            assert candidates.index(managed.resolve()) < candidates.index(
+                copy.resolve()
+            )
+
+    def test_empty_profiles_and_broken_symlinks_contribute_nothing(
+        self, monkeypatch, tmp_path
+    ):
+        home = self._isolate_home(monkeypatch, tmp_path)
+        # a profile dir without the package, and a profile entry that is a
+        # broken symlink: neither may contribute, neither may crash the scan
+        (home / ".pi" / "empty-profile" / "npm").mkdir(parents=True)
+        (home / ".pi" / "ghost").symlink_to(home / ".no-such-target")
+
+        candidates = runtime.magic_context_package_candidates()
+
+        assert not any(
+            "ghost" in str(candidate) or "empty-profile" in str(candidate)
+            for candidate in candidates
+        )
+
+    def test_env_override_still_wins(self, monkeypatch, tmp_path):
+        home = self._isolate_home(monkeypatch, tmp_path)
+        self._make_copy(home / ".pi" / "agent")
+        override = tmp_path / "explicit-root"
+        override.mkdir()
+        monkeypatch.setenv("MAGIC_CONTEXT_PACKAGE_ROOT", str(override))
+
+        candidates = runtime.magic_context_package_candidates()
+
+        assert candidates[0] == override.resolve()
