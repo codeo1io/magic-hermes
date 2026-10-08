@@ -145,7 +145,7 @@ upstream's guard would.
 
 ### 1c. Shared store classification guard
 
-Upstream `@cortexkit/pi-magic-context` (through 0.45.0) seeds historian run
+Upstream `@cortexkit/pi-magic-context` (through 0.46.0) seeds historian run
 telemetry with `status='failed'`, and its benign early-return paths (drain
 budget exhausted, nothing to process, ...) commit rows with
 `status='failed'` and `failure_reason IS NULL`. Consumers that count

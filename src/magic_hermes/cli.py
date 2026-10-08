@@ -535,28 +535,46 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
         if len(installations) > 1:
             others = ", ".join(f"{v or '?'} @ {r}" for r, v in installations[1:])
             report.add("INFO", f"Other copies discovered: {others}")
+        validated = _semver_tuple(tested)
+
+        def newer_than_validated(candidate: str | None) -> bool:
+            parsed = _semver_tuple(candidate or "")
+            return (
+                validated is not None and parsed is not None and parsed > validated
+            )
+
         if version == tested:
             report.add(
                 "PASS",
                 f"Upstream version matches the version validated by this build "
                 f"(v{tested})",
             )
-        else:
-            current = _semver_tuple(version or "")
-            wanted = _semver_tuple(tested)
-            if current and wanted and current > wanted:
-                report.add(
-                    "WARN",
-                    f"Upstream {version} is newer than the validated v{tested}; "
-                    "the shared-DB schema fence follows the newest copy — "
-                    "update magic-hermes if sessions fail to open the store",
-                )
-            else:
-                report.add(
-                    "INFO",
-                    f"Upstream {version} differs from validated v{tested} "
-                    f"(supported series {series}.x)",
-                )
+        elif not newer_than_validated(version):
+            report.add(
+                "INFO",
+                f"Upstream {version} differs from validated v{tested} "
+                f"(supported series {series}.x)",
+            )
+        # Version-drift WARN, re-keyed from the primary copy to EVERY
+        # discovered installation (finding c7d63424, plan U2/D1): the
+        # primary-only comparison could never fire in the breaking
+        # configuration, where the Hermes-managed copy still matches the
+        # build-validated pin while a newer copy elsewhere on the machine
+        # has already forward-migrated the shared store.  The warning
+        # names each newer copy (version @ path) and points at the
+        # sanctioned adoption path (D3), not upstream's npx advice; it
+        # fires before any sidecar boot, purely from package.json reads.
+        newer_copies = [(r, v) for r, v in installations if newer_than_validated(v)]
+        if newer_copies:
+            named = ", ".join(f"{v} @ {r}" for r, v in newer_copies)
+            report.add(
+                "WARN",
+                f"Upstream copy newer than the validated v{tested}: {named}; "
+                "the shared-DB schema fence follows the newest copy — adopt "
+                "the newer series via scripts/next_magic_context_release.py + "
+                "scripts/sync_magic_context_release.py (series jumps are "
+                "PR-gated), release, then `magic-hermes install`",
+            )
     else:
         report.add(
             "FAIL",
