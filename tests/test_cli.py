@@ -957,3 +957,151 @@ class TestDoctorSkipWording:
         assert "WARN" in out
         assert "deadline" in out
         assert "probe reads succeeded" in out
+
+
+class TestDoctorVersionDrift:
+    """U2 (finding c7d63424) — the version-drift WARN keys off every
+    discovered copy, not just the primary: the shared store's schema
+    fence follows the NEWEST copy on the machine, so a newer copy in any
+    discovered installation (a non-default Pi profile, the OMP home)
+    must warn even while the primary matches the validated pin — the
+    exact shape of the 2026-10-08 incident estate.
+    """
+
+    def _run_doctor_with_copies(
+        self, tmp_path, monkeypatch, isolated_home, versions
+    ):
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        config = Path(cli.hermes_config_path())
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n"
+            "  engine: magic-context\n"
+            "memory:\n"
+            "  provider: magic_context\n"
+            "plugins:\n"
+            "  enabled:\n"
+            "    - magic-hermes\n",
+            encoding="utf-8",
+        )
+
+        installs = [
+            (make_package(tmp_path / f"copy{i}", version), version)
+            for i, version in enumerate(versions)
+        ]
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+        sidecar = mock.MagicMock()
+
+        def call(method, params=None, timeout=60):
+            if method == "hello":
+                return {"harness": "hermes", "package_version": versions[0]}
+            return {
+                "database_health": "ok",
+                "core_symbols_ready": True,
+                "supported_series": series,
+            }
+
+        sidecar.call.side_effect = call
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+
+        with (
+            mock.patch.object(cli, "discover_installations", return_value=installs),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+        ):
+            code = cli.run_doctor(json_output=False)
+        return code, installs
+
+    @staticmethod
+    def _versions_around_tested():
+        tested = cli.tested_magic_context_version()
+        major, minor, patch = cli._semver_tuple(tested)
+        newer = f"{major}.{minor}.{patch + 1}"
+        newer_still = f"{major}.{minor}.{patch + 2}"
+        older = (
+            f"{major}.{minor - 1}.0" if patch == 0 else f"{major}.{minor}.{patch - 1}"
+        )
+        return tested, newer, newer_still, older
+
+    def test_newer_other_copy_warns_while_primary_matches(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested, newer, _, _ = self._versions_around_tested()
+        code, installs = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [tested, newer]
+        )
+        out = capsys.readouterr().out
+        # WARN never raises the FAIL count (maestro verdict contract)
+        assert code == 0
+        primary, foreign = installs
+        assert f"{newer} @ {foreign[0]}" in out
+        assert "newer than the validated" in out
+        assert "schema fence follows the newest copy" in out
+        assert "scripts/next_magic_context_release.py" in out
+        assert "scripts/sync_magic_context_release.py" in out
+        assert "magic-hermes install" in out
+        # the primary rows keep their shape: found + matches-validated PASS
+        assert f"found at {primary[0]}" in out
+        assert "matches the version validated by this build" in out
+        assert "Other copies discovered" in out
+        # per-row honesty: the drift WARN row itself never greps as a
+        # verdict pass (the Summary line legitimately prints FAIL 0)
+        drift_rows = [ln for ln in out.splitlines() if "newer than the validated" in ln]
+        assert drift_rows and not any("FAIL 0" in ln for ln in drift_rows)
+
+    def test_multiple_newer_copies_all_named(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested, newer, newer_still, _ = self._versions_around_tested()
+        self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [tested, newer, newer_still]
+        )
+        out = capsys.readouterr().out
+        assert f"{newer} @ " in out
+        assert f"{newer_still} @ " in out
+
+    def test_primary_newer_still_warns(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested, newer, _, _ = self._versions_around_tested()
+        code, installs = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [newer]
+        )
+        out = capsys.readouterr().out
+        # the pre-U2 shape (primary itself newer) keeps warning
+        assert code == 0
+        assert "newer than the validated" in out
+        assert f"{newer} @ {installs[0][0]}" in out
+        # no differs-from-validated INFO alongside the WARN
+        assert "differs from validated" not in out
+        assert tested  # derived from the build manifest, not hardcoded
+
+    def test_all_copies_at_tested_do_not_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested, _, _, _ = self._versions_around_tested()
+        code, _ = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [tested, tested]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "newer than the validated" not in out
+        assert "matches the version validated by this build" in out
+
+    def test_older_other_copy_does_not_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested, _, _, older = self._versions_around_tested()
+        code, _ = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [tested, older]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "newer than the validated" not in out
+        assert "Other copies discovered" in out
