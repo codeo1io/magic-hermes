@@ -70,8 +70,9 @@ The installer auto-detects any existing Magic Context installation, installs or
 updates `@cortexkit/pi-magic-context` as needed, wires the Hermes config, and
 verifies the runtime end to end:
 
-- If Magic Context is already installed anywhere Magic-Hermes looks (Pi home,
-  OpenCode config, or the Hermes-managed root), it is reused when its version
+- If Magic Context is already installed anywhere Magic-Hermes looks (every
+  Pi profile home, OpenCode config, the OMP home, or the Hermes-managed
+  root), it is reused when its version
   matches the one this build was validated against. Foreign homes (Pi's,
   OpenCode's) are never modified.
 - If the discovered copy is older than the validated version, the validated
@@ -106,6 +107,18 @@ lane, live sidecar handshake + DB quick_check + core-symbol check) with a
 summary line and non-zero exit on FAIL. `--json` emits machine-readable
 output.
 
+Two rows cover shared-store lane skew across installations (finding
+c7d63424): when any discovered copy of the upstream package is newer than
+the version this build validated, `doctor` WARNs that the shared-DB schema
+fence follows the newest copy and names the newer installations; when the
+sidecar then refuses the shared store because its migration lane is newer
+than the validated binary supports, `doctor` FAILs with a typed lane-skew
+row naming the sanctioned adoption path —
+`scripts/next_magic_context_release.py` +
+`scripts/sync_magic_context_release.py` (series jumps are PR-gated), a
+release, then `magic-hermes install`. The doctor itself never writes to the
+store; repair is always an explicit act.
+
 ### 1b-2. Shared store migration toolkit (`magic-hermes db`)
 
 Upstream bumps the schema fence on series releases, and the shared store
@@ -132,7 +145,7 @@ upstream's guard would.
 
 ### 1c. Shared store classification guard
 
-Upstream `@cortexkit/pi-magic-context` (through 0.45.0) seeds historian run
+Upstream `@cortexkit/pi-magic-context` (through 0.46.0) seeds historian run
 telemetry with `status='failed'`, and its benign early-return paths (drain
 budget exhausted, nothing to process, ...) commit rows with
 `status='failed'` and `failure_reason IS NULL`. Consumers that count
@@ -270,8 +283,9 @@ npx @cortexkit/magic-context@latest setup --harness pi
 ```
 
 If Magic Context is already installed for Pi or OpenCode, you can reuse that same
-installation and database. Magic-Hermes automatically searches the normal Pi and
-OpenCode package locations. For a custom installation, point directly at the package:
+installation and database. Magic-Hermes automatically searches the normal Pi
+(all profile homes), OpenCode, and OMP package locations. For a custom
+installation, point directly at the package:
 
 ```bash
 export MAGIC_CONTEXT_PACKAGE_ROOT=/path/to/node_modules/@cortexkit/pi-magic-context

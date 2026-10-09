@@ -94,6 +94,20 @@ def _semver_tuple(version: str) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups()[:3])  # type: ignore[return-value]
 
 
+# Typed shared-store lane-skew detection (finding c7d63424, plan U3):
+# when a newer @cortexkit/pi-magic-context on the machine has already
+# forward-migrated the shared store, upstream's storage fence refuses
+# the open with this stable user-facing sentence.  The doctor quotes the
+# lane numbers straight from upstream's message (the authoritative
+# source) instead of deriving them from the bundle or the store, and
+# fails open to the generic sidecar-failure row when upstream rewords
+# it.
+_LANE_SKEW_FENCE = re.compile(
+    r"upstream migration lane v(\d+) is newer than this binary supports "
+    r"\(max v(\d+)\)"
+)
+
+
 # ---------------------------------------------------------------------------
 # detection helpers
 # ---------------------------------------------------------------------------
@@ -521,28 +535,46 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
         if len(installations) > 1:
             others = ", ".join(f"{v or '?'} @ {r}" for r, v in installations[1:])
             report.add("INFO", f"Other copies discovered: {others}")
+        validated = _semver_tuple(tested)
+
+        def newer_than_validated(candidate: str | None) -> bool:
+            parsed = _semver_tuple(candidate or "")
+            return (
+                validated is not None and parsed is not None and parsed > validated
+            )
+
         if version == tested:
             report.add(
                 "PASS",
                 f"Upstream version matches the version validated by this build "
                 f"(v{tested})",
             )
-        else:
-            current = _semver_tuple(version or "")
-            wanted = _semver_tuple(tested)
-            if current and wanted and current > wanted:
-                report.add(
-                    "WARN",
-                    f"Upstream {version} is newer than the validated v{tested}; "
-                    "the shared-DB schema fence follows the newest copy — "
-                    "update magic-hermes if sessions fail to open the store",
-                )
-            else:
-                report.add(
-                    "INFO",
-                    f"Upstream {version} differs from validated v{tested} "
-                    f"(supported series {series}.x)",
-                )
+        elif not newer_than_validated(version):
+            report.add(
+                "INFO",
+                f"Upstream {version} differs from validated v{tested} "
+                f"(supported series {series}.x)",
+            )
+        # Version-drift WARN, re-keyed from the primary copy to EVERY
+        # discovered installation (finding c7d63424, plan U2/D1): the
+        # primary-only comparison could never fire in the breaking
+        # configuration, where the Hermes-managed copy still matches the
+        # build-validated pin while a newer copy elsewhere on the machine
+        # has already forward-migrated the shared store.  The warning
+        # names each newer copy (version @ path) and points at the
+        # sanctioned adoption path (D3), not upstream's npx advice; it
+        # fires before any sidecar boot, purely from package.json reads.
+        newer_copies = [(r, v) for r, v in installations if newer_than_validated(v)]
+        if newer_copies:
+            named = ", ".join(f"{v} @ {r}" for r, v in newer_copies)
+            report.add(
+                "WARN",
+                f"Upstream copy newer than the validated v{tested}: {named}; "
+                "the shared-DB schema fence follows the newest copy — adopt "
+                "the newer series via scripts/next_magic_context_release.py + "
+                "scripts/sync_magic_context_release.py (series jumps are "
+                "PR-gated), release, then `magic-hermes install`",
+            )
     else:
         report.add(
             "FAIL",
@@ -788,13 +820,44 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
             )
         elif not sidecar_healthy:
             if len(sidecar_failures) == 2:
-                report.add(
-                    "FAIL",
+                combined_failures = (
                     f"{sidecar_failures[0]} (fast-fail retry) "
-                    f"{sidecar_failures[1]}",
+                    f"{sidecar_failures[1]}"
                 )
             else:
-                report.add("FAIL", sidecar_failures[0])
+                combined_failures = sidecar_failures[0]
+            # Typed verdict (plan U3/D5): a lane-skew fence refusal renders
+            # ONE actionable FAIL row that REPLACES the generic one, so a
+            # skewed estate still counts exactly FAIL 1 for maestro's
+            # contract.  The match runs over the raw failure texts joined
+            # by spaces (the "Magic Context sidecar failed:" wrapper this
+            # function adds is stripped first), so a fence sentence split
+            # across the fast-fail retry pair still matches; the rendered
+            # evidence keeps the wrapper and retry marker.  No match fails
+            # open to today's generic row, byte-for-byte.
+            lane_skew = _LANE_SKEW_FENCE.search(
+                " ".join(
+                    failure.removeprefix("Magic Context sidecar failed: ")
+                    for failure in sidecar_failures
+                )
+            )
+            if lane_skew is not None:
+                store_lane, binary_max = lane_skew.group(1), lane_skew.group(2)
+                report.add(
+                    "FAIL",
+                    "Magic Context shared-store lane skew: the shared store's "
+                    f"migration lane v{store_lane} is newer than the validated "
+                    f"upstream's supported max v{binary_max} — a newer copy "
+                    f"of {UPSTREAM_PACKAGE} on this machine already migrated "
+                    "the shared store (see the 'Other copies discovered' row "
+                    "and the version-drift warning). Adopt the newer series "
+                    "via scripts/next_magic_context_release.py + "
+                    "scripts/sync_magic_context_release.py (series jumps are "
+                    "PR-gated), release, then `magic-hermes install`. "
+                    f"Underlying failure: {combined_failures}",
+                )
+            else:
+                report.add("FAIL", combined_failures)
         if isinstance(bridge, dict):
             health = str(bridge.get("database_health", "unknown"))
             if health == "ok":
