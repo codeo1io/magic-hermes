@@ -1188,6 +1188,62 @@ class TestDoctorVersionDrift:
         assert "newer than the validated" not in out
         assert "Other copies discovered" in out
 
+    def test_non_semver_foreign_copy_is_skipped_not_fatal(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # Review F1 regression: a foreign copy whose package.json version
+        # is truthy but not strict semver ("v0.46.0" — the classic
+        # hand-edit; "0.46", "next", or a torn write behave the same)
+        # must not crash the doctor render. Widened discovery reaches
+        # arbitrary profile roots we do not control, so the drift
+        # comparison parses first and skips unparseable versions; the
+        # copy stays visible in the Other-copies row and the verdict
+        # renders normally.
+        tested, newer, _, _ = self._versions_around_tested()
+        code, installs = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [tested, "v" + newer]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert installs[1][1] == "v" + newer
+        assert f"v{newer} @ {installs[1][0]}" in out
+        assert "Other copies discovered" in out
+        assert "newer than the validated" not in out
+        assert "matches the version validated by this build" in out
+
+    def test_non_semver_primary_renders_differs_not_crash(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # Review F1 regression, primary variant: an unparseable PRIMARY
+        # version renders the differs-from-validated INFO row (not a
+        # crash) and no drift WARN fires from it.
+        tested, _, _, older = self._versions_around_tested()
+        code, _ = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, ["v" + older, older]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert f"Upstream v{older} differs from validated v{tested}" in out
+        assert "newer than the validated" not in out
+
+    def test_off_pin_primary_with_newer_other_copy_states_both(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # Review F2 regression: when the PRIMARY is off-pin (older here)
+        # and some OTHER copy is newer, the drift WARN names the newer
+        # copy AND the primary's own relation to the pin is still stated
+        # (the WARN alone never names the primary's drift).
+        tested, newer, _, older = self._versions_around_tested()
+        code, installs = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [older, newer]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "newer than the validated" in out
+        assert f"{newer} @ {installs[1][0]}" in out
+        assert f"Upstream {older} differs from validated v{tested}" in out
+        assert "matches the version validated by this build" not in out
+
 
 class TestDoctorLaneSkewVerdict:
     """U3 (finding c7d63424) — a sidecar refusal naming upstream's storage

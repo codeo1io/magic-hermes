@@ -269,13 +269,16 @@ path: `scripts/next_magic_context_release.py` +
 `scripts/sync_magic_context_release.py` (series jumps are PR-gated),
 release, then `magic-hermes install` — not upstream's
 `npx @cortexkit/magic-context@latest doctor --force` advice, which
-does not re-pin Hermes. Discovery meanwhile covers every copy the
-schema fence can follow — all Pi profile roots (`~/.pi/*/npm`), the
-OMP home (`~/.omo/npm`), and the classic Pi/OpenCode locations — and
-the version-drift WARN fires when any discovered copy is newer than
-the build-validated pin, not just the primary, because the shared
-store migrates with the newest copy on the machine. Here too the
-doctor never writes.
+does not re-pin Hermes. Discovery meanwhile covers the npm-layout
+roots the schema fence most often follows — all Pi profile roots
+(`~/.pi/*/npm`), the OMP home (`~/.omo/npm`), and the classic
+Pi/OpenCode locations; a copy installed under a custom npm prefix
+outside those roots can still migrate the store unseen, which is
+why the typed lane-skew FAIL — not discovery — remains the
+authoritative signal. The version-drift WARN fires when any
+discovered copy is newer than the build-validated pin, not just the
+primary, because the shared store migrates with the newest copy on
+the machine. Here too the doctor never writes.
 
 ### 2. Manual install (fallback)
 

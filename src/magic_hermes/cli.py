@@ -555,20 +555,34 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
         # the primary: the shared store's schema fence follows the newest
         # copy on the machine, wherever it lives (finding c7d63424 — the
         # incident's newer copy sat in a non-default Pi profile the old
-        # primary-only check could structurally never see).
+        # primary-only check could structurally never see). Parse each
+        # copy's version BEFORE comparing (review F1): discovery now
+        # reaches arbitrary profile roots whose package.json content we
+        # do not control, and a truthy but non-strict-semver version
+        # ("v0.46.0", "0.46", "next", a torn write) parses to None —
+        # comparing that unguarded raised TypeError and killed the whole
+        # doctor render before any row; an unparseable copy is skipped by
+        # the comparison and stays visible in the rows above.
         wanted = _semver_tuple(tested)
-        newer_copies = [
-            (copy_root, copy_version)
-            for copy_root, copy_version in installations
-            if copy_version and wanted and _semver_tuple(copy_version) > wanted
-        ]
+        newer_copies = []
+        for copy_root, copy_version in installations:
+            parsed = _semver_tuple(copy_version) if copy_version else None
+            if parsed is not None and wanted is not None and parsed > wanted:
+                newer_copies.append((copy_root, copy_version))
         if version == tested:
             report.add(
                 "PASS",
                 f"Upstream version matches the version validated by this build "
                 f"(v{tested})",
             )
-        elif not newer_copies:
+        elif not newer_copies or not any(
+            copy_root == root for copy_root, _ in newer_copies
+        ):
+            # An off-pin primary keeps its relation to the pin stated even
+            # when some OTHER copy is newer and the drift WARN fires
+            # (review F2): the WARN names the newer copies, not the
+            # primary's own drift. When the primary itself is the newer
+            # copy the WARN already names it, so no redundant row.
             report.add(
                 "INFO",
                 f"Upstream {version} differs from validated v{tested} "
