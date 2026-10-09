@@ -251,15 +251,16 @@ def test_official_runtime_indexes_tools_memories_and_compartments(tmp_path):
         assert "<session-history>" in rendered_text
         assert rendered["synthetic_leading_count"] == 2
 
-        # Historian completion is an upstream note-nudge trigger. Magic
-        # Context 0.46.0 rewrote nudge delivery: the render that applies the
-        # freshly published history is a cache-busting pass, which upstream's
-        # new serve-eligibility treats as a first-serve delivery, so the
-        # canonical deferred-note instruction lands on the trigger-time user
-        # message, anchored sticky; later renders replay it on that same
-        # anchored message, and a cooldown keeps following user turns from
-        # receiving a second copy. (0.45.0 instead deferred past the
-        # trigger-time message and delivered on the next user turn.)
+        # Historian completion is an upstream note-nudge trigger. Where the
+        # canonical deferred-note instruction lands is series-dependent:
+        #   < 0.46 — the trigger-time render only anchors the deferral; the
+        #             NEXT user turn receives the instruction.
+        #  >= 0.46 — the cache-busting trigger-time render delivers the
+        #             instruction immediately ON the trigger-time user
+        #             message and sticky-anchors it there; every later
+        #             render replays it onto the SAME anchored message and
+        #             new turns do not receive a fresh nudge (15-min
+        #             cooldown), so a stale copy cannot re-defer.
         followup = [*messages, {"role": "user", "content": "Continue after historian."}]
         nudged = client.call(
             "render_context",
@@ -269,23 +270,36 @@ def test_official_runtime_indexes_tools_memories_and_compartments(tmp_path):
                 "history_budget_tokens": 8_000,
             },
         )
-        trigger_user = next(
-            message
-            for message in nudged["messages"]
-            if "amber-10" in str(message.get("content", ""))
-        )
         followup_user = next(
             message
             for message in nudged["messages"]
             if "Continue after historian." in str(message.get("content", ""))
         )
         if supported_magic_context_series() >= (0, 46):
-            # Sticky replay keeps the delivered nudge anchored to the
-            # trigger-time user message ...
-            assert '<instruction name="deferred_notes">' in trigger_user["content"]
-            assert "Recheck the runtime adapter" in trigger_user["content"]
-            # ... and the delivery cooldown means the new user turn does not
-            # carry a second nudge.
+            last_user_content = [
+                message for message in messages if message["role"] == "user"
+            ][-1]["content"]
+
+            def _anchored(payload):
+                # the real (non-synthetic) trigger-time user message is the
+                # LAST message whose content still carries the original text
+                return [
+                    message
+                    for message in payload["messages"]
+                    if last_user_content in str(message.get("content", ""))
+                ][-1]
+
+            anchored_on_trigger = _anchored(rendered)
+            anchored_on_followup_render = _anchored(nudged)
+            assert (
+                '<instruction name="deferred_notes">'
+                in anchored_on_trigger["content"]
+            )
+            assert (
+                '<instruction name="deferred_notes">'
+                in anchored_on_followup_render["content"]
+            )
+            # sticky anchor: the new turn itself stays clean
             assert '<instruction name="deferred_notes">' not in followup_user["content"]
         else:
             assert '<instruction name="deferred_notes">' in followup_user["content"]

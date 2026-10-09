@@ -256,211 +256,6 @@ class TestDoctorReport:
         assert cli.db_schema_lane(fake_db) == 99
 
 
-class TestDoctorVersionDrift:
-    """U2 (finding c7d63424) — the version-drift WARN is keyed to every
-    discovered installation, not just the primary copy: in the breaking
-    configuration the Hermes-managed copy still matches the build's
-    validated pin while a newer copy elsewhere on the machine has
-    already forward-migrated the shared store, so a primary-only
-    comparison can never fire."""
-
-    @staticmethod
-    def _wire_config():
-        config = Path(cli.hermes_config_path())
-        config.parent.mkdir(parents=True, exist_ok=True)
-        config.write_text(
-            "context:\n"
-            "  engine: magic-context\n"
-            "memory:\n"
-            "  provider: magic_context\n"
-            "plugins:\n"
-            "  enabled:\n"
-            "    - magic-hermes\n",
-            encoding="utf-8",
-        )
-
-    def _run_doctor_with_installations(
-        self, tmp_path, monkeypatch, isolated_home, installations
-    ):
-        from magic_hermes import historian_guard as hg
-
-        db = tmp_path / "context.db"
-        hg.make_fixture_db(db)
-        hg.apply_guard(db, verify=False)
-        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
-        self._wire_config()
-
-        tested = cli.tested_magic_context_version()
-        series = ".".join(map(str, cli.supported_magic_context_series()))
-        sidecar = mock.MagicMock()
-        sidecar.call.side_effect = lambda method, params=None, timeout=60: {
-            "hello": {"harness": "hermes", "package_version": tested},
-            "doctor": {
-                "database_health": "ok",
-                "core_symbols_ready": True,
-                "supported_series": series,
-            },
-        }[method]
-        client = mock.MagicMock()
-        client.__enter__.return_value = sidecar
-        client.__exit__.return_value = False
-
-        with (
-            mock.patch.object(
-                cli, "discover_installations", return_value=installations
-            ),
-            mock.patch.object(cli, "RuntimeClient", return_value=client),
-        ):
-            code = cli.run_doctor(json_output=False)
-        return code
-
-    @staticmethod
-    def _relative_versions():
-        pin = cli._semver_tuple(cli.tested_magic_context_version())
-        newer = f"{pin[0]}.{pin[1] + 1}.{pin[2]}"
-        older = f"{pin[0]}.{pin[1] - 1}.{pin[2]}"
-        return newer, older
-
-    def test_newer_foreign_copy_warns_even_when_primary_matches(
-        self, tmp_path, monkeypatch, isolated_home, capsys
-    ):
-        """The incident shape: the primary (Hermes-managed) copy still
-        matches the validated pin while a newer copy elsewhere on the
-        machine has already forward-migrated the shared store — the
-        primary-only comparison could never see it."""
-        tested = cli.tested_magic_context_version()
-        newer, _older = self._relative_versions()
-        primary = make_package(tmp_path / "managed", tested)
-        foreign = make_package(
-            isolated_home / ".pi" / "agent-cliproxy-only" / "npm"
-            / "node_modules" / "@cortexkit" / "pi-magic-context",
-            newer,
-        )
-        code = self._run_doctor_with_installations(
-            tmp_path,
-            monkeypatch,
-            isolated_home,
-            [(primary, tested), (foreign, newer)],
-        )
-        out = capsys.readouterr().out
-        assert code == 0  # drift is WARN, not FAIL (D2)
-        assert out.count("fence follows the newest copy") == 1
-        assert f"newer than the validated v{tested}: {newer} @ {foreign}" in out
-        # D3: the sanctioned adoption path, not upstream's npx advice
-        assert "scripts/next_magic_context_release.py" in out
-        assert "scripts/sync_magic_context_release.py" in out
-        assert "PR-gated" in out
-        assert "magic-hermes install" in out
-        # the primary PASS rows are unchanged
-        assert f"{cli.UPSTREAM_PACKAGE} {tested} found at {primary}" in out
-        assert "matches the version validated by this build" in out
-        # honesty invariant: the verdict string never rides in the row
-        # itself (the summary line's own FAIL 0 is the contract, not a row)
-        drift_row = next(
-            line for line in out.splitlines() if "fence follows the newest copy" in line
-        )
-        assert "FAIL 0" not in drift_row
-
-    def test_all_copies_matching_pin_render_no_drift_warning(
-        self, tmp_path, monkeypatch, isolated_home, capsys
-    ):
-        tested = cli.tested_magic_context_version()
-        primary = make_package(tmp_path / "managed", tested)
-        second = make_package(
-            isolated_home / ".pi" / "agent" / "npm" / "node_modules"
-            / "@cortexkit" / "pi-magic-context",
-            tested,
-        )
-        code = self._run_doctor_with_installations(
-            tmp_path,
-            monkeypatch,
-            isolated_home,
-            [(primary, tested), (second, tested)],
-        )
-        out = capsys.readouterr().out
-        assert code == 0
-        assert "newer than the validated" not in out
-        assert "fence follows the newest copy" not in out
-
-    def test_primary_newer_than_pin_still_warns_once(
-        self, tmp_path, monkeypatch, isolated_home, capsys
-    ):
-        """No regression: the estate the old primary-only WARN covered
-        (the primary itself newer) still renders exactly one WARN, now
-        naming the copy and the adoption path."""
-        tested = cli.tested_magic_context_version()
-        newer, _older = self._relative_versions()
-        primary = make_package(tmp_path / "managed", newer)
-        code = self._run_doctor_with_installations(
-            tmp_path, monkeypatch, isolated_home, [(primary, newer)]
-        )
-        out = capsys.readouterr().out
-        assert code == 0
-        assert out.count("fence follows the newest copy") == 1
-        assert f"newer than the validated v{tested}: {newer} @ {primary}" in out
-        # a newer primary renders neither the PASS-match nor the differs row
-        assert "matches the version validated by this build" not in out
-        assert "differs from validated" not in out
-        drift_row = next(
-            line for line in out.splitlines() if "fence follows the newest copy" in line
-        )
-        assert "FAIL 0" not in drift_row
-
-    def test_older_foreign_copy_alone_does_not_warn(
-        self, tmp_path, monkeypatch, isolated_home, capsys
-    ):
-        tested = cli.tested_magic_context_version()
-        _newer, older = self._relative_versions()
-        primary = make_package(tmp_path / "managed", tested)
-        foreign = make_package(
-            isolated_home / ".omo" / "npm" / "node_modules" / "@cortexkit"
-            / "pi-magic-context",
-            older,
-        )
-        code = self._run_doctor_with_installations(
-            tmp_path,
-            monkeypatch,
-            isolated_home,
-            [(primary, tested), (foreign, older)],
-        )
-        out = capsys.readouterr().out
-        assert code == 0
-        assert "newer than the validated" not in out
-        assert "fence follows the newest copy" not in out
-        assert "matches the version validated by this build" in out
-
-    def test_primary_older_with_newer_foreign_warns_and_keeps_info_row(
-        self, tmp_path, monkeypatch, isolated_home, capsys
-    ):
-        """D1 max-over-all: the WARN keys off the newest copy anywhere,
-        while the older-primary INFO row is unchanged and only strictly
-        newer copies are named."""
-        tested = cli.tested_magic_context_version()
-        newer, older = self._relative_versions()
-        primary = make_package(tmp_path / "managed", older)
-        foreign = make_package(
-            isolated_home / ".pi" / "agent-cliproxy-only" / "npm"
-            / "node_modules" / "@cortexkit" / "pi-magic-context",
-            newer,
-        )
-        code = self._run_doctor_with_installations(
-            tmp_path,
-            monkeypatch,
-            isolated_home,
-            [(primary, older), (foreign, newer)],
-        )
-        out = capsys.readouterr().out
-        assert code == 0
-        assert out.count("fence follows the newest copy") == 1
-        assert f"{newer} @ {foreign}" in out
-        assert f"{older} @ {primary}" not in out  # only newer copies named
-        assert f"Upstream {older} differs from validated v{tested}" in out
-        drift_row = next(
-            line for line in out.splitlines() if "fence follows the newest copy" in line
-        )
-        assert "FAIL 0" not in drift_row
-
-
 class TestGuardParser:
     def test_guard_subcommand_accepts_all_three_actions(self):
         parser = cli.build_parser()
@@ -733,80 +528,6 @@ class TestDoctorGuardPosture:
         assert payload["summary"]["fail"] == 0
 
 
-class TestDoctorInstallEnumeration:
-    """U1 (finding c7d63424) — every discovered copy shows up in the
-    doctor's enumeration row, so a lane-migrating copy in a widened scan
-    family (Pi profile homes, OMP home) is visible in the verdict."""
-
-    def test_other_copies_render_in_one_info_row(
-        self, tmp_path, monkeypatch, isolated_home, capsys
-    ):
-        from magic_hermes import historian_guard as hg
-
-        db = tmp_path / "context.db"
-        hg.make_fixture_db(db)
-        hg.apply_guard(db, verify=False)
-        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
-        config = Path(cli.hermes_config_path())
-        config.parent.mkdir(parents=True, exist_ok=True)
-        config.write_text(
-            "context:\n"
-            "  engine: magic-context\n"
-            "memory:\n"
-            "  provider: magic_context\n"
-            "plugins:\n"
-            "  enabled:\n"
-            "    - magic-hermes\n",
-            encoding="utf-8",
-        )
-
-        tested = cli.tested_magic_context_version()
-        primary = make_package(tmp_path / "managed", tested)
-        cliproxy = make_package(
-            isolated_home / ".pi" / "agent-cliproxy-only" / "npm"
-            / "node_modules" / "@cortexkit" / "pi-magic-context",
-            "0.46.0",
-        )
-        omo = make_package(
-            isolated_home / ".omo" / "npm" / "node_modules" / "@cortexkit"
-            / "pi-magic-context",
-            "0.44.2",
-        )
-
-        sidecar = mock.MagicMock()
-        sidecar.call.side_effect = lambda method, params=None, timeout=60: {
-            "hello": {"harness": "hermes", "package_version": tested},
-            "doctor": {
-                "database_health": "ok",
-                "core_symbols_ready": True,
-                "supported_series": ".".join(
-                    map(str, cli.supported_magic_context_series())
-                ),
-            },
-        }[method]
-        client = mock.MagicMock()
-        client.__enter__.return_value = sidecar
-        client.__exit__.return_value = False
-
-        with (
-            mock.patch.object(
-                cli,
-                "discover_installations",
-                return_value=[(primary, tested), (cliproxy, "0.46.0"), (omo, "0.44.2")],
-            ),
-            mock.patch.object(cli, "RuntimeClient", return_value=client),
-        ):
-            code = cli.run_doctor(json_output=False)
-
-        out = capsys.readouterr().out
-        assert code == 0
-        assert out.count("Other copies discovered:") == 1
-        assert f"0.46.0 @ {cliproxy}" in out
-        assert f"0.44.2 @ {omo}" in out
-        # the primary (Hermes-managed, == tested) PASS row is unchanged
-        assert f"{cli.UPSTREAM_PACKAGE} {tested} found at {primary}" in out
-
-
 class TestDoctorSidecarRetry:
     """R2 (finding c7d63424) — the doctor sidecar pair (hello + doctor)
     gets exactly one retry, and only when the first failure was fast.
@@ -922,76 +643,12 @@ class TestDoctorSidecarRetry:
         assert out.count("◆  FAIL") == 1  # exactly one FAIL entry
         assert "tail-1" in out and "tail-2" in out  # both attempts quoted
 
-    def test_persistent_lane_skew_renders_typed_fail_once(
-        self, tmp_path, monkeypatch, isolated_home, capsys
-    ):
-        """U3 (finding c7d63424) — the upstream fence refusal renders ONE
-        typed, actionable FAIL row (adoption path named, upstream's own
-        lane numbers quoted) instead of the opaque generic one."""
-
-        def fence_refusal(method, tested, series):
-            raise RuntimeError(
-                "Runtime exited during hello (status 1); stderr: "
-                "[magic-context] storage fatal: refusing to open "
-                "context.db; upstream migration lane v95 is newer than "
-                "this binary supports (max v94)"
-            )
-
-        code, attempts = self._run_doctor_with_attempts(
-            tmp_path, monkeypatch, isolated_home, [fence_refusal, fence_refusal]
-        )
-        out = capsys.readouterr().out
-        assert code == 1
-        # the R2 pair is preserved: fast-fail retry, no extra spawns
-        assert len(attempts) == 2
-        # D5: the typed row REPLACES the generic one — still FAIL 1
-        assert out.count("◆  FAIL") == 1
-        # typed: upstream's own numbers, quoted verbatim
-        assert "shared-store lane skew" in out
-        assert "lane v95" in out
-        assert "max v94" in out
-        # actionable: the sanctioned adoption path, not upstream's npx advice
-        assert "scripts/next_magic_context_release.py" in out
-        assert "scripts/sync_magic_context_release.py" in out
-        assert "PR-gated" in out
-        assert "magic-hermes install" in out
-        # the upstream evidence is preserved, never suppressed
-        assert "storage fatal" in out
-        assert "refusing to open context.db" in out
-        # honesty invariant: a FAIL row must never embed the verdict string
-        assert "FAIL 0" not in out
-
-    def test_generic_failure_does_not_render_lane_skew_wording(
-        self, tmp_path, monkeypatch, isolated_home, capsys
-    ):
-        """Fail-open guard: a sidecar failure without the fence sentence
-        keeps today's generic row, byte-for-byte."""
-
-        calls = {"n": 0}
-
-        def always_fail(method, tested, series):
-            calls["n"] += 1
-            raise RuntimeError(
-                f"Runtime exited during {method} (status 1); "
-                f"stderr: SQLITE_BUSY tail-generic-{calls['n']}"
-            )
-
-        code, _attempts = self._run_doctor_with_attempts(
-            tmp_path, monkeypatch, isolated_home, [always_fail, always_fail]
-        )
-        out = capsys.readouterr().out
-        assert code == 1
-        assert "lane skew" not in out
-        assert "next_magic_context_release.py" not in out
-        # unchanged from the pre-U3 rendering: both attempts' texts ride
-        # in the single generic row, wrapper and all
-        assert out.count("Magic Context sidecar failed") == 2
-
     def test_lane_skew_sentence_split_across_retry_pair_matches_once(
         self, tmp_path, monkeypatch, isolated_home, capsys
     ):
-        """Edge: the fence sentence split across the two fast-fail retry
-        texts still matches — and still renders exactly one FAIL row."""
+        """U3 edge (finding c7d63424): the fence sentence split across
+        the two fast-fail retry texts still types — and still renders
+        exactly one FAIL row (D5)."""
 
         def first_half(method, tested, series):
             raise RuntimeError(
@@ -1004,9 +661,7 @@ class TestDoctorSidecarRetry:
             # a differently-shaped failure whose message begins exactly
             # where the first attempt's tail was cut: the wrapper-stripped
             # join must reconstruct the sentence across the pair
-            raise RuntimeError(
-                "supports (max v94) — refusing to open context.db"
-            )
+            raise RuntimeError("supports (max v94) — refusing to open context.db")
 
         code, attempts = self._run_doctor_with_attempts(
             tmp_path, monkeypatch, isolated_home, [first_half, second_half]
@@ -1334,3 +989,398 @@ class TestDoctorSkipWording:
         assert "WARN" in out
         assert "deadline" in out
         assert "probe reads succeeded" in out
+
+
+class TestDoctorOtherCopiesRow:
+    """U1 (finding c7d63424) — widened discovery makes the doctor's
+    enumeration honest: every discovered copy beyond the primary renders
+    in ONE INFO row, version per copy, so the copy that migrated the
+    shared store is visible in the verdict itself.
+    """
+
+    @staticmethod
+    def _wire_config():
+        config = Path(cli.hermes_config_path())
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n"
+            "  engine: magic-context\n"
+            "memory:\n"
+            "  provider: magic_context\n"
+            "plugins:\n"
+            "  enabled:\n"
+            "    - magic-hermes\n",
+            encoding="utf-8",
+        )
+
+    def test_multiple_copies_render_one_info_row_with_versions(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        self._wire_config()
+
+        tested = cli.tested_magic_context_version()
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+        # derive the foreign copy's version from the validated pin: U4's
+        # adoption moved the pin to 0.46.1, so the incident's literal
+        # 0.46.0 is no longer NEWER — the row must stay honest about a
+        # copy that is ahead of the pin whatever the pin currently is
+        major, minor, patch = cli._semver_tuple(tested)
+        newer_version = f"{major}.{minor}.{patch + 1}"
+        primary = make_package(tmp_path / "managed-pkg", tested)
+        newer = make_package(tmp_path / "cliproxy-pkg", newer_version)
+        unreadable = tmp_path / "omo-pkg"
+        unreadable.mkdir()
+        (unreadable / "package.json").write_text("{", encoding="utf-8")
+        (unreadable / "dist").mkdir()
+        (unreadable / "dist" / "index.js").write_text("", encoding="utf-8")
+
+        sidecar = mock.MagicMock()
+        sidecar.call.side_effect = lambda method, params=None, timeout=60: {
+            "hello": {"harness": "hermes", "package_version": tested},
+            "doctor": {
+                "database_health": "ok",
+                "core_symbols_ready": True,
+                "supported_series": series,
+            },
+        }[method]
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+
+        with (
+            mock.patch.object(
+                cli,
+                "discover_installations",
+                return_value=[
+                    (primary, tested),
+                    (newer, newer_version),
+                    (unreadable, None),
+                ],
+            ),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+        ):
+            code = cli.run_doctor(json_output=False)
+        out = capsys.readouterr().out
+        assert code == 0
+        assert out.count("Other copies discovered:") == 1
+        assert f"{newer_version} @ {newer}" in out
+        assert f"? @ {unreadable}" in out
+
+
+class TestDoctorVersionDrift:
+    """U2 (finding c7d63424) — the version-drift WARN keys off every
+    discovered copy, not just the primary: the shared store's schema
+    fence follows the NEWEST copy on the machine, so a newer copy in any
+    discovered installation (a non-default Pi profile, the OMP home)
+    must warn even while the primary matches the validated pin — the
+    exact shape of the 2026-10-08 incident estate.
+    """
+
+    def _run_doctor_with_copies(
+        self, tmp_path, monkeypatch, isolated_home, versions
+    ):
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        config = Path(cli.hermes_config_path())
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n"
+            "  engine: magic-context\n"
+            "memory:\n"
+            "  provider: magic_context\n"
+            "plugins:\n"
+            "  enabled:\n"
+            "    - magic-hermes\n",
+            encoding="utf-8",
+        )
+
+        installs = [
+            (make_package(tmp_path / f"copy{i}", version), version)
+            for i, version in enumerate(versions)
+        ]
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+        sidecar = mock.MagicMock()
+
+        def call(method, params=None, timeout=60):
+            if method == "hello":
+                return {"harness": "hermes", "package_version": versions[0]}
+            return {
+                "database_health": "ok",
+                "core_symbols_ready": True,
+                "supported_series": series,
+            }
+
+        sidecar.call.side_effect = call
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+
+        with (
+            mock.patch.object(cli, "discover_installations", return_value=installs),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+        ):
+            code = cli.run_doctor(json_output=False)
+        return code, installs
+
+    @staticmethod
+    def _versions_around_tested():
+        tested = cli.tested_magic_context_version()
+        major, minor, patch = cli._semver_tuple(tested)
+        newer = f"{major}.{minor}.{patch + 1}"
+        newer_still = f"{major}.{minor}.{patch + 2}"
+        older = (
+            f"{major}.{minor - 1}.0" if patch == 0 else f"{major}.{minor}.{patch - 1}"
+        )
+        return tested, newer, newer_still, older
+
+    def test_newer_other_copy_warns_while_primary_matches(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested, newer, _, _ = self._versions_around_tested()
+        code, installs = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [tested, newer]
+        )
+        out = capsys.readouterr().out
+        # WARN never raises the FAIL count (maestro verdict contract)
+        assert code == 0
+        primary, foreign = installs
+        assert f"{newer} @ {foreign[0]}" in out
+        assert "newer than the validated" in out
+        assert "schema fence follows the newest copy" in out
+        assert "scripts/next_magic_context_release.py" in out
+        assert "scripts/sync_magic_context_release.py" in out
+        assert "magic-hermes install" in out
+        # the primary rows keep their shape: found + matches-validated PASS
+        assert f"found at {primary[0]}" in out
+        assert "matches the version validated by this build" in out
+        assert "Other copies discovered" in out
+        # per-row honesty: the drift WARN row itself never greps as a
+        # verdict pass (the Summary line legitimately prints FAIL 0)
+        drift_rows = [ln for ln in out.splitlines() if "newer than the validated" in ln]
+        assert drift_rows and not any("FAIL 0" in ln for ln in drift_rows)
+
+    def test_multiple_newer_copies_all_named(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested, newer, newer_still, _ = self._versions_around_tested()
+        self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [tested, newer, newer_still]
+        )
+        out = capsys.readouterr().out
+        assert f"{newer} @ " in out
+        assert f"{newer_still} @ " in out
+
+    def test_primary_newer_still_warns(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested, newer, _, _ = self._versions_around_tested()
+        code, installs = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [newer]
+        )
+        out = capsys.readouterr().out
+        # the pre-U2 shape (primary itself newer) keeps warning
+        assert code == 0
+        assert "newer than the validated" in out
+        assert f"{newer} @ {installs[0][0]}" in out
+        # no differs-from-validated INFO alongside the WARN
+        assert "differs from validated" not in out
+        assert tested  # derived from the build manifest, not hardcoded
+
+    def test_all_copies_at_tested_do_not_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested, _, _, _ = self._versions_around_tested()
+        code, _ = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [tested, tested]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "newer than the validated" not in out
+        assert "matches the version validated by this build" in out
+
+    def test_older_other_copy_does_not_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        tested, _, _, older = self._versions_around_tested()
+        code, _ = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [tested, older]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "newer than the validated" not in out
+        assert "Other copies discovered" in out
+
+    def test_non_semver_foreign_copy_is_skipped_not_fatal(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # Review F1 regression: a foreign copy whose package.json version
+        # is truthy but not strict semver ("v0.46.0" — the classic
+        # hand-edit; "0.46", "next", or a torn write behave the same)
+        # must not crash the doctor render. Widened discovery reaches
+        # arbitrary profile roots we do not control, so the drift
+        # comparison parses first and skips unparseable versions; the
+        # copy stays visible in the Other-copies row and the verdict
+        # renders normally.
+        tested, newer, _, _ = self._versions_around_tested()
+        code, installs = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [tested, "v" + newer]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert installs[1][1] == "v" + newer
+        assert f"v{newer} @ {installs[1][0]}" in out
+        assert "Other copies discovered" in out
+        assert "newer than the validated" not in out
+        assert "matches the version validated by this build" in out
+
+    def test_non_semver_primary_renders_differs_not_crash(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # Review F1 regression, primary variant: an unparseable PRIMARY
+        # version renders the differs-from-validated INFO row (not a
+        # crash) and no drift WARN fires from it.
+        tested, _, _, older = self._versions_around_tested()
+        code, _ = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, ["v" + older, older]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert f"Upstream v{older} differs from validated v{tested}" in out
+        assert "newer than the validated" not in out
+
+    def test_off_pin_primary_with_newer_other_copy_states_both(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # Review F2 regression: when the PRIMARY is off-pin (older here)
+        # and some OTHER copy is newer, the drift WARN names the newer
+        # copy AND the primary's own relation to the pin is still stated
+        # (the WARN alone never names the primary's drift).
+        tested, newer, _, older = self._versions_around_tested()
+        code, installs = self._run_doctor_with_copies(
+            tmp_path, monkeypatch, isolated_home, [older, newer]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "newer than the validated" in out
+        assert f"{newer} @ {installs[1][0]}" in out
+        assert f"Upstream {older} differs from validated v{tested}" in out
+        assert "matches the version validated by this build" not in out
+
+
+class TestDoctorLaneSkewVerdict:
+    """U3 (finding c7d63424) — a sidecar refusal naming upstream's storage
+    fence renders ONE typed FAIL row (shared-store lane skew) with the
+    fence's own lane numbers, the sanctioned adoption path, and the
+    underlying refusal quoted; any other failure keeps today's generic
+    row unchanged (fail-open, D1). The typed row REPLACES the generic one
+    (D5): a skew estate still renders exactly FAIL 1.
+    """
+
+    # the exact stderr shape the fence refusal produces through the
+    # RuntimeClient exit-error path (sentence verified against the
+    # upstream 0.46.0 bundle: "upstream migration lane vN is newer than
+    # this binary supports (max vM).")
+    FENCE_TEXT = (
+        "Runtime exited during hello (status 1); "
+        "stderr: [magic-context] storage fatal: refusing to open "
+        "/home/agent/.local/share/cortexkit/magic-context/context.db; "
+        "upstream migration lane v95 is newer than this binary supports "
+        "(max v94). A pinned or stale plugin is likely sharing this "
+        "database with a newer instance; update or unpin Magic Context "
+        "with 'npx @cortexkit/magic-context@latest doctor --force', "
+        "then restart."
+    )
+
+    def _run(self, tmp_path, monkeypatch, isolated_home, scripts, **kwargs):
+        harness = TestDoctorSidecarRetry()
+        return harness._run_doctor_with_attempts(
+            tmp_path, monkeypatch, isolated_home, scripts, **kwargs
+        )
+
+    def test_fence_refusal_renders_one_typed_fail_row(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        calls = {"n": 0}
+
+        def fence(method, tested, series):
+            calls["n"] += 1
+            raise RuntimeError(f"{self.FENCE_TEXT} tail-{calls['n']}")
+
+        code, attempts = self._run(
+            tmp_path, monkeypatch, isolated_home, [fence, fence]
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert len(attempts) == 2  # fast-fail retry still happens
+        assert out.count("◆  FAIL") == 1  # typed row REPLACES, not adds (D5)
+        assert "shared-store lane skew" in out
+        assert "lane v95" in out
+        assert "max v94" in out
+        # D3: the sanctioned adoption path, not upstream's npx advice,
+        # is the guidance
+        assert "scripts/next_magic_context_release.py" in out
+        assert "scripts/sync_magic_context_release.py" in out
+        assert "PR-gated" in out
+        assert "magic-hermes install" in out
+        # the underlying refusal stays quoted for evidence (both tails)
+        assert "storage fatal" in out
+        assert "tail-1" in out and "tail-2" in out
+        # one-FAIL-row count semantics: the summary still says FAIL 1
+        assert "/ FAIL 1" in out
+        # wording invariant: no FAIL-status message hides "FAIL 0"
+        for line in out.splitlines():
+            if "◆  FAIL" in line:
+                assert "FAIL 0" not in line
+
+    def test_generic_failure_keeps_the_generic_row_unchanged(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        calls = {"n": 0}
+
+        def always_fail(method, tested, series):
+            calls["n"] += 1
+            raise RuntimeError(
+                f"Runtime exited during {method} (status 1); "
+                f"stderr: SQLITE_BUSY tail-{calls['n']}"
+            )
+
+        code, _ = self._run(
+            tmp_path, monkeypatch, isolated_home, [always_fail, always_fail]
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert out.count("◆  FAIL") == 1
+        assert "shared-store lane skew" not in out  # fail-open (D1)
+        assert "Magic Context sidecar failed:" in out
+        assert "(fast-fail retry)" in out
+        assert "tail-1" in out and "tail-2" in out
+
+    def test_fence_refusal_on_slow_single_failure_renders_typed_row(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        def slow_fence(method, tested, series):
+            raise RuntimeError(f"{self.FENCE_TEXT} tail-slow")
+
+        # a zero gate makes the failure "slow": no retry, one text —
+        # the typed verdict must not depend on the retry shape
+        code, attempts = self._run(
+            tmp_path, monkeypatch, isolated_home, [slow_fence], fast_fail_s=0.0
+        )
+        out = capsys.readouterr().out
+        assert code == 1
+        assert len(attempts) == 1
+        assert out.count("◆  FAIL") == 1
+        assert "shared-store lane skew" in out
+        assert "lane v95" in out and "max v94" in out
+        assert "tail-slow" in out
+        assert "(fast-fail retry)" not in out

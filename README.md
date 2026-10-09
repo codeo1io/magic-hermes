@@ -107,18 +107,6 @@ lane, live sidecar handshake + DB quick_check + core-symbol check) with a
 summary line and non-zero exit on FAIL. `--json` emits machine-readable
 output.
 
-Two rows cover shared-store lane skew across installations (finding
-c7d63424): when any discovered copy of the upstream package is newer than
-the version this build validated, `doctor` WARNs that the shared-DB schema
-fence follows the newest copy and names the newer installations; when the
-sidecar then refuses the shared store because its migration lane is newer
-than the validated binary supports, `doctor` FAILs with a typed lane-skew
-row naming the sanctioned adoption path —
-`scripts/next_magic_context_release.py` +
-`scripts/sync_magic_context_release.py` (series jumps are PR-gated), a
-release, then `magic-hermes install`. The doctor itself never writes to the
-store; repair is always an explicit act.
-
 ### 1b-2. Shared store migration toolkit (`magic-hermes db`)
 
 Upstream bumps the schema fence on series releases, and the shared store
@@ -270,6 +258,28 @@ drift and WARN on advisory residue; a same-repo non-canonical checkout
 INFO skip (HTTPS clones are the norm there); foreign checkouts stay
 silent. In every row the doctor never writes — repair stays an
 explicit operator act (`magic-hermes provenance --repair`).
+
+The shared store's migration lane joins the same row vocabulary
+(finding c7d63424: a newer `@cortexkit/pi-magic-context` copy living
+only in a non-default Pi profile migrated the shared store ahead of
+the validated pin, and the sidecar refused to open it). When that
+refusal names a migration lane newer than the binary supports,
+`doctor` renders a typed **FAIL** — shared-store lane skew — quoting
+the fence's own lane numbers and pointing at the sanctioned adoption
+path: `scripts/next_magic_context_release.py` +
+`scripts/sync_magic_context_release.py` (series jumps are PR-gated),
+release, then `magic-hermes install` — not upstream's
+`npx @cortexkit/magic-context@latest doctor --force` advice, which
+does not re-pin Hermes. Discovery meanwhile covers the npm-layout
+roots the schema fence most often follows — all Pi profile roots
+(`~/.pi/*/npm`), the OMP home (`~/.omo/npm`), and the classic
+Pi/OpenCode locations; a copy installed under a custom npm prefix
+outside those roots can still migrate the store unseen, which is
+why the typed lane-skew FAIL — not discovery — remains the
+authoritative signal. The version-drift WARN fires when any
+discovered copy is newer than the build-validated pin, not just the
+primary, because the shared store migrates with the newest copy on
+the machine. Here too the doctor never writes.
 
 ### 2. Manual install (fallback)
 

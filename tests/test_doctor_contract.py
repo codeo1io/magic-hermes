@@ -287,16 +287,16 @@ class TestHonestyInvariant:
                 {"database_health": "skipped:store-size 3690000000 > 1610612736"},
                 None,
             ),
+            # U3 (finding c7d63424): the typed lane-skew FAIL row must
+            # obey the honesty invariant like every other FAIL row
             (
-                # U3 (finding c7d63424): the typed lane-skew FAIL row is a
-                # FAIL-status message too — it must not embed the verdict
-                # substring any more than the generic one
                 {},
                 RuntimeError(
-                    "Runtime exited during hello (status 1); stderr: "
-                    "[magic-context] storage fatal: refusing to open "
-                    "context.db; upstream migration lane v95 is newer "
-                    "than this binary supports (max v94)"
+                    "Runtime exited during hello (status 1); "
+                    "stderr: [magic-context] storage fatal: refusing to "
+                    "open context.db; upstream migration lane v95 is newer "
+                    "than this binary supports (max v94). A pinned or stale "
+                    "plugin is likely sharing this database"
                 ),
             ),
         ],
@@ -317,26 +317,25 @@ class TestHonestyInvariant:
         assert all("FAIL 0" not in c["message"] for c in fails)
 
 
-class TestLaneSkewContract:
-    """U3 (finding c7d63424) — the typed lane-skew verdict under the
-    maestro contract.
+class TestLaneSkewTypedVerdict:
+    """U3 (finding c7d63424) — the storage-fence refusal renders ONE
+    typed FAIL row in the machine-readable report: the fence's own lane
+    numbers, the sanctioned adoption path, and the underlying refusal
+    quoted for evidence. maestro's verdict sees FAIL 1 / rc 1 (the
+    escalation lane), with count semantics identical to the generic
+    sidecar-failure row it replaces (D5)."""
 
-    The skewed-store estate (a newer copy migrated the shared store; the
-    validated binary's fence refuses it) renders exactly one FAIL row:
-    typed (upstream's own lane numbers, the sanctioned adoption path)
-    with unchanged count semantics — FAIL 1, never a second row, never a
-    verdict-string collision.  The row adds zero sidecar spawns beyond
-    the R2 fast-fail pair (pinned in test_cli.py's retry suite and by
-    TestRetryBudget's constants)."""
-
-    _FENCE_ERROR = RuntimeError(
-        "Runtime exited during hello (status 1); stderr: "
-        "[magic-context] storage fatal: refusing to open context.db; "
-        "upstream migration lane v95 is newer than this binary supports "
-        "(max v94)"
+    FENCE = (
+        "Runtime exited during hello (status 1); "
+        "stderr: [magic-context] storage fatal: refusing to open "
+        "context.db; upstream migration lane v95 is newer than this "
+        "binary supports (max v94). A pinned or stale plugin is likely "
+        "sharing this database with a newer instance; update or unpin "
+        "Magic Context with 'npx @cortexkit/magic-context@latest "
+        "doctor --force', then restart."
     )
 
-    def test_lane_skew_is_one_typed_fail_row(
+    def test_json_carries_the_typed_row_with_fence_numbers(
         self, tmp_path, monkeypatch, isolated_home, capsys
     ):
         rc, _ = _run_doctor(
@@ -345,38 +344,38 @@ class TestLaneSkewContract:
             isolated_home,
             {},
             json_output=True,
-            sidecar_error=self._FENCE_ERROR,
+            sidecar_error=RuntimeError(self.FENCE),
         )
         payload = json.loads(capsys.readouterr().out)
         assert rc == 1
         fails = [c for c in payload["checks"] if c["status"] == "FAIL"]
-        assert len(fails) == 1  # D5: replaces the generic row, no second row
+        assert len(fails) == 1
         message = fails[0]["message"]
-        # typed: upstream's own numbers, verbatim
+        assert "shared-store lane skew" in message
         assert "lane v95" in message
         assert "max v94" in message
-        # actionable: the sanctioned adoption path
+        # D3: the sanctioned adoption path is the guidance
         assert "scripts/next_magic_context_release.py" in message
         assert "scripts/sync_magic_context_release.py" in message
-        assert "PR-gated" in message
         assert "magic-hermes install" in message
-        # the upstream evidence rides along, never suppressed
+        # the underlying refusal stays quoted — it is the evidence
         assert "storage fatal" in message
-        # count semantics unchanged for the contract greps
         assert payload["summary"]["fail"] == 1
-        assert "FAIL 0" not in message
 
-    def test_lane_skew_text_summary_counts_stay_consistent(
+    def test_text_summary_renders_the_typed_row_once(
         self, tmp_path, monkeypatch, isolated_home, capsys
     ):
-        _run_doctor(
+        # D5 holds in text mode too: exactly one typed FAIL row, the
+        # summary stays FAIL 1, and no row embeds the verdict substring
+        rc, _ = _run_doctor(
             tmp_path,
             monkeypatch,
             isolated_home,
             {},
-            sidecar_error=self._FENCE_ERROR,
+            sidecar_error=RuntimeError(self.FENCE),
         )
         out = capsys.readouterr().out
+        assert rc == 1
         assert out.count("shared-store lane skew") == 1
         summary_line = next(line for line in out.splitlines() if "Summary:" in line)
         assert "FAIL 1" in summary_line
@@ -462,6 +461,9 @@ class _FakeSidecar:
 
     def call(self, method, params=None, timeout=None):
         if method == "hello":
+            error = os.environ.get("DOCTOR_SIDECAR_ERROR")
+            if error:
+                raise RuntimeError(error)
             return {"harness": "hermes", "package_version": TESTED}
         return RESPONSE
 
@@ -610,6 +612,31 @@ class TestObserverBudgetMatrix:
         assert "wall-budget" in proc.stdout
         assert "PRAGMA quick_check" in proc.stdout
         assert "quick_check ok" not in proc.stdout
+
+    def test_lane_skew_fence_renders_typed_fail_within_observer_shot(
+        self, tmp_path, isolated_home
+    ):
+        # U3 (finding c7d63424): a fence-refusing store renders the typed
+        # lane-skew FAIL row inside the 90 s single-shot budget — rc 1
+        # and FAIL 1, the escalation lane — with no extra spawns: the
+        # typed row is minted inside the existing failure branch.
+        fence = (
+            "Runtime exited during hello (status 1); "
+            "stderr: [magic-context] storage fatal: refusing to open "
+            "context.db; upstream migration lane v95 is newer than this "
+            "binary supports (max v94). A pinned or stale plugin is "
+            "likely sharing this database with a newer instance"
+        )
+        proc = self._run_row(
+            tmp_path,
+            isolated_home,
+            {"DOCTOR_SIDECAR_ERROR": fence},
+        )
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "shared-store lane skew" in proc.stdout
+        assert "lane v95" in proc.stdout
+        assert "scripts/sync_magic_context_release.py" in proc.stdout
+        assert "/ FAIL 1" in proc.stdout
 
 
 class TestDeploySmoke:
