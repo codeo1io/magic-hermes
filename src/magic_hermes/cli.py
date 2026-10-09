@@ -551,28 +551,39 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
         if len(installations) > 1:
             others = ", ".join(f"{v or '?'} @ {r}" for r, v in installations[1:])
             report.add("INFO", f"Other copies discovered: {others}")
+        # The version-drift WARN keys off EVERY discovered copy, not just
+        # the primary: the shared store's schema fence follows the newest
+        # copy on the machine, wherever it lives (finding c7d63424 — the
+        # incident's newer copy sat in a non-default Pi profile the old
+        # primary-only check could structurally never see).
+        wanted = _semver_tuple(tested)
+        newer_copies = [
+            (copy_root, copy_version)
+            for copy_root, copy_version in installations
+            if copy_version and wanted and _semver_tuple(copy_version) > wanted
+        ]
         if version == tested:
             report.add(
                 "PASS",
                 f"Upstream version matches the version validated by this build "
                 f"(v{tested})",
             )
-        else:
-            current = _semver_tuple(version or "")
-            wanted = _semver_tuple(tested)
-            if current and wanted and current > wanted:
-                report.add(
-                    "WARN",
-                    f"Upstream {version} is newer than the validated v{tested}; "
-                    "the shared-DB schema fence follows the newest copy — "
-                    "update magic-hermes if sessions fail to open the store",
-                )
-            else:
-                report.add(
-                    "INFO",
-                    f"Upstream {version} differs from validated v{tested} "
-                    f"(supported series {series}.x)",
-                )
+        elif not newer_copies:
+            report.add(
+                "INFO",
+                f"Upstream {version} differs from validated v{tested} "
+                f"(supported series {series}.x)",
+            )
+        if newer_copies:
+            skew = ", ".join(f"{v} @ {r}" for r, v in newer_copies)
+            report.add(
+                "WARN",
+                f"Upstream copy {skew} is newer than the validated v{tested}; "
+                "the shared-DB schema fence follows the newest copy — adopt "
+                "the newer series via scripts/next_magic_context_release.py + "
+                "scripts/sync_magic_context_release.py (series jumps are "
+                "PR-gated), release, then `magic-hermes install`",
+            )
     else:
         report.add(
             "FAIL",

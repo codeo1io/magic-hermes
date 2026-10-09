@@ -251,9 +251,16 @@ def test_official_runtime_indexes_tools_memories_and_compartments(tmp_path):
         assert "<session-history>" in rendered_text
         assert rendered["synthetic_leading_count"] == 2
 
-        # Historian completion is an upstream note-nudge trigger. The first
-        # render anchors/defer-delivers on the trigger-time user message; the
-        # next user turn receives the canonical deferred-note instruction.
+        # Historian completion is an upstream note-nudge trigger. Where the
+        # canonical deferred-note instruction lands is series-dependent:
+        #   < 0.46 — the trigger-time render only anchors the deferral; the
+        #             NEXT user turn receives the instruction.
+        #  >= 0.46 — the cache-busting trigger-time render delivers the
+        #             instruction immediately ON the trigger-time user
+        #             message and sticky-anchors it there; every later
+        #             render replays it onto the SAME anchored message and
+        #             new turns do not receive a fresh nudge (15-min
+        #             cooldown), so a stale copy cannot re-defer.
         followup = [*messages, {"role": "user", "content": "Continue after historian."}]
         nudged = client.call(
             "render_context",
@@ -268,7 +275,34 @@ def test_official_runtime_indexes_tools_memories_and_compartments(tmp_path):
             for message in nudged["messages"]
             if "Continue after historian." in str(message.get("content", ""))
         )
-        assert '<instruction name="deferred_notes">' in followup_user["content"]
+        if supported_magic_context_series() >= (0, 46):
+            last_user_content = [
+                message for message in messages if message["role"] == "user"
+            ][-1]["content"]
+
+            def _anchored(payload):
+                # the real (non-synthetic) trigger-time user message is the
+                # LAST message whose content still carries the original text
+                return [
+                    message
+                    for message in payload["messages"]
+                    if last_user_content in str(message.get("content", ""))
+                ][-1]
+
+            anchored_on_trigger = _anchored(rendered)
+            anchored_on_followup_render = _anchored(nudged)
+            assert (
+                '<instruction name="deferred_notes">'
+                in anchored_on_trigger["content"]
+            )
+            assert (
+                '<instruction name="deferred_notes">'
+                in anchored_on_followup_render["content"]
+            )
+            # sticky anchor: the new turn itself stays clean
+            assert '<instruction name="deferred_notes">' not in followup_user["content"]
+        else:
+            assert '<instruction name="deferred_notes">' in followup_user["content"]
 
     with RuntimeClient(db_path=db_path, timeout=60) as restarted:
         restarted.call(
