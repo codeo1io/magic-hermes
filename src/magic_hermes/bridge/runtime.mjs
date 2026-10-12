@@ -1965,6 +1965,17 @@ function lastCompartmentIds(db, sessionId, count) {
   }
 }
 
+// Upstream contract string (KTD2/KTD5): @cortexkit/pi-magic-context mints this
+// exact rejection in validateParsedCompartments (dist/index.js — "output left
+// uncovered messages ${expectedStart}-${chunkEnd} without <unprocessed_from>")
+// when the historian covered a contiguous prefix but omitted the trailing
+// <unprocessed_from> suffix declaration. Anchored at both ends so ONLY this
+// class matches; if a future upstream series rewords the string, the match
+// fails and behavior degrades silently to today's repair/reject path — the
+// salvage regression test is the drift tripwire that goes red.
+const UNCOVERED_SUFFIX_ERROR_RE =
+  /^Historian returned invalid compartment output: output left uncovered messages (\d+)-(\d+) without <unprocessed_from>$/;
+
 async function historianPublish(args) {
   const session = getSession(args);
   const pending = session.pendingHistorian;
@@ -1972,6 +1983,10 @@ async function historianPublish(args) {
     throw new Error("No historian pass is pending");
   }
   const output = String(args.output || "");
+  // The text this pass publishes onward (two-pass editor prompt). It starts
+  // as the received output and becomes the marker-appended text only when the
+  // uncovered-suffix salvage below re-validates cleanly.
+  let publishText = output;
   let validation = mc("validateHistorianOutput")(
     output,
     session.id,
@@ -1979,6 +1994,34 @@ async function historianPublish(args) {
     pending.priorCompartments,
     pending.priorCompartments.length
   );
+  // Uncovered-suffix salvage (maestro A4 d59758598379): a rejection that is
+  // SOLELY the missing <unprocessed_from> declaration over an otherwise
+  // accepted contiguous prefix is completed deterministically by appending
+  // the marker with the ordinal the validator's own error names, then
+  // re-validated through the same live validator. The validator stays
+  // authoritative (R2): if the amended text does not pass, or the error is
+  // any other class, behavior is byte-for-byte today's — the failure payload
+  // below is built from the ORIGINAL error and text.
+  if (!validation.ok) {
+    const uncovered = UNCOVERED_SUFFIX_ERROR_RE.exec(
+      String(validation.error || "")
+    );
+    if (uncovered) {
+      const amended =
+        `${output}\n<unprocessed_from>${uncovered[1]}</unprocessed_from>`;
+      const revalidated = mc("validateHistorianOutput")(
+        amended,
+        session.id,
+        pending.chunk,
+        pending.priorCompartments,
+        pending.priorCompartments.length
+      );
+      if (revalidated.ok) {
+        validation = revalidated;
+        publishText = amended;
+      }
+    }
+  }
   const editorPass = args.editor_pass === true;
   if (editorPass && !validation.ok && pending.validatedDraft?.ok) {
     validation = pending.validatedDraft;
@@ -2002,7 +2045,7 @@ async function historianPublish(args) {
       ok: false,
       needs_editor: true,
       editor_system_prompt: pending.editorSystemPrompt,
-      editor_prompt: mc("buildHistorianEditorPrompt")(output)
+      editor_prompt: mc("buildHistorianEditorPrompt")(publishText)
     };
   }
 

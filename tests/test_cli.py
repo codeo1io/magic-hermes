@@ -527,6 +527,98 @@ class TestDoctorGuardPosture:
         assert guard_checks[0]["status"] == "PASS"
         assert payload["summary"]["fail"] == 0
 
+    def test_doctor_json_includes_partial_coverage_count(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        """R5 (finding d59758598379) — doctor surfaces an INFO row with the
+        trailing-24h count of partial-coverage success rows (covered prefix
+        published, remainder declared via ``unprocessed_from``). Only rows
+        that are fresh, successful, and carry a marker inside the chunk
+        count; the INFO row never touches the health verdict."""
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        hg.apply_guard(db, verify=False)
+        now_ms = int(time.time() * 1000)
+        con = sqlite3.connect(db)
+        con.executemany(
+            "insert into historian_runs "
+            "(session_id, harness, run_kind, status, "
+            "chunk_start_ordinal, chunk_end_ordinal, unprocessed_from, "
+            "compartments_produced, created_at) "
+            "values (?, 'hermes', 'incremental', 'success', 1, 60, ?, 1, ?)",
+            [("s-partial", 31, now_ms), ("s-partial", 41, now_ms - 1000)],
+        )
+        # Non-counting controls: a stale partial pass (outside 24h), a
+        # failed row that happens to carry a marker, and a marker past the
+        # chunk end (full coverage does not declare a remainder).
+        con.execute(
+            "insert into historian_runs "
+            "(session_id, harness, run_kind, status, "
+            "chunk_start_ordinal, chunk_end_ordinal, unprocessed_from, "
+            "compartments_produced, created_at) "
+            "values ('s-partial', 'hermes', 'incremental', 'success', "
+            "1, 60, 21, 1, ?)",
+            (now_ms - 25 * 60 * 60 * 1000,),
+        )
+        con.execute(
+            "insert into historian_runs "
+            "(session_id, harness, run_kind, status, failure_reason, "
+            "chunk_start_ordinal, chunk_end_ordinal, unprocessed_from, "
+            "compartments_produced, created_at) "
+            "values ('s-partial', 'hermes', 'incremental', 'failed', "
+            "'historian output rejected: ...', 1, 60, 31, 0, ?)",
+            (now_ms,),
+        )
+        con.execute(
+            "insert into historian_runs "
+            "(session_id, harness, run_kind, status, "
+            "chunk_start_ordinal, chunk_end_ordinal, unprocessed_from, "
+            "compartments_produced, created_at) "
+            "values ('s-full', 'hermes', 'incremental', 'success', "
+            "1, 60, 61, 1, ?)",
+            (now_ms,),
+        )
+        con.commit()
+        con.close()
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        self._wire_config()
+
+        tested = cli.tested_magic_context_version()
+        package = make_package(tmp_path / "pkg", tested)
+        series = ".".join(map(str, cli.supported_magic_context_series()))
+        sidecar = mock.MagicMock()
+        sidecar.call.side_effect = lambda method, params=None, timeout=60: {
+            "hello": {"harness": "hermes", "package_version": tested},
+            "doctor": {
+                "database_health": "ok",
+                "core_symbols_ready": True,
+                "supported_series": series,
+            },
+        }[method]
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+
+        with (
+            mock.patch.object(
+                cli, "discover_installations", return_value=[(package, tested)]
+            ),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+        ):
+            assert cli.run_doctor(json_output=True) == 0
+        payload = json.loads(capsys.readouterr().out)
+        partial = [
+            c
+            for c in payload["checks"]
+            if "partial-coverage" in c["message"]
+        ]
+        assert partial, "doctor --json must surface the partial-coverage row"
+        assert partial[0]["status"] == "INFO"
+        assert "(last 24h): 2 success row(s)" in partial[0]["message"]
+        assert payload["summary"]["fail"] == 0
+
 
 class TestDoctorSidecarRetry:
     """R2 (finding c7d63424) — the doctor sidecar pair (hello + doctor)

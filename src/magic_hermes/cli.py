@@ -455,6 +455,38 @@ def db_schema_lane(db_path: Path) -> int | None:
     return int(row[0]) if row and row[0] is not None else None
 
 
+def partial_coverage_success_rows_24h(db_path: Path) -> int | None:
+    """Count partial-coverage historian success rows in the last 24h.
+
+    A success row with ``unprocessed_from`` inside the chunk is upstream's
+    own first-class partial outcome: the pass published a contiguous
+    covered prefix and declared the trailing remainder unprocessed — via a
+    model-emitted ``<unprocessed_from>`` marker or the bridge's
+    uncovered-suffix salvage at the publish boundary, which are
+    indistinguishable in telemetry by design. The remainder self-retries
+    on the next historian pass (``historianPrepare`` resumes at
+    ``lastEnd + 1``). Read-only and fail-open: ``None`` skips the doctor
+    line entirely rather than ever touching the health-gate verdict
+    (KTD4 — an operator signal, INFO only).
+    """
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "select count(*) from historian_runs "
+                "where status = 'success' "
+                "and unprocessed_from is not null "
+                "and unprocessed_from <= chunk_end_ordinal "
+                "and created_at >= ?",
+                (int(time.time() * 1000) - 24 * 60 * 60 * 1000,),
+            ).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    return int(row[0]) if row else 0
+
+
 # Upstream's storage-fence refusal sentence (finding c7d63424): the
 # stable user-facing form @cortexkit/pi-magic-context prints when the
 # shared store's migration lane exceeds what the running binary
@@ -694,6 +726,20 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                 "PASS",
                 "Historian classification guard active "
                 f"({guard.marker_rows_24h} rows reclassified in the last 24h)",
+            )
+        # Partial-coverage observability (maestro finding d59758598379,
+        # R5): count the trailing-24h success rows that published a
+        # covered prefix with an unprocessed remainder. INFO only — this
+        # is upstream's intended partial-pass outcome, not a degradation
+        # of the health gate. A failed read silently skips the line.
+        partial_coverage = partial_coverage_success_rows_24h(db_path)
+        if partial_coverage is not None:
+            report.add(
+                "INFO",
+                "Historian partial-coverage passes (last 24h): "
+                f"{partial_coverage} success row(s) with <unprocessed_from> "
+                "— covered prefix published, remainder self-retries next "
+                "pass",
             )
     else:
         report.add(
