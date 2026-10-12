@@ -173,6 +173,37 @@ the early-return paths is validated: `RETIRES_AT_UPSTREAM` in
 `magic-hermes guard remove` drops the trigger (an idempotent no-op when
 absent). `MAGIC_CONTEXT_DB_PATH` overrides the store for testing.
 
+#### Uncovered-suffix salvage at the publish boundary
+
+The same finding's dominant recurring class is different: the historian
+model returns a structurally valid document covering a contiguous prefix
+of the chunk but omits the `<unprocessed_from>` marker declaring the
+trailing remainder unprocessed. Upstream's validator rejects that output
+(`output left uncovered messages N-M without <unprocessed_from>`), the
+repair retry usually repeats the omission, and the pass aborts as
+`status='failed'` — the row maestro's operational scan counts.
+
+The bridge fixes this at the single publish boundary
+(`historianPublish` in `src/magic_hermes/bridge/runtime.mjs`): a rejection
+that is *solely* this class — matched by an anchored regex on the exact
+upstream error string — is completed deterministically by appending
+`<unprocessed_from>N</unprocessed_from>` with the ordinal the validator's
+own error names, then re-validated through the same live upstream
+validator. The validator stays authoritative: the amended text publishes
+only on its clean second pass, every other error class (marker mismatch,
+overlap, gap, out-of-chunk, zero compartments, malformed XML) rejects
+exactly as before, and a failed re-validation falls through to today's
+repair/reject behavior with the original error. This is not masking a
+failure: a covered prefix with a declared remainder is upstream's own
+first-class partial outcome — the remainder self-retries on the next
+historian pass, exactly as it does for model-emitted markers. If a future
+upstream series rewords the error string, the anchored match fails and
+behavior degrades silently to today's path (the salvage regression test
+is the tripwire that goes red). `magic-hermes doctor` reports an INFO
+line with the trailing-24h count of partial-coverage success rows
+(`status='success'` with `unprocessed_from` inside the chunk); salvaged
+and model-emitted markers are indistinguishable in telemetry by design.
+
 ### 1d. Repository provenance guard
 
 Maestro's phase-1 probe pins this repository's canonical origin
