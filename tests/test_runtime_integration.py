@@ -72,6 +72,51 @@ def historian_xml(start, end):
 </output>"""
 
 
+def historian_xml_partial(start, mid):
+    """Historian output covering only start..mid with NO <unprocessed_from>
+    suffix declaration anywhere (meta included).
+
+    This is the exact output shape that makes the upstream validator mint
+    the uncovered-suffix rejection class ("output left uncovered messages
+    {mid+1}-{chunkEnd} without <unprocessed_from>") whenever the pending
+    chunk extends past mid: a contiguous, otherwise-valid covered prefix
+    whose trailing declaration is simply missing.
+    """
+    primer_question = (
+        "How does the runtime adapter preserve Magic Context lifecycle parity?"
+    )
+    return f"""<output>
+<compartments>
+<compartment start="{start}" end="{mid}" title="Runtime integration"
+ episode_type="implementation" importance="80">
+<p1>I verified the official runtime adapter over messages {start}-{mid}.</p1>
+<p2>Official runtime adapter verification.</p2>
+<p3>Runtime adapter verified.</p3>
+<p4>Adapter verified.</p4>
+</compartment>
+</compartments>
+<facts>
+</facts>
+<events>
+<causal_incident at_compartment="1">
+<summary>The host requires its own auxiliary LLM route.</summary>
+<affected_surface>host_integration</affected_surface>
+<symptom>Upstream Pi spawning cannot run inside Hermes.</symptom>
+<cause_summary>Hermes owns provider credentials and task routing.</cause_summary>
+<disposition>fixed</disposition>
+<evidence>The runtime adapter delegates historian completion to Hermes.</evidence>
+<fix_summary>Registered the mc_historian auxiliary route.</fix_summary>
+</causal_incident>
+</events>
+<primer_candidates>
+<primer at_compartment="1">{primer_question}</primer>
+</primer_candidates>
+<meta>
+<messages_processed>{start}-{mid}</messages_processed>
+</meta>
+</output>"""
+
+
 def test_official_runtime_indexes_tools_memories_and_compartments(tmp_path):
     config_dir = tmp_path / ".cortexkit"
     config_dir.mkdir()
@@ -2465,6 +2510,437 @@ def test_historian_publish_success_records_success_row(monkeypatch, tmp_path):
     assert row["importance_min"] == 80
     assert row["importance_max"] == 80
     assert row["importance_avg"] == 80
+    assert_no_unclassified_hermes_failures(db_path)
+
+
+def test_historian_publish_partial_without_marker_salvages_to_success_row(
+    monkeypatch, tmp_path
+):
+    """Uncovered-suffix salvage accept path (plan U2, maestro A4 d59758598379).
+
+    A structurally valid compartment document whose coverage stops mid-chunk
+    with NO <unprocessed_from> marker is the exact class the upstream
+    validator rejects with "output left uncovered messages N-M without
+    <unprocessed_from>" — the dominant recurring hermes-lane failure behind
+    maestro's phase1.context.operational FAIL. The bridge completes the
+    truncated declaration deterministically (marker ordinal taken from the
+    validator's own error) and re-validates through the same live validator;
+    the pass must therefore land as upstream's own first-class partial
+    outcome: exactly one success row whose unprocessed_from is the first
+    uncovered ordinal — indistinguishable from a model-emitted marker.
+
+    KTD5 drift tripwire: if a future upstream series rewords the
+    uncovered-suffix error string, the bridge's anchored
+    UNCOVERED_SUFFIX_ERROR_RE stops matching, salvage degrades silently to
+    today's reject/repair path, and THIS test goes red — the signal to
+    update the anchored regex in src/magic_hermes/bridge/runtime.mjs.
+    """
+    user_home = _historian_telemetry_config(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-salvage.db"
+
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {"session_id": "telemetry-salvage", "project_root": str(project)},
+            timeout=60,
+        )
+        prepared = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-salvage",
+                "messages": conversation(12),
+                "protect_last_n": 2,
+                "history_budget_tokens": 8_000,
+            },
+            timeout=60,
+        )
+        assert prepared["ready"] is True
+        start = prepared["chunk"]["start"]
+        end = prepared["chunk"]["end"]
+        # Room for a covered prefix plus an uncovered suffix.
+        assert end - start >= 4
+        mid = end - 3
+
+        salvaged = client.call(
+            "historian_publish",
+            {
+                "session_id": "telemetry-salvage",
+                "output": historian_xml_partial(start, mid),
+            },
+            timeout=60,
+        )
+        assert salvaged["ok"] is True
+        assert salvaged["compartments_added"] > 0
+
+        # A redundant abort after a salvaged publish is a no-op for
+        # telemetry, exactly as for a fully covered publish: the pass
+        # already recorded its terminal (success) outcome.
+        redundant = client.call(
+            "historian_abort", {"session_id": "telemetry-salvage"}
+        )
+        assert redundant == {"aborted": True}
+
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["status"] == "success"
+    assert row["failure_reason"] is None
+    assert row["session_id"] == "telemetry-salvage"
+    assert row["run_kind"] == "incremental"
+    assert row["chunk_start_ordinal"] == start
+    assert row["chunk_end_ordinal"] == end
+    # The salvaged declaration: coverage stopped at mid, so the pass
+    # published the prefix and declared mid+1 as the first unprocessed
+    # ordinal — what a model-emitted marker would have recorded.
+    assert row["unprocessed_from"] == mid + 1
+    assert row["compartments_produced"] == salvaged["compartments_added"]
+    assert_no_unclassified_hermes_failures(db_path)
+
+
+def test_historian_salvaged_partial_self_retries_remainder_next_prepare(
+    monkeypatch, tmp_path
+):
+    """Loop closure after a salvaged partial publish (plan R3/U2).
+
+    Upstream historianPrepare computes the next chunk from the last covered
+    end (+1), so a salvaged pass must leave the session positioned exactly
+    at the declared unprocessed ordinal: the next prepare resumes at mid+1
+    and publishing full coverage for the remainder completes the work — the
+    uncovered suffix self-retries on the next pass exactly as it does for
+    model-emitted markers. No failed row is ever minted along the way.
+    """
+    user_home = _historian_telemetry_config(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-salvage-retry.db"
+
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {
+                "session_id": "telemetry-salvage-retry",
+                "project_root": str(project),
+            },
+            timeout=60,
+        )
+        prepared = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-salvage-retry",
+                "messages": conversation(12),
+                "protect_last_n": 2,
+                "history_budget_tokens": 8_000,
+            },
+            timeout=60,
+        )
+        assert prepared["ready"] is True
+        start = prepared["chunk"]["start"]
+        end = prepared["chunk"]["end"]
+        assert end - start >= 4
+        mid = end - 3
+
+        salvaged = client.call(
+            "historian_publish",
+            {
+                "session_id": "telemetry-salvage-retry",
+                "output": historian_xml_partial(start, mid),
+            },
+            timeout=60,
+        )
+        assert salvaged["ok"] is True
+
+        prepared_again = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-salvage-retry",
+                "messages": conversation(12),
+                "protect_last_n": 2,
+                "history_budget_tokens": 8_000,
+            },
+            timeout=60,
+        )
+        assert prepared_again["ready"] is True
+        # The remainder re-enters processing at the declared ordinal.
+        assert prepared_again["chunk"]["start"] == mid + 1
+        remainder_end = prepared_again["chunk"]["end"]
+        assert remainder_end >= mid + 1
+
+        completed = client.call(
+            "historian_publish",
+            {
+                "session_id": "telemetry-salvage-retry",
+                "output": historian_xml(mid + 1, remainder_end),
+            },
+            timeout=60,
+        )
+        assert completed["ok"] is True
+
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 2
+    assert {row["status"] for row in rows} == {"success"}
+    assert rows[0]["unprocessed_from"] == mid + 1
+    assert rows[1]["chunk_start_ordinal"] == mid + 1
+    assert rows[1]["unprocessed_from"] == remainder_end + 1
+    assert all(row["failure_reason"] is None for row in rows)
+    assert_no_unclassified_hermes_failures(db_path)
+
+
+def test_historian_publish_wrong_marker_value_still_rejects(
+    monkeypatch, tmp_path
+):
+    """Adversarial negative (plan U2 matrix): a marker that is PRESENT but
+    names the wrong ordinal must still reject.
+
+    The salvage fires only on the exact missing-marker class; the
+    marker-mismatch class is a different upstream rejection and must keep
+    today's byte-for-byte behavior — repair prompt, no telemetry row at
+    publish time, and the engine-composed failed row only on abort.
+    """
+    user_home = _historian_telemetry_config(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-wrong-marker.db"
+
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {
+                "session_id": "telemetry-wrong-marker",
+                "project_root": str(project),
+            },
+            timeout=60,
+        )
+        prepared = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-wrong-marker",
+                "messages": conversation(12),
+                "protect_last_n": 2,
+                "history_budget_tokens": 8_000,
+            },
+            timeout=60,
+        )
+        assert prepared["ready"] is True
+        start = prepared["chunk"]["start"]
+        end = prepared["chunk"]["end"]
+        assert end - start >= 4
+        mid = end - 3
+
+        rejected = client.call(
+            "historian_publish",
+            {
+                "session_id": "telemetry-wrong-marker",
+                "output": (
+                    historian_xml_partial(start, mid)
+                    + f"\n<unprocessed_from>{start}</unprocessed_from>"
+                ),
+            },
+            timeout=60,
+        )
+        assert rejected["ok"] is False
+        # The marker-mismatch class, verbatim upstream vocabulary — NOT the
+        # uncovered-suffix class, so the salvage must not have fired.
+        assert (
+            f"<unprocessed_from> {start} does not match next uncovered "
+            f"message {mid + 1}" in rejected["error"]
+        )
+        assert "output left uncovered messages" not in rejected["error"]
+        assert rejected["repair_prompt"]
+        # Intermediate outcome: still retryable, nothing recorded yet.
+        assert hermes_historian_rows(db_path) == []
+
+        aborted = client.call(
+            "historian_abort",
+            {
+                "session_id": "telemetry-wrong-marker",
+                "outcome": {
+                    "status": "failed",
+                    "reason": (
+                        "historian output rejected: " + rejected["error"]
+                    ),
+                },
+            },
+        )
+        assert aborted == {"aborted": True}
+
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["failure_reason"] == (
+        "historian output rejected: " + rejected["error"]
+    )
+    assert_no_unclassified_hermes_failures(db_path)
+
+
+def test_historian_publish_gap_still_rejects_with_upstream_error_string(
+    monkeypatch, tmp_path
+):
+    """Adversarial negative + upstream reject-vocabulary tripwire (plan
+    U2/KTD5): a compartment that starts past the expected ordinal leaves a
+    GAP — a rejection class adjacent to the salvaged one that must reject
+    exactly as before, with upstream's verbatim minted string.
+
+    This pins the still-rejecting half of the salvage boundary AND doubles
+    as the upstream-string drift tripwire: if a future upstream series
+    rewords its minted rejection vocabulary, this assertion goes red — the
+    cue to re-anchor UNCOVERED_SUFFIX_ERROR_RE in the same change.
+    """
+    user_home = _historian_telemetry_config(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-gap.db"
+
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {"session_id": "telemetry-gap", "project_root": str(project)},
+            timeout=60,
+        )
+        prepared = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-gap",
+                "messages": conversation(12),
+                "protect_last_n": 2,
+                "history_budget_tokens": 8_000,
+            },
+            timeout=60,
+        )
+        assert prepared["ready"] is True
+        start = prepared["chunk"]["start"]
+        end = prepared["chunk"]["end"]
+        assert end - start >= 4
+        mid = end - 3
+
+        rejected = client.call(
+            "historian_publish",
+            {
+                "session_id": "telemetry-gap",
+                # Coverage begins at start+1: message `start` is left behind.
+                "output": historian_xml_partial(start + 1, mid),
+            },
+            timeout=60,
+        )
+        assert rejected["ok"] is False
+        assert rejected["error"].endswith(
+            f"gap before message {start + 1} (expected {start})"
+        )
+        assert "output left uncovered messages" not in rejected["error"]
+        assert rejected["repair_prompt"]
+        assert hermes_historian_rows(db_path) == []
+
+        aborted = client.call(
+            "historian_abort",
+            {
+                "session_id": "telemetry-gap",
+                "outcome": {
+                    "status": "failed",
+                    "reason": (
+                        "historian output rejected: " + rejected["error"]
+                    ),
+                },
+            },
+        )
+        assert aborted == {"aborted": True}
+
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["failure_reason"] == (
+        "historian output rejected: " + rejected["error"]
+    )
+    assert_no_unclassified_hermes_failures(db_path)
+
+
+def test_historian_two_pass_editor_failure_falls_back_to_salvaged_draft(
+    monkeypatch, tmp_path
+):
+    """Two-pass interplay with the salvage (plan KTD3/U2).
+
+    With two_pass enabled, the salvaged (marker-completed) validation is the
+    draft the editor round-trips: the editor prompt is built from the
+    amended text — the editor sees and must preserve the suffix declaration
+    — and a failed editor pass falls back to that validated draft. The
+    terminal row is the same partial-coverage success a model-emitted
+    marker would have produced.
+    """
+    user_home = _historian_telemetry_config(
+        tmp_path, {"historian": {"model": "gpt-5.5", "two_pass": True}}
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-two-pass-salvage.db"
+
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {
+                "session_id": "telemetry-two-pass-salvage",
+                "project_root": str(project),
+            },
+            timeout=60,
+        )
+        prepared = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-two-pass-salvage",
+                "messages": conversation(12),
+                "protect_last_n": 2,
+                "history_budget_tokens": 8_000,
+            },
+            timeout=60,
+        )
+        assert prepared["ready"] is True
+        assert prepared["two_pass"] is True
+        start = prepared["chunk"]["start"]
+        end = prepared["chunk"]["end"]
+        assert end - start >= 4
+        mid = end - 3
+
+        editor_request = client.call(
+            "historian_publish",
+            {
+                "session_id": "telemetry-two-pass-salvage",
+                "output": historian_xml_partial(start, mid),
+            },
+            timeout=60,
+        )
+        assert editor_request["ok"] is False
+        assert editor_request["needs_editor"] is True
+        # KTD3: the editor prompt carries the marker-completed text, not
+        # the raw truncated output the model actually sent.
+        assert (
+            f"<unprocessed_from>{mid + 1}</unprocessed_from>"
+            in editor_request["editor_prompt"]
+        )
+        assert hermes_historian_rows(db_path) == []
+
+        published = client.call(
+            "historian_publish",
+            {
+                "session_id": "telemetry-two-pass-salvage",
+                "output": "invalid editor output",
+                "editor_pass": True,
+            },
+            timeout=60,
+        )
+        assert published["ok"] is True
+        assert published["compartments_added"] == 1
+
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["status"] == "success"
+    assert row["failure_reason"] is None
+    assert row["unprocessed_from"] == mid + 1
+    assert row["chunk_end_ordinal"] == end
     assert_no_unclassified_hermes_failures(db_path)
 
 
