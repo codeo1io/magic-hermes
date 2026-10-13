@@ -104,10 +104,18 @@ const FALLBACK_EXPORTS = [
 // Modules of the adapter bundle a name can be re-exported from when it is
 // not a top-level binding of index.js. Upstream 0.43.x code-splits the
 // session-chunk family into its own chunk (read-session-chunk-*.js) while
-// earlier series exported everything from index.js; keep both shapes
-// working. Chunk file names are content-hashed and drift per release, so
-// match by stable prefix rather than exact name.
-const SPLIT_MODULE_PREFIXES = ["read-session-chunk-"];
+// earlier series exported everything from index.js; 0.48.x additionally
+// splits the embedding-registry, memory-storage, and tag-storage families
+// into project-embedding-registry-*.js / storage-memory-*.js /
+// storage-tags-*.js re-export chunks (shape: `local2 as name` — same
+// match as read-session-chunk). Chunk file names are content-hashed and
+// drift per release, so match by stable prefix rather than exact name.
+const SPLIT_MODULE_PREFIXES = [
+  "read-session-chunk-",
+  "project-embedding-registry-",
+  "storage-memory-",
+  "storage-tags-",
+];
 
 // Names a missing required export can be synthesized from when upstream
 // refactors instead of removing it. Upstream 0.44.x split the pure resolver
@@ -229,16 +237,38 @@ export async function load(url, context, nextLoad) {
   }
 
   let source = String(result.source);
+  // 0.47.x and earlier call the exported initializer verbatim:
+  //   setHarness("pi"); / setHarness('pi'); / setHarness(PI_HARNESS_KIND);
+  // 0.48.x is esbuild-bundled with the initializer RENAMED (observed:
+  // setHarness2(PI_HARNESS_KIND);) and the rename seed changes per
+  // upstream release, so match the callee by its stable stem plus the
+  // literal argument forms, and re-write preserving the callee name we
+  // actually found. The kind argument must stay a static literal or the
+  // harness-known detection constant: replacing a dynamic kind would
+  // silently misdeclare the harness.
   const piHarnessForms = [
     'setHarness("pi");',
     "setHarness('pi');",
     "setHarness(PI_HARNESS_KIND);",
   ];
-  const matchedForm = piHarnessForms.find((form) => source.includes(form));
+  let matchedForm = piHarnessForms.find((form) => source.includes(form));
+  if (matchedForm === undefined) {
+    const renamed =
+      /\b(setHarness\d*)\(\s*(?:"pi"|'pi'|PI_HARNESS_KIND)\s*\)\s*;/.exec(source);
+    if (renamed !== null) {
+      matchedForm = renamed[0];
+      source = source.replace(
+        renamed[0],
+        renamed[1] + '("hermes");'
+      );
+    }
+  }
   if (matchedForm === undefined) {
     throw new Error("Unsupported Magic Context adapter: Pi harness initializer not found");
   }
-  source = source.replace(matchedForm, 'setHarness("hermes");');
+  if (piHarnessForms.includes(matchedForm)) {
+    source = source.replace(matchedForm, 'setHarness("hermes");');
+  }
 
   // Names that are top-level bindings of index.js can be re-exported
   // directly. Upstream 0.43.x code-splits some exports into sibling chunks;
@@ -280,7 +310,12 @@ export async function load(url, context, nextLoad) {
     // least one deferred name; a name found nowhere stays undefined at
     // call time — the runtime's mc() throws a precise error naming it,
     // matching the pre-existing fail-closed contract.
+    // `chunkProviders` remembers which chunk supplied which name so the
+    // synthesis pass below can locally import a chunk-provided recipe
+    // dependency (0.48.x moved e.g. drainStaleEmbeddingIdentitiesForProject
+    // out of index.js into project-embedding-registry-*.js).
     const remaining = new Set(deferred);
+    const chunkProviders = new Map();
     for (const chunkUrl of splitModuleUrls(url)) {
       if (remaining.size === 0) break;
       const chunkSource = String((await nextLoad(chunkUrl, { format: "module" })).source ?? "");
@@ -291,29 +326,49 @@ export async function load(url, context, nextLoad) {
       if (fromChunk.length === 0) continue;
       const specifier = new URL(chunkUrl).pathname;
       suffix += "\nexport { " + fromChunk.map((name) => name + " as __mh_" + name).join(", ") + ' } from "' + specifier + '";\n';
-      for (const name of fromChunk) remaining.delete(name);
+      for (const name of fromChunk) {
+        remaining.delete(name);
+        chunkProviders.set(name, specifier);
+      }
     }
     if (remaining.size > 0) {
       // Try to synthesize missing names whose upstream replacements are
       // available (see SYNTHESIZED_EXPORTS). Each emitted binding closes
       // over its `requires`-gate dependencies, so every dependency must
-      // itself be exported by the appended suffix — otherwise the
-      // synthesized module would reference an undeclared identifier at
-      // evaluation time.
-      const synthesized = [];
-      for (const name of [...remaining].sort()) {
-        const recipe = SYNTHESIZED_EXPORTS[name];
-        if (recipe === undefined) continue;
-        if (!recipe.requires.every((dep) => direct.includes(dep))) continue;
-        const binding = "__mh_" + name;
-        const deps = recipe.requires.join(", ");
-        suffix +=
-          "\nconst " + binding + " = (" +
-          recipe.source + ")(" + deps + ");\n";
-        suffix += "export { " + binding + " };\n";
-        synthesized.push(name);
+      // itself be available in the appended suffix scope — as a direct
+      // index.js top-level binding, as a chunk-provided import (emitted
+      // below; import declarations hoist, so position is safe), or as a
+      // name synthesized earlier in this pass. Iterate to a fixed point
+      // so chained recipes (A from B, C from A) apply in one load.
+      const synthesized = new Set();
+      const importedForSynthesis = new Set();
+      let progressed = true;
+      while (remaining.size > 0 && progressed) {
+        progressed = false;
+        for (const name of [...remaining].sort()) {
+          const recipe = SYNTHESIZED_EXPORTS[name];
+          if (recipe === undefined) continue;
+          const depAvailable = (dep) =>
+            direct.includes(dep) || chunkProviders.has(dep) || synthesized.has(dep);
+          if (!recipe.requires.every(depAvailable)) continue;
+          for (const dep of recipe.requires) {
+            if (direct.includes(dep) || synthesized.has(dep)) continue;
+            if (!importedForSynthesis.has(dep)) {
+              importedForSynthesis.add(dep);
+              suffix += 'import { ' + dep + ' } from "' + chunkProviders.get(dep) + '";\n';
+            }
+          }
+          const binding = "__mh_" + name;
+          const deps = recipe.requires.join(", ");
+          suffix +=
+            "\nconst " + binding + " = (" +
+            recipe.source + ")(" + deps + ");\n";
+          suffix += "export { " + binding + " };\n";
+          synthesized.add(name);
+          remaining.delete(name);
+          progressed = true;
+        }
       }
-      for (const name of synthesized) remaining.delete(name);
     }
     if (remaining.size > 0) {
       throw new Error(

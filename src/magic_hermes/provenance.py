@@ -52,6 +52,7 @@ Ref: maestro findings 4bc6f3a5b0c1 (strict tier) and d59758598379
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -308,14 +309,27 @@ class RepairResult:
 
 
 def _git(args: list[str], repo: Path) -> tuple[int, str]:
-    """Run ``git -C <repo> <args>``; return ``(returncode, stdout)``."""
+    """Run ``git -C <repo> <args>``; return ``(returncode, stdout)``.
 
+    Discovery is ceiling-bounded at the target's own parent: without it,
+    git's upward ``.git`` traversal answers for an ENCLOSING repository
+    when ``repo`` itself is not one, silently attributing the outer
+    repo's origin/branch state to the path under test (observed
+    2026-10-12: pytest tmp trees under the newly-git-versioned
+    ``~/.hermes`` made ``notarepo`` probes report origin_match/
+    branch_tracking drift). ``--git-dir`` inside the target still
+    resolves normally — only escape is blocked.
+    """
+
+    ceiling = str(repo.resolve().parent)
+    env = {**os.environ, "GIT_CEILING_DIRECTORIES": ceiling}
     proc = subprocess.run(
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
         timeout=GIT_TIMEOUT_S,
         check=False,
+        env=env,
     )
     return proc.returncode, proc.stdout.strip()
 

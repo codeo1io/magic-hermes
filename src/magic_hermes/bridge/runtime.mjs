@@ -1294,17 +1294,44 @@ async function executeTool(args) {
       }))
     }
   };
-  let result = await mc("withRawMessageProvider")(
-    session.id,
-    providerFor(session),
-    () => tool.execute(
-      String(args.call_id || "magic-hermes"),
-      args.arguments || {},
-      undefined,
-      () => {},
-      context
-    )
-  );
+  let result;
+  try {
+    result = await mc("withRawMessageProvider")(
+      session.id,
+      providerFor(session),
+      () => tool.execute(
+        String(args.call_id || "magic-hermes"),
+        args.arguments || {},
+        undefined,
+        () => {},
+        context
+      )
+    );
+  } catch (toolError) {
+    // 0.48.x registers every tool wrapped in throwReturnedToolErrors():
+    // an isError result is re-thrown as an Error whose message is the
+    // concatenated text blocks. Reconstruct the pre-0.48 result shape so
+    // the contract below (isError inspection + FTS fallback) keeps
+    // working across series; a genuine non-tool exception still
+    // propagates as a thrown error to the host.
+    const message = toolError instanceof Error ? toolError.message : String(toolError);
+    const knownToolErrorShapes = [
+      "This session's history numbering can't be verified",
+      "No messages found in range",
+      "No message at ordinal",
+      "is no longer in this session's history",
+      "Range ",
+      " is entirely within the live tail"
+    ];
+    if (!knownToolErrorShapes.some((shape) => message.includes(shape))) {
+      throw toolError;
+    }
+    result = {
+      content: [{ type: "text", text: message }],
+      details: undefined,
+      isError: true
+    };
+  }
 
   const expandText = resultText(result);
   const emptyExpand =

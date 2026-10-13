@@ -762,6 +762,26 @@ def test_upstream_dreamer_maps_verifies_and_classifies_memories(tmp_path):
     (src / "sample.py").write_text(
         "def current_rule():\n    return 'mapped-and-verified'\n", encoding="utf-8"
     )
+    # 0.48's mapper validates mapped paths as GIT-TRACKED files of the
+    # project's own repo (normalizeVerificationFiles -> git ls-files).
+    # Without a repo here, discovery escapes to the enclosing repo (on
+    # this host: the 2026-10-12 git-versioned ~/.hermes that contains the
+    # pytest tmp tree), where src/sample.py is untracked — every mapping
+    # is then rejected as host_rejected_fallback and the verify/classify
+    # stages see an empty scope. Model the production shape instead: a
+    # real project repo with the sample file tracked.
+    import subprocess as _sp
+
+    def _git(*args):
+        assert _sp.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+        ).returncode == 0
+
+    _git("init", "-q")
+    _git("config", "user.email", "test@magic-hermes.local")
+    _git("config", "user.name", "magic-hermes test")
+    _git("add", "src/sample.py")
+    _git("commit", "-qm", "test: track sample file for dreamer mapping")
     config_dir = tmp_path / ".cortexkit"
     config_dir.mkdir()
     (config_dir / "magic-context.jsonc").write_text(
