@@ -1285,13 +1285,34 @@ async function executeTool(args) {
       // ctx_expand intentionally re-reads the host branch so it can recover
       // complete toolCall/toolResult parts instead of FTS-only text.  Present
       // the normalized Hermes entries in Pi's public SessionEntry shape.
-      getBranch: () => session.entries.map((entry) => ({
-        type: "message",
-        id: entry.id,
-        version: entry.version,
-        ...(entry.timestamp === undefined ? {} : { timestamp: entry.timestamp }),
-        message: entry.message
-      }))
+      // After a sidecar restart with no in-memory entries yet, the live
+      // branch is empty — but upstream 0.49 refuses numeric ctx_expand unless
+      // the branch contains the newest compartment's anchor message
+      // (resolvePiOrdinalAlignment → locatePiRawOrdinals over getBranch()).
+      // Serve the persisted indexed history (the same rows the FTS fallback
+      // reads) as minimal message entries so the anchor resolves. Their ids
+      // are the deterministic entry ids, identical to the in-memory ones.
+      getBranch: () => {
+        if (session.entries.length > 0) {
+          return session.entries.map((entry) => ({
+            type: "message",
+            id: entry.id,
+            version: entry.version,
+            ...(entry.timestamp === undefined ? {} : { timestamp: entry.timestamp }),
+            message: entry.message
+          }));
+        }
+        if (session.baseOrdinal > 0) {
+          return hermesIndexedRows(session.id).map((row) => ({
+            type: "message",
+            id: row.id,
+            version: row.ts,
+            timestamp: row.ts,
+            message: { role: row.role, content: [{ type: "text", text: row.text }] }
+          }));
+        }
+        return [];
+      }
     }
   };
   let result = await mc("withRawMessageProvider")(
