@@ -102,12 +102,21 @@ const FALLBACK_EXPORTS = [
 ].join("\n");
 
 // Modules of the adapter bundle a name can be re-exported from when it is
-// not a top-level binding of index.js. Upstream 0.43.x code-splits the
-// session-chunk family into its own chunk (read-session-chunk-*.js) while
-// earlier series exported everything from index.js; keep both shapes
-// working. Chunk file names are content-hashed and drift per release, so
-// match by stable prefix rather than exact name.
-const SPLIT_MODULE_PREFIXES = ["read-session-chunk-"];
+// not a top-level binding of index.js. Upstream's code-splitting families
+// drift per release (0.43.x: read-session-chunk-*; 0.49.x: storage-memory-*,
+// storage-tags-*, project-embedding-registry-*, …) and each new family broke
+// the bridge until the prefix list was patched. Scan every sibling .js
+// module instead — names are only taken from chunks that actually export
+// them, so worker scripts and wasm glue that never export our names are
+// read but never imported.
+function splitModuleUrls(adapterUrl) {
+  const baseUrl = new URL(".", adapterUrl);
+  const adapterName = new URL(adapterUrl).pathname.split("/").pop();
+  const names = readdirSync(baseUrl).filter(
+    (name) => name.endsWith(".js") && name !== adapterName
+  );
+  return names.map((name) => new URL(name, baseUrl).href);
+}
 
 // Names a missing required export can be synthesized from when upstream
 // refactors instead of removing it. Upstream 0.44.x split the pure resolver
@@ -194,18 +203,6 @@ const SYNTHESIZED_EXPORTS = {
   },
 };
 
-// Stable specifiers for the split modules. The adapter URL is set by the
-// runtime before this loader loads, so the directory is derivable; chunk
-// names are resolved lazily in load() because content hashes drift per
-// upstream release.
-function splitModuleUrls(adapterUrl) {
-  const baseUrl = new URL(".", adapterUrl);
-  const names = readdirSync(baseUrl).filter((name) =>
-    SPLIT_MODULE_PREFIXES.some((prefix) => name.startsWith(prefix) && name.endsWith(".js"))
-  );
-  return names.map((name) => new URL(name, baseUrl).href);
-}
-
 const TUI_SOURCE = [
   "export class Box {}",
   "export class Text {}",
@@ -229,16 +226,25 @@ export async function load(url, context, nextLoad) {
   }
 
   let source = String(result.source);
+  // Upstream's bundler may rename the local setHarness binding per build
+  // (0.47.0: `setHarness("pi")`/`setHarness(PI_HARNESS_KIND)`, 0.49.0:
+  // `setHarness2(PI_HARNESS_KIND)`). Match the callee by prefix so a
+  // renamed suffix cannot break the hermes rewrite; the argument list is
+  // the invariant (literal "pi" or the PI_HARNESS_KIND constant).
   const piHarnessForms = [
-    'setHarness("pi");',
-    "setHarness('pi');",
-    "setHarness(PI_HARNESS_KIND);",
+    /setHarness\d*\(\s*"pi"\s*\)\s*;/,
+    /setHarness\d*\(\s*'pi'\s*\)\s*;/,
+    /setHarness\d*\(\s*PI_HARNESS_KIND\s*\)\s*;/,
   ];
-  const matchedForm = piHarnessForms.find((form) => source.includes(form));
+  const matchedForm = piHarnessForms.find((form) => form.test(source));
   if (matchedForm === undefined) {
     throw new Error("Unsupported Magic Context adapter: Pi harness initializer not found");
   }
-  source = source.replace(matchedForm, 'setHarness("hermes");');
+  // Preserve the matched callee name (0.49.0 renames it to setHarness2);
+  // only the harness-kind argument is rewritten.
+  const matchedCall = source.match(matchedForm)[0];
+  const callee = matchedCall.match(/setHarness\d*/)[0];
+  source = source.replace(matchedForm, callee + '("hermes");');
 
   // Names that are top-level bindings of index.js can be re-exported
   // directly. Upstream 0.43.x code-splits some exports into sibling chunks;
@@ -281,6 +287,7 @@ export async function load(url, context, nextLoad) {
     // call time — the runtime's mc() throws a precise error naming it,
     // matching the pre-existing fail-closed contract.
     const remaining = new Set(deferred);
+    const resolvedFrom = new Map(); // name -> chunk specifier it was re-exported from
     for (const chunkUrl of splitModuleUrls(url)) {
       if (remaining.size === 0) break;
       const chunkSource = String((await nextLoad(chunkUrl, { format: "module" })).source ?? "");
@@ -291,20 +298,30 @@ export async function load(url, context, nextLoad) {
       if (fromChunk.length === 0) continue;
       const specifier = new URL(chunkUrl).pathname;
       suffix += "\nexport { " + fromChunk.map((name) => name + " as __mh_" + name).join(", ") + ' } from "' + specifier + '";\n';
-      for (const name of fromChunk) remaining.delete(name);
+      for (const name of fromChunk) {
+        remaining.delete(name);
+        resolvedFrom.set(name, specifier);
+      }
     }
     if (remaining.size > 0) {
       // Try to synthesize missing names whose upstream replacements are
       // available (see SYNTHESIZED_EXPORTS). Each emitted binding closes
       // over its `requires`-gate dependencies, so every dependency must
-      // itself be exported by the appended suffix — otherwise the
-      // synthesized module would reference an undeclared identifier at
-      // evaluation time.
+      // itself be available — as a top-level binding of index.js (direct)
+      // or re-exported from a chunk, in which case a hoisted import
+      // statement binds it locally for the synthesized closure.
       const synthesized = [];
       for (const name of [...remaining].sort()) {
         const recipe = SYNTHESIZED_EXPORTS[name];
         if (recipe === undefined) continue;
-        if (!recipe.requires.every((dep) => direct.includes(dep))) continue;
+        const chunkDeps = recipe.requires.filter((dep) => resolvedFrom.has(dep));
+        const allDepsAvailable = recipe.requires.every(
+          (dep) => direct.includes(dep) || resolvedFrom.has(dep)
+        );
+        if (!allDepsAvailable) continue;
+        for (const dep of chunkDeps) {
+          suffix += "import { " + dep + ' } from "' + resolvedFrom.get(dep) + '";\n';
+        }
         const binding = "__mh_" + name;
         const deps = recipe.requires.join(", ");
         suffix +=
