@@ -2858,6 +2858,107 @@ def test_historian_publish_gap_still_rejects_with_upstream_error_string(
     assert_no_unclassified_hermes_failures(db_path)
 
 
+def test_historian_publish_hallucinated_ordinals_rejects_with_range_mapping_string(
+    monkeypatch, tmp_path
+):
+    """Range-mapping rejection tripwire (plan U3 / maestro A4 d59758598379,
+    dispatched historian_runs row 66289 class): a compartment whose
+    ordinals hallucinate past the chunk boundary is rejected by the
+    upstream range-mapping check (dist mapParsedCompartmentsToChunk —
+    "Compartment range s-e does not map to raw session lines start-end"),
+    which fires BEFORE tier/gap/marker validation.
+
+    The bridge must carry that minted string byte-for-byte — the uncovered-
+    suffix salvage is anchored to exactly one rejection class and must stay
+    silent here — and the engine-composed failed row records it verbatim,
+    exactly once, on abort. Like the gap tripwire above, this doubles as an
+    upstream drift tripwire: if a future pi-magic-context series rewords
+    the mapping vocabulary, this goes red — the cue to re-anchor.
+    """
+    user_home = _historian_telemetry_config(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_home))
+    project = tmp_path / "project"
+    project.mkdir()
+    db_path = tmp_path / "telemetry-range-mapping.db"
+
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        client.call(
+            "bind",
+            {
+                "session_id": "telemetry-range-map",
+                "project_root": str(project),
+            },
+            timeout=60,
+        )
+        prepared = client.call(
+            "historian_prepare",
+            {
+                "session_id": "telemetry-range-map",
+                "messages": conversation(12),
+                "protect_last_n": 2,
+                "history_budget_tokens": 8_000,
+            },
+            timeout=60,
+        )
+        assert prepared["ready"] is True
+        start = prepared["chunk"]["start"]
+        end = prepared["chunk"]["end"]
+        assert end - start >= 4
+        # Hallucinated ordinals strictly past the chunk: neither ordinal
+        # exists in chunk.lines, so the mapping check rejects before any
+        # tier/gap/marker validation can fire.
+        beyond = end + 2
+
+        rejected = client.call(
+            "historian_publish",
+            {
+                "session_id": "telemetry-range-map",
+                "output": historian_xml_partial(beyond, beyond),
+            },
+            timeout=60,
+        )
+        assert rejected["ok"] is False
+        # Exact class-C minted string — full equality, with the chunk bounds
+        # interpolated from the live prepare payload (never hardcoded
+        # ordinals): the bridge adds, trims, and rewords nothing.
+        assert rejected["error"] == (
+            "Historian returned invalid compartment output: "
+            f"Compartment range {beyond}-{beyond} does not map to raw "
+            f"session lines {start}-{end}"
+        )
+        # Salvage silent: neither the uncovered-suffix class it is anchored
+        # to nor the zero-compartment class.
+        assert "output left uncovered messages" not in rejected["error"]
+        assert "no usable compartments" not in rejected["error"]
+        assert rejected["repair_prompt"]
+        # Intermediate outcome: still retryable, nothing recorded yet.
+        assert hermes_historian_rows(db_path) == []
+
+        aborted = client.call(
+            "historian_abort",
+            {
+                "session_id": "telemetry-range-map",
+                "outcome": {
+                    "status": "failed",
+                    "reason": (
+                        "historian output rejected: " + rejected["error"]
+                    ),
+                },
+            },
+        )
+        assert aborted == {"aborted": True}
+
+    rows = hermes_historian_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["failure_reason"] == (
+        "historian output rejected: " + rejected["error"]
+    )
+    assert rows[0]["chunk_start_ordinal"] == start
+    assert rows[0]["chunk_end_ordinal"] == end
+    assert_no_unclassified_hermes_failures(db_path)
+
+
 def test_historian_two_pass_editor_failure_falls_back_to_salvaged_draft(
     monkeypatch, tmp_path
 ):
