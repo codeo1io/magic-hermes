@@ -8,15 +8,16 @@
 
 ## Fleet context
 
-- dependents (changes here affect): agent
+- upstreams (this repo builds on): .github, agent, hermes-agent
+- dependents (changes here affect): (host), agent, maestro
 - graph: evidence-derived (imports/refs/deploy surfaces); advisory
 
 ## Open items
 
-### Add test coverage for 10 untested module(s)
+### Add test coverage for 11 untested module(s)
 - id: `rm-003` | track: reliability | priority: 100.0 | status: candidate
-- signals: reliability.no_tests:src/magic_hermes/_host_budget.py, reliability.no_tests:src/magic_hermes/bridge/migrate-hooks.mjs, reliability.no_tests:src/magic_hermes/cli.py, reliability.no_tests:src/magic_hermes/db_toolkit.py, reliability.no_tests:src/magic_hermes/engine.py (+5 more)
-- acceptance: Every module in ['src/magic_hermes/_host_budget.py', 'src/magic_hermes/bridge/migrate-hooks.mjs', 'src/magic_hermes/cli.py', 'src/magic_hermes/db_toolkit.py', 'src/magic_hermes/engine.py', 'src/magic_hermes/historian_guard.py', 'src/magic_hermes/memory_provider.py', 'src/magic_hermes/plugin.py', 'src/magic_hermes/provenance.py', 'src/magic_hermes/runtime.py'] has a corresponding test file with at least one passing test
+- signals: reliability.no_tests:src/magic_hermes/_host_budget.py, reliability.no_tests:src/magic_hermes/bridge/loader.mjs, reliability.no_tests:src/magic_hermes/bridge/migrate-hooks.mjs, reliability.no_tests:src/magic_hermes/cli.py, reliability.no_tests:src/magic_hermes/db_toolkit.py (+6 more)
+- acceptance: Every module in ['src/magic_hermes/_host_budget.py', 'src/magic_hermes/bridge/loader.mjs', 'src/magic_hermes/bridge/migrate-hooks.mjs', 'src/magic_hermes/cli.py', 'src/magic_hermes/db_toolkit.py', 'src/magic_hermes/engine.py', 'src/magic_hermes/historian_guard.py', 'src/magic_hermes/memory_provider.py', 'src/magic_hermes/plugin.py', 'src/magic_hermes/provenance.py', 'src/magic_hermes/runtime.py'] has a corresponding test file with at least one passing test
 - evidence: full suite green (python -m pytest -q) at HEAD; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 
 ### Complete the v0.3.4 release/deploy chain and fix the pending-version skip
