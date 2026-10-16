@@ -11,6 +11,9 @@ on:
 
 permissions:
   contents: read
+  # gitleaks ScanPullRequest lists PR commits — needs this scope on PR events
+  # (see reusable workflow note; matched grant required at the caller).
+  pull-requests: read
 
 jobs:
   private-leak:
