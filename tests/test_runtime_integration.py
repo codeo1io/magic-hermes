@@ -1134,6 +1134,17 @@ def test_historian_candidates_flow_through_user_memory_and_primer_dreamer(
 
 
 def test_upstream_mural_cues_render_into_m0_for_vision_model(monkeypatch, tmp_path):
+    # 0.49's session identity resolver only grants memory features to a
+    # directory with its own project identity: a bare directory under the
+    # user's home tree that only INHERITS an outer git repo (or no repo at
+    # all, upstream's allow-home gate) resolves no identity and bind fails
+    # with "could not resolve a project identity". Give the fixture its
+    # own repo so the identity is the fixture's, not the host's.
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)],
+        check=True,
+        timeout=30,
+    )
     data_root = tmp_path / "data"
     model_cache_dir = data_root / "cortexkit" / "magic-context"
     model_cache_dir.mkdir(parents=True)
@@ -1509,7 +1520,10 @@ def test_ctx_reduce_uses_upstream_tags_and_cache_safe_materialization(
             },
         )
         assert queued["is_error"] is False
-        assert "Queued" in queued["text"]
+        # 0.49 replies with the stamped count ("1 tag stamped.") instead of
+        # the pre-0.49 "Queued §1§ ..." deferral wording; the drop still
+        # materializes at the next execute-threshold render below.
+        assert "1 tag stamped." in queued["text"]
 
         deferred = client.call(
             "render_context",
