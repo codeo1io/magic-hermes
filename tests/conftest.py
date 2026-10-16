@@ -13,8 +13,10 @@ suite failures holding the Magic Context pin upgrade pipeline hostage):
 
 * ``test_provenance.py::TestDriftFixture::test_not_a_repo_reports_only_repo_readable``
 * ``test_provenance.py::TestRepair::test_refuses_non_repo_path``
-* ``test_provenance.py::TestDoctorProvenanceSurface::test_unreadable_path_warns_as_skipped``
-* ``test_runtime_integration.py::test_upstream_dreamer_maps_verifies_and_classifies_memories``
+* ``test_provenance.py::TestDoctorProvenanceSurface::
+  test_unreadable_path_warns_as_skipped``
+* ``test_runtime_integration.py::
+  test_upstream_dreamer_maps_verifies_and_classifies_memories``
   (upstream re-derives the project root via ``git rev-parse
   --show-toplevel``; the inherited repo redirected memory mapping to the
   outer checkout, leaving ``memory_verifications.file_path`` empty)
