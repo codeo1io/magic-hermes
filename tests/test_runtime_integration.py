@@ -1509,7 +1509,10 @@ def test_ctx_reduce_uses_upstream_tags_and_cache_safe_materialization(
             },
         )
         assert queued["is_error"] is False
-        assert "Queued" in queued["text"]
+        # 0.49 replies with the stamped count ("1 tag stamped.") instead of
+        # the pre-0.49 "Queued §1§ ..." deferral wording; the drop still
+        # materializes at the next execute-threshold render below.
+        assert "1 tag stamped." in queued["text"]
 
         deferred = client.call(
             "render_context",
