@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SYNC_WORKFLOW = ROOT / ".github" / "workflows" / "sync-magic-context.yml"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 README = ROOT / "README.md"
 
 
@@ -36,6 +37,13 @@ def _sync_cron() -> str:
     match = re.search(r"cron:\s*\"([^\"]+)\"", workflow_text)
     assert match is not None, "sync workflow must declare a schedule cron"
     return match.group(1)
+
+
+def _ci_node_major() -> int:
+    workflow_text = CI_WORKFLOW.read_text(encoding="utf-8")
+    match = re.search(r'node-version:\s*"(\d+)"', workflow_text)
+    assert match is not None, "ci workflow must pin a node-version"
+    return int(match.group(1))
 
 
 def test_upstream_pin_matches_compatibility_manifest():
@@ -102,6 +110,28 @@ def test_readme_adoption_policy_matches_resolver():
         "scripts/next_magic_context_release.py no longer states the "
         "newest-stable-above-pin contract in next_release_tag's docstring; "
         "update the README claim and this test together"
+    )
+
+
+def test_readme_node_floor_agrees_with_ci_pin():
+    """README's Node.js floor must exist and never exceed the CI pin.
+
+    The floor exists because the pinned Magic Context core drives the
+    shared SQLite store through the built-in node:sqlite module; CI is the
+    configuration that actually validates the documented floor, so a CI
+    node below it would leave the README claim unvalidated.
+    """
+    readme = README.read_text(encoding="utf-8")
+    match = re.search(r"Node\.js (\d+) or newer", readme)
+    assert match is not None, (
+        "README Requirements must state a 'Node.js <major> or newer' floor; "
+        "update the README claim and this test together"
+    )
+    floor = int(match.group(1))
+    ci_node = _ci_node_major()
+    assert ci_node >= floor, (
+        f"CI validates on node {ci_node}, below the README floor {floor}; "
+        "the documented floor must never exceed what CI validates"
     )
 
 
