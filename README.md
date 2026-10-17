@@ -13,8 +13,11 @@ algorithms.
 
 Working development preview. The exact upstream release exercised by this repo and
 the accepted major/minor series are recorded in
-`src/magic_hermes/magic_context_compat.json`. New Magic Context core releases are
-synchronized automatically only after the full Magic-Hermes validation gate passes.
+`src/magic_hermes/magic_context_compat.json`. Same-series patch releases are
+synchronized automatically once the full Magic-Hermes validation gate passes.
+A release that changes the accepted major/minor series never takes that direct
+path: the sync opens a PR-gated adoption PR and the series moves only when a
+maintainer merges it.
 
 ## Architecture
 
@@ -449,7 +452,7 @@ With the repo-pinned official Magic Context package installed:
 
 ```bash
 python -m pytest -q
-ruff check src tests
+ruff check src tests scripts
 node --check src/magic_hermes/bridge/loader.mjs
 node --check src/magic_hermes/bridge/runtime.mjs
 python -m build
@@ -474,7 +477,12 @@ exact upstream release used for validation. `.github/workflows/sync-magic-contex
 checks for new core `vX.Y.Z` releases daily at 00:07 UTC (and also supports immediate
 `repository_dispatch`), waits for the matching npm publication, and adopts the
 newest stable core release above the pinned version, catching up in a single sync
-(drafts and prereleases are never adopted). Each validated upstream release
+(drafts and prereleases are never adopted). A release that changes the accepted
+major/minor series is refused on this direct path and routed to a PR-gated
+adoption PR (`sync/magic-context-<tag>`, body carrying the migration-notes
+review condition and the documented rollback); an explicitly requested series
+jump additionally requires the `allow_series_jump` repository-dispatch
+confirmation before the sync resolves it at all. Each validated upstream release
 updates the dependency pin and compatibility manifest,
 increments the Magic-Hermes patch version (for example `0.2.0` to `0.2.1`), runs the
 full Python/Node/build gate, commits and tags the release, and publishes the wheel,
