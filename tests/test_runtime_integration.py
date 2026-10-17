@@ -9,12 +9,28 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+from packaging.version import Version as _Version
 
 from magic_hermes.runtime import (
     RuntimeClient,
     runtime_available,
     supported_magic_context_series,
 )
+
+
+def _note_nudge_delivers_on_trigger_render(observed_package_version: str) -> bool:
+    """Whether the trigger-time cache-busting render delivers the note nudge.
+
+    0.46 introduced immediate trigger-time delivery via the Pi adapter's
+    ``isCacheBustingPass`` eligibility lane. 0.49.8 replaced that lane with
+    ``prefixRewriteCoversAnchor`` (hardcoded false at the Pi call site), so a
+    cold-start trigger render defers delivery to the next live-tail user
+    turn instead of anchoring immediately. Version-gate the contract on the
+    OBSERVED runtime version (``hello`` package_version) so the suite asserts
+    the behavior the runtime actually exhibits under test.
+    """
+    return _Version(observed_package_version) < _Version("0.49.8")
+
 
 pytestmark = pytest.mark.skipif(
     not runtime_available(),
@@ -320,7 +336,11 @@ def test_official_runtime_indexes_tools_memories_and_compartments(tmp_path):
             for message in nudged["messages"]
             if "Continue after historian." in str(message.get("content", ""))
         )
-        if supported_magic_context_series() >= (0, 46):
+        trigger_render_delivers = supported_magic_context_series() >= (
+            0,
+            46,
+        ) and _note_nudge_delivers_on_trigger_render(hello["package_version"])
+        if trigger_render_delivers:
             last_user_content = [
                 message for message in messages if message["role"] == "user"
             ][-1]["content"]
@@ -347,6 +367,8 @@ def test_official_runtime_indexes_tools_memories_and_compartments(tmp_path):
             # sticky anchor: the new turn itself stays clean
             assert '<instruction name="deferred_notes">' not in followup_user["content"]
         else:
+            # < 0.46, and 0.49.8+: the trigger render only arms the deferral;
+            # the note nudge is delivered on the NEXT live-tail user turn.
             assert '<instruction name="deferred_notes">' in followup_user["content"]
 
     with RuntimeClient(db_path=db_path, timeout=60) as restarted:
