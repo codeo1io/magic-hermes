@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { register } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -104,9 +111,150 @@ const mc = (name) => {
   return value;
 };
 
-const db = process.env.MAGIC_CONTEXT_DB_PATH
-  ? mc("openDatabase")({ dbPath: process.env.MAGIC_CONTEXT_DB_PATH })
-  : mc("openDatabase")();
+// OPS-03: boot bind executed after lock-helper declarations below
+
+// OPS-03 (2026-10-17): boot-bind contention guard. The shared context.db is
+// ~7.8GB with WAL checkpoint storms; every runtime bind runs migrations /
+// write txns on open, and concurrent binds (cron wave windows, multi-session
+// startup bursts) exceed the adapter's hard-clamped 5000ms boot busy-timeout
+// → `storage unavailable: database is locked` → sidecar exits 1 → MC
+// disabled for the run (live 2026-10-17 15:15–16:48Z: 4 cascades from 8
+// lock events). Two guards, both bridge-side because the plugin's
+// BOOT_SQLITE_BUSY_TIMEOUT_MS cannot be raised by callers (verified 0.49.5/
+// 0.49.8/0.49.10 — a version bump is a dead end):
+//   1. cross-process bind mutex (flock on <dbPath>.bindlock): at most ONE
+//      runtime performs the migration-writing open at a time; the others
+//      wait, which alone removes most contention;
+//   2. bounded retry with cooldown-aware backoff on transient lock errors:
+//      even under the mutex, a long external writer (cron scheduler WAL
+//      checkpoint, 20s+ holds observed) can still collide — retry up to
+//      BIND_ATTEMPTS times before failing the bind.
+// Failure stays fail-loud (throw) — a run that cannot bind degrades to MC
+// disabled, never a silent wrong-context fallback.
+function openDatabaseWithLockGuard() {
+  const dbPath = process.env.MAGIC_CONTEXT_DB_PATH || "";
+  const opts = dbPath ? { dbPath } : {};
+  const attempts = bindAttempts();
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    // Guard 1: cross-process bind mutex via an atomic mkdir lock (mkdir is
+    // atomic on POSIX; every magic-hermes sidecar runs this same code, so
+    // all bind paths honor it). Stale locks (holder died mid-open) are
+    // broken by mtime age > 120s — openDatabase itself is bounded by the
+    // 5s boot busy-timeout, so a live holder never holds the lock that long.
+    const lockPath = dbPath
+      ? dbPath + ".bindlock"
+      : join(tmpdir(), "hermes", "magic-context", "context.db.bindlock");
+    mkdirSync(dirname(lockPath), { recursive: true });
+    acquireBindLock(lockPath);
+    try {
+      return mc("openDatabase")(opts);
+    } catch (err) {
+      lastError = err;
+      const transient = /database is locked|SQLITE_BUSY|storage unavailable/i.test(
+        String(err && err.message ? err.message : err)
+      );
+      process.stderr.write(
+        "magic-hermes: openDatabase attempt " + attempt + "/" + attempts +
+        " failed" + (transient ? " (transient lock)" : "") + ": " +
+        String(err && err.message ? err.message : err) + "\n"
+      );
+      if (!transient || attempt === attempts) {
+        break;
+      }
+      // Cooldown-aware backoff: sleep OUTSIDE the held lock (finally below
+      // releases it) so waiters proceed. 2s, 4s, 8s, ... capped 15s.
+      const delayMs = Math.min(15000, 2000 * Math.pow(2, attempt - 1));
+      sleepSync(delayMs);
+    } finally {
+      releaseBindLock(lockPath);
+    }
+  }
+  throw lastError;
+}
+
+// Atomic mkdir mutex with stale-lock breaking (holder-death + 120s age).
+// Declared before the boot bind below executes it (function hoisting covers
+// the functions, but the const must precede its first READ at runtime).
+const BIND_LOCK_STALE_MS = 120000;
+
+function acquireBindLock(lockPath) {
+  const deadline = Date.now() + 90000;
+  for (;;) {
+    try {
+      mkdirSync(lockPath);
+      // Write OUR pid inside the lock so waiters can break it if we die
+      // mid-open (holder-death detection), and so the stale-age breaker
+      // has a hard identity to attribute the break to.
+      writeFileSync(join(lockPath, "pid"), String(process.pid) + "\n");
+      return;
+    } catch (err) {
+      if (err && err.code !== "EEXIST") {
+        throw err;
+      }
+    }
+    // Lock held by someone: break it only when the holder is provably dead
+    // (pid liveness check) or the lock is older than the stale window.
+    let holderPid = NaN;
+    let mtimeMs = 0;
+    try {
+      const holder = readFileSync(join(lockPath, "pid"), "utf8");
+      holderPid = parseInt(holder.trim(), 10);
+    } catch {}
+    try {
+      mtimeMs = statSync(lockPath).mtimeMs;
+    } catch {
+      continue; // vanished between EEXIST and stat: retry immediately
+    }
+    // process.kill(pid, 0) THROWS ESRCH for a dead pid (it does not return
+    // false) — wrap or a holder-death break crashes the binder itself.
+    let holderAlive = false;
+    if (Number.isFinite(holderPid)) {
+      try {
+        process.kill(holderPid, 0);
+        holderAlive = true;
+      } catch (err) {
+        holderAlive = err && err.code !== "ESRCH";
+      }
+    }
+    const stale = !holderAlive || Date.now() - mtimeMs > BIND_LOCK_STALE_MS;
+    if (stale) {
+      try {
+        rmSync(lockPath, { recursive: true, force: true });
+      } catch {}
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        "bind mutex acquisition timed out after 90s (" + lockPath + ")"
+      );
+    }
+    sleepSync(250);
+  }
+}
+
+function releaseBindLock(lockPath) {
+  try {
+    rmSync(lockPath, { recursive: true, force: true });
+  } catch {}
+}
+
+// Synchronous sleep (Node has no built-in sleepSync; Atomics.wait on a
+// dummy SharedArrayBuffer blocks the thread for the timeout without
+// spinning or external deps).
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function bindAttempts() {
+  const raw = parseInt(process.env.MAGIC_CONTEXT_BIND_ATTEMPTS || "", 10);
+  if (Number.isFinite(raw) && raw >= 1 && raw <= 10) {
+    return raw;
+  }
+  return 4;
+}
+
+const db = openDatabaseWithLockGuard();
 if (!db) {
   throw new Error(
     "Magic Context refused to open its shared context database. " +
