@@ -42,7 +42,9 @@ Magic Context core.
 ## Requirements
 
 - Python 3.10 or newer
-- Node.js on `PATH`
+- Node.js 24 or newer on `PATH` — the pinned Magic Context core drives the shared
+  SQLite store through the built-in `node:sqlite` module, which upstream
+  supports on Node 24+ (or Bun with `bun:sqlite`); CI validates on node 24
 - `@cortexkit/pi-magic-context` from the supported series declared in
   `src/magic_hermes/magic_context_compat.json`, installed in a standard Pi/OpenCode
   location, or `MAGIC_CONTEXT_PACKAGE_ROOT` set to its package directory
@@ -336,19 +338,19 @@ export MAGIC_CONTEXT_PACKAGE_ROOT=/path/to/node_modules/@cortexkit/pi-magic-cont
 
 Install the latest published wheel into the Python environment used by Hermes. This
 repository is public, so install the release wheel directly from its GitHub Release
-URL (shown for v0.3.6; newer versions follow the same URL pattern on the
+URL (shown for v0.3.16; newer versions follow the same URL pattern on the
 [Releases](https://github.com/codeo1io/magic-hermes/releases) page):
 
 ```bash
 uv pip install --python /path/to/hermes/venv/bin/python --no-deps \
-  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.6/magic_hermes-0.3.6-py3-none-any.whl
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.16/magic_hermes-0.3.16-py3-none-any.whl
 ```
 
 If `uv` is not installed, use the Hermes environment's `pip` instead:
 
 ```bash
 /path/to/hermes/venv/bin/python -m pip install --no-deps \
-  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.6/magic_hermes-0.3.6-py3-none-any.whl
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.16/magic_hermes-0.3.16-py3-none-any.whl
 ```
 
 For development from a local checkout, install the repository directly instead:
