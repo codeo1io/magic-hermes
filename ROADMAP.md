@@ -8,7 +8,8 @@
 
 ## Fleet context
 
-- dependents (changes here affect): agent
+- upstreams (this repo builds on): .github, agent, hermes-agent
+- dependents (changes here affect): (host), agent, maestro
 - graph: evidence-derived (imports/refs/deploy surfaces); advisory
 
 ## Open items
@@ -31,7 +32,7 @@
 
 ### Refactor 20 high-complexity function(s)
 - id: `rm-001` | track: reliability | priority: 90.0 | status: candidate
-- signals: reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L117, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L167, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L187, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L194, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L214 (+15 more)
+- signals: reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L104, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L104, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L134, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L177, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L181 (+15 more)
 - acceptance: Each flagged function is decomposed below the branch threshold with behavior locked by characterization tests
 - evidence: ast-based branch-count check passes at HEAD (full suite green; conductor validation digest validation:v1:<sha> recorded in the shipping PR)
 
