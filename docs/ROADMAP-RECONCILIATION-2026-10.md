@@ -131,3 +131,39 @@ recorded in the adoption ledger.
 Facts verified against the local checkout at `793ad78` and live `gh` where
 cited; the adoption-ledger entries it references are appended by the same run
 per that ledger's append-only charter.*
+
+## 8. Addendum (2026-10-21): v0.3.18 GitHub Release gap closed
+
+The `v0.3.18` tag had existed on the remote since 2026-10-17T23:52Z (annotated
+`19ab6927`, tagger `agent <agent@agent-runner.local>`, pointing at the pure
+version-bump commit `c673da7`) with no GitHub Release behind it: a local
+release-train invocation tagged and pushed, but its publish step never
+completed. The workflow's bot train then published `v0.3.19` (2026-10-18T04:18Z)
+and `v0.3.20` (2026-10-19T04:27Z, `github-actions[bot]`) over the gap, leaving
+`v0.3.18` the unique tag-without-release hole in the `v0.2.0..v0.3.20` set.
+
+Closed 2026-10-21 by conductor run `6aac093ac3b34d6a9cf9f4da8bdf90a0`: the
+missing Release was published at the historical tag with `--verify-tag` (no ref
+created, moved, or deleted), script-convention-faithful notes (Changes = the
+verbatim `936753b` subject, the OPS-03 guard of PR #88, per the explicit
+`v0.3.17..v0.3.18` range; Tested `v0.49.8` from the tag manifest; standard
+Install URL), and exactly the three conventional assets:
+`magic_hermes-0.3.18-py3-none-any.whl`
+`sha256:519c9841974e0670909d11b96dd951d97e2cbb9a7b02571a17e501d09092d1a0`,
+`magic_hermes-0.3.18.tar.gz`
+`sha256:f401bcd1d241d08c2f4a63751fe021a4e523b827a1ed4a77ec279d130cf4d882`,
+and `SHA256SUMS` — built from the tag tree and validated on it (376 passed,
+2 skipped; ruff clean; `node --check` on both bridge modules). Published with
+`--latest=false`, the single intentional deviation from `scripts/release.py`'s
+publish step (which has no make-latest control), so Latest remains `v0.3.20`,
+unchanged.
+
+The README install example (its step 3) is refreshed to `v0.3.20` in the same
+change — another recurrence of R4 (example pinned to an older wheel while
+Latest moved on). Still out of scope here, per this run's scope lock: the
+`0.49.11`/`0.49.12` adoption-ledger backfill and any `release.py` backfill
+hardening.
+
+*Addendum recorded 2026-10-21 by conductor run
+`6aac093ac3b34d6a9cf9f4da8bdf90a0`. Facts verified against live `gh` (release
+set, asset digests, Latest flag, compare base) at publish time.*
