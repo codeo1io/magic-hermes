@@ -562,7 +562,8 @@ def test_retrospective_reads_hermes_history_and_persists_learning_watermark(tmp_
             {"session_id": "retro-source", "project_root": str(tmp_path)},
             timeout=60,
         )
-        base = 1_790_000_000_000
+        # now-6h: hardcoded epochs age out of the 30-day retrospective scan window
+        base = int(time.time() * 1000) - 6 * 60 * 60 * 1000
         messages = [
             {"role": "system", "content": "System."},
             {
@@ -3524,7 +3525,8 @@ def test_retrospective_scan_window_respects_hermes_child_contract(tmp_path):
             {"session_id": "retro-clamp", "project_root": str(tmp_path)},
             timeout=60,
         )
-        base = 1_790_000_000_000
+        # now-6h: hardcoded epochs age out of the 30-day retrospective scan window
+        base = int(time.time() * 1000) - 6 * 60 * 60 * 1000
         # Realistic conversational lines (mixed characters, ~786 chars,
         # ~150 BPE tokens each): 80 lines = ~62.9k chars / ~12k tokens of
         # history. Unclamped, the window default (128k tokens) admits ALL
@@ -3624,7 +3626,8 @@ def test_retrospective_usable_input_tokens_override(tmp_path):
             {"session_id": "retro-ovr", "project_root": str(tmp_path)},
             timeout=60,
         )
-        base = 1_790_000_000_000
+        # now-6h: hardcoded epochs age out of the 30-day retrospective scan window
+        base = int(time.time() * 1000) - 6 * 60 * 60 * 1000
         messages = [{"role": "system", "content": "System."}]
         for index in range(60):
             messages.append(
