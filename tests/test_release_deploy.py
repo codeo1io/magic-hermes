@@ -228,9 +228,7 @@ class TestDeployRelease:
         with pytest.raises(release.ReleaseError, match="doctor"):
             release.deploy_release(artifacts, VERSION, target)
 
-        assert fake.doctor_calls() == [
-            (str(target / "bin" / "magic-hermes"), "doctor")
-        ]
+        assert fake.doctor_calls() == [(str(target / "bin" / "magic-hermes"), "doctor")]
 
     def test_smoke_gate_unset_never_invokes_doctor(self, tmp_path, monkeypatch):
         target = make_target(tmp_path)
@@ -386,6 +384,100 @@ class TestMainDeployWiring:
         assert "deploy" not in names
         assert "commit_and_tag" not in names
         assert "publish" not in names
+
+
+class TestEnsureDefaultBranchFFRecovery:
+    """Behind-only drift no longer hard-fails the release preflight.
+
+    Root cause 2026-10-22 nightly (run 39722457971): the roadmap-sync /
+    conductor writers push to master between the workflow checkout and
+    release.py's preflight, so the strict synchronized check aborted the
+    auto-release lane. Behind-only is always recoverable at that point —
+    the release transaction's own dirt is the only dirt allowed through
+    ensure_clean_or_release_version — so fold it over the new tip with
+    stash → fast-forward → pop. Ahead or diverged states still fail loud.
+    """
+
+    DIV = ("git", "rev-list", "--left-right", "--count", "HEAD...origin/master")
+
+    def _patch(self, monkeypatch, *, divergence: str, status: str = "") -> FakeRun:
+        fake = FakeRun(
+            answers={
+                ("git", "branch", "--show-current"): "master",
+                (
+                    "gh",
+                    "repo",
+                    "view",
+                    "--json",
+                    "defaultBranchRef",
+                    "--jq",
+                    ".defaultBranchRef.name",
+                ): "master",
+                self.DIV: divergence,
+                ("git", "status", "--porcelain"): status,
+            }
+        )
+        monkeypatch.setattr(release, "run", fake)
+        return fake
+
+    def test_behind_clean_tree_fast_forwards(self, monkeypatch):
+        fake = self._patch(monkeypatch, divergence="0\t2")
+
+        assert release.ensure_default_branch() == "master"
+
+        assert ("git", "merge", "--ff-only", "origin/master") in fake.calls
+        assert not any(call[:2] == ("git", "stash") for call in fake.calls)
+
+    def test_behind_dirty_release_tree_stashes_and_pops(self, monkeypatch):
+        fake = self._patch(
+            monkeypatch,
+            divergence="0\t2",
+            status="M  pyproject.toml\nM  src/magic_hermes/__init__.py\n",
+        )
+
+        assert release.ensure_default_branch() == "master"
+
+        calls = fake.calls
+        stash_push = calls.index(
+            ("git", "stash", "push", "-m", "release-preflight ff-recovery")
+        )
+        ff = calls.index(("git", "merge", "--ff-only", "origin/master"))
+        stash_pop = calls.index(("git", "stash", "pop"))
+        assert stash_push < ff < stash_pop
+
+    def test_ahead_fails_loudly(self, monkeypatch):
+        fake = self._patch(monkeypatch, divergence="1\t0")
+
+        with pytest.raises(release.ReleaseError, match="synchronized"):
+            release.ensure_default_branch()
+
+        assert not any("merge" in call for call in fake.calls)
+
+    def test_diverged_fails_loudly(self, monkeypatch):
+        self._patch(monkeypatch, divergence="1\t2")
+
+        with pytest.raises(release.ReleaseError, match="synchronized"):
+            release.ensure_default_branch()
+
+    def test_ff_failure_restores_stash_and_raises(self, monkeypatch):
+        fake = self._patch(
+            monkeypatch,
+            divergence="0\t2",
+            status="M  pyproject.toml\n",
+        )
+        original_call = fake.__call__
+
+        def fail_ff_then_pass(*args, capture: bool = False, env=None):
+            if args[:3] == ("git", "merge", "--ff-only"):
+                raise release.ReleaseError("command failed: git merge --ff-only")
+            return original_call(*args, capture=capture, env=env)
+
+        monkeypatch.setattr(release, "run", fail_ff_then_pass)
+
+        with pytest.raises(release.ReleaseError, match="ff-only"):
+            release.ensure_default_branch()
+
+        assert ("git", "stash", "pop") in fake.calls
 
 
 @pytest.mark.skipif(

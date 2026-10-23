@@ -114,9 +114,7 @@ def assert_versions(version: str) -> None:
     )
     init_version = re.search(
         r'^__version__ = "([^"]+)"$',
-        (ROOT / "src" / "magic_hermes" / "__init__.py").read_text(
-            encoding="utf-8"
-        ),
+        (ROOT / "src" / "magic_hermes" / "__init__.py").read_text(encoding="utf-8"),
         re.MULTILINE,
     )
     found = {
@@ -242,11 +240,35 @@ def ensure_default_branch() -> str:
             f"release must run from default branch {default!r}, got {branch!r}"
         )
     run("git", "fetch", "origin", default, "--tags")
-    divergence = git_output(
+    ahead_raw, _, behind_raw = git_output(
         "rev-list", "--left-right", "--count", f"HEAD...origin/{default}"
-    )
-    if divergence != "0\t0":
+    ).partition("\t")
+    ahead, behind = ahead_raw.strip(), behind_raw.strip()
+    if ahead != "0":
         raise ReleaseError(f"{default} must be synchronized with origin/{default}")
+    if behind == "0":
+        return default
+
+    # Behind-only drift: another writer (roadmap-sync, conductor landings)
+    # pushed between checkout and this preflight, which hard-failed the
+    # 2026-10-22 nightly and stalled the auto-release lane. At this point
+    # the tree holds only the release transaction's own files
+    # (ensure_clean_or_release_version ran first), so fold them over the
+    # new tip: stash → fast-forward → pop. Ahead or diverged states still
+    # fail loudly above.
+    dirty = git_output("status", "--porcelain")
+    if not dirty:
+        run("git", "merge", "--ff-only", f"origin/{default}")
+        print(f"fast-forwarded {default} to origin/{default} during release preflight")
+        return default
+    run("git", "stash", "push", "-m", "release-preflight ff-recovery")
+    try:
+        run("git", "merge", "--ff-only", f"origin/{default}")
+    except ReleaseError:
+        run("git", "stash", "pop")
+        raise
+    run("git", "stash", "pop")
+    print(f"fast-forwarded {default} to origin/{default} during release preflight")
     return default
 
 
@@ -290,23 +312,29 @@ def write_checksums(artifacts: list[Path]) -> Path:
 
 
 def tag_exists(tag: str) -> bool:
-    return subprocess.run(
-        ["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"],
-        cwd=ROOT,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    ).returncode == 0
+    return (
+        subprocess.run(
+            ["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
 
 
 def release_exists(tag: str) -> bool:
-    return subprocess.run(
-        ["gh", "release", "view", tag],
-        cwd=ROOT,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    ).returncode == 0
+    return (
+        subprocess.run(
+            ["gh", "release", "view", tag],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
 
 
 def deploy_target() -> Path:
