@@ -2518,7 +2518,7 @@ function hermesIndexedRows(sessionId) {
      WHERE s.session_id = ? AND s.harness = 'hermes'
      ORDER BY s.message_ordinal ASC, s.message_id ASC
   `).all(sessionId);
-  return rows.map((row) => ({
+  const mapped = rows.map((row) => ({
     sessionId: String(row.session_id),
     id: String(row.message_id),
     ordinal: Number(row.message_ordinal),
@@ -2527,6 +2527,26 @@ function hermesIndexedRows(sessionId) {
     content: String(row.content || ""),
     ts: parseHermesSourceTime(row.source_version, row.updated_at)
   }));
+  // Upstream 0.49.13+ retrospective contract: a user line is only an
+  // eligible candidate when the session already saw a user message and an
+  // assistant reply before it (their Pi reader passes
+  // `sawUserMessage && sawAssistantReply` into normalizePiUserEntry, and
+  // runRetrospectiveTask filters on followsAssistantReply === true —
+  // otherwise every run no-ops with "no reply-following user lines").
+  // Mirror that flag here so the Hermes provider satisfies the same gate.
+  let sawUserMessage = false;
+  let sawAssistantReply = false;
+  for (const row of mapped) {
+    if (row.role === "user") {
+      if (sawUserMessage && sawAssistantReply) {
+        row.followsAssistantReply = true;
+      }
+      sawUserMessage = true;
+    } else if (sawUserMessage && row.role === "assistant") {
+      sawAssistantReply = true;
+    }
+  }
+  return mapped;
 }
 
 function createHermesRetrospectiveProvider(projectIdentity) {

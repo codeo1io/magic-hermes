@@ -3637,6 +3637,17 @@ def test_retrospective_usable_input_tokens_override(tmp_path):
                     "timestamp": base + index * 1_000,
                 }
             )
+            # Upstream 0.49.13+ only treats user lines as retrospective
+            # candidates when they FOLLOW an assistant reply
+            # (followsAssistantReply); a bare user-only transcript no-ops
+            # with "no reply-following user lines".
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "ack",
+                    "timestamp": base + index * 1_000 + 500,
+                }
+            )
         client.call(
             "observe",
             {"session_id": "retro-ovr", "messages": messages},
