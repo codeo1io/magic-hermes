@@ -2,6 +2,12 @@ name: Sync Magic Context release
 
 on:
   schedule:
+    # Lane 2 backstop: the host watcher (magic-context-watch.timer) normally
+    # dispatches this workflow within minutes of an upstream release via
+    # repository_dispatch. This hourly cron catches anything the watcher
+    # misses (host down, npm/GitHub release skew, watcher regression) so
+    # adoption lag is bounded at ~1h even when the watcher is dead.
+    - cron: "23 * * * *"
     - cron: "7 0 * * *"
   workflow_dispatch:
     inputs:

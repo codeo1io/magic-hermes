@@ -32,11 +32,28 @@ def _tested_version() -> str:
     return manifest["tested_version"]
 
 
-def _sync_cron() -> str:
+def _sync_crons() -> list[str]:
     workflow_text = SYNC_WORKFLOW.read_text(encoding="utf-8")
-    match = re.search(r"cron:\s*\"([^\"]+)\"", workflow_text)
-    assert match is not None, "sync workflow must declare a schedule cron"
-    return match.group(1)
+    return re.findall(r"cron:\s*\"([^\"]+)\"", workflow_text)
+
+
+def _hourly_backstop(crons: list[str]) -> str:
+    hourly = [c for c in crons if c.split()[1] == "*"]
+    assert hourly, (
+        "sync workflow must keep an hourly backstop cron (lane 2): the host "
+        "watcher that dispatches repository_dispatch runs on the live host, "
+        "so the workflow needs its own catch-up schedule"
+    )
+    return hourly[0]
+
+
+def _daily_backstop(crons: list[str]) -> str:
+    daily = [c for c in crons if c.split()[1] != "*"]
+    assert daily, (
+        "sync workflow must keep the daily 00:07 UTC cron as a second "
+        "backstop lane"
+    )
+    return daily[0]
 
 
 def _ci_node_major() -> int:
@@ -53,23 +70,35 @@ def test_upstream_pin_matches_compatibility_manifest():
 
 def test_readme_cadence_claim_matches_sync_workflow_cron():
     """README's sync cadence claim must match the workflow's actual schedule."""
-    cron = _sync_cron()
-    fields = cron.split()
-    assert len(fields) == 5, f"expected a simple cron expression, got {cron!r}"
-    minute, hour, day, month, weekday = fields
-    assert {day, month, weekday} == {"*"}, (
-        "cadence claim in this test only models daily schedules; "
-        f"update the README claim and this test together for {cron!r}"
-    )
-    expected = f"daily at {int(hour):02d}:{int(minute):02d} UTC"
+    crons = _sync_crons()
+    hourly = _hourly_backstop(crons)
+    daily = _daily_backstop(crons)
     readme = README.read_text(encoding="utf-8")
-    assert expected in readme, (
-        f"README sync-cadence claim does not mention the actual schedule "
-        f"{expected!r} (cron {cron!r})"
+    for cron in (hourly, daily):
+        fields = cron.split()
+        assert len(fields) == 5, f"expected a simple cron expression, got {cron!r}"
+        _minute, _hour, day, month, weekday = fields
+        assert {day, month, weekday} == {"*"}, (
+            "cadence claim in this test only models simple schedules; "
+            f"update the README claim and this test together for {cron!r}"
+        )
+    expected_daily = "daily at 00:07 UTC"
+    assert expected_daily in readme, (
+        f"README sync-cadence claim does not mention the daily backstop "
+        f"{expected_daily!r} (cron {daily!r})"
     )
-    assert "every 15 minutes" not in readme, (
-        "README still claims a 15-minute polling cadence that the workflow "
-        "does not have"
+    assert "hourly" in readme, (
+        "README must mention the hourly backstop cadence "
+        f"(cron {hourly!r})"
+    )
+    assert "magic-context-watch" in readme, (
+        "README must name the host watcher (magic-context-watch) that "
+        "dispatches the workflow's repository_dispatch trigger within "
+        "minutes of an upstream release"
+    )
+    assert "repository_dispatch" in readme, (
+        "README must document that the workflow supports immediate "
+        "repository_dispatch, since the host watcher depends on it"
     )
 
 

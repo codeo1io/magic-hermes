@@ -476,8 +476,7 @@ The adapter accepts only the major/minor series recorded in
 `src/magic_hermes/magic_context_compat.json` because it uses private symbols from
 the official Pi module. The repo-level `package.json`/`package-lock.json` pin the
 exact upstream release used for validation. `.github/workflows/sync-magic-context.yml`
-checks for new core `vX.Y.Z` releases daily at 00:07 UTC (and also supports immediate
-`repository_dispatch`), waits for the matching npm publication, and adopts the
+checks for new core `vX.Y.Z` releases hourly (host watcher `magic-context-watch` also dispatches the sync workflow's `repository_dispatch` within minutes of an upstream npm publication; a second backstop runs daily at 00:07 UTC), waits for the matching npm publication, and adopts the
 newest stable core release above the pinned version, catching up in a single sync
 (drafts and prereleases are never adopted). A release that changes the accepted
 major/minor series is refused on this direct path and routed to a PR-gated
