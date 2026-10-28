@@ -5,10 +5,10 @@ before its owner could publish pid, plus scratch reaping of live locks.
 Tests use disposable lock directories; never open the production context DB.
 """
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
@@ -22,7 +22,8 @@ def _node_script():
     end = source.index("function bindAttempts()", begin)
     helpers = source[begin:end]
     return (
-        'import {mkdirSync, readFileSync, rmSync, statSync, writeFileSync} from "node:fs";\n'
+        'import {mkdirSync, readFileSync, rmSync, statSync, '
+        'writeFileSync} from "node:fs";\n'
         'import {join} from "node:path";\n'
         + helpers
         + '\nacquireBindLock(process.argv[1]);\n'
@@ -133,7 +134,10 @@ def test_parallel_binders_do_not_steal_each_others_lock(tmp_path):
 def test_lock_is_durable_and_backoff_is_outside_mutex():
     source = RUNTIME.read_text()
     assert 'join(dataHome, "cortexkit", "magic-context", "context.db")' in source
-    assert 'join(tmpdir(), "hermes", "magic-context", "context.db.bindlock")' not in source
+    assert (
+        'join(tmpdir(), "hermes", "magic-context", "context.db.bindlock")'
+        not in source
+    )
     assert source.index("releaseBindLock(lockPath);") < source.index(
         "if (retryDelayMs) sleepSync(retryDelayMs);"
     )
