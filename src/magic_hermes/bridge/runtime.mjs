@@ -137,16 +137,19 @@ function openDatabaseWithLockGuard() {
   const attempts = bindAttempts();
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    // Guard 1: cross-process bind mutex via an atomic mkdir lock (mkdir is
-    // atomic on POSIX; every magic-hermes sidecar runs this same code, so
-    // all bind paths honor it). Stale locks (holder died mid-open) are
-    // broken by mtime age > 120s — openDatabase itself is bounded by the
-    // 5s boot busy-timeout, so a live holder never holds the lock that long.
-    const lockPath = dbPath
-      ? dbPath + ".bindlock"
-      : join(tmpdir(), "hermes", "magic-context", "context.db.bindlock");
+    // Guard 1: cross-process bind mutex via atomic mkdir. Keep the lock
+    // beside the durable DB (never under a scratch reaper). Dead-owner
+    // locks are reclaimed only after a publication grace; live holders
+    // are never broken merely because a slow DB open exceeds a timeout.
+    // The lock must live beside the durable DB. A scratch/tmp lock can be
+    // reaped while held, causing ENOENT writing pid and overlapping binds.
+    const dataHome = process.env.XDG_DATA_HOME
+      ? resolve(process.env.XDG_DATA_HOME)
+      : join(homedir(), ".local", "share");
+    const lockPath = (dbPath || join(dataHome, "cortexkit", "magic-context", "context.db")) + ".bindlock";
     mkdirSync(dirname(lockPath), { recursive: true });
     acquireBindLock(lockPath);
+    let retryDelayMs = 0;
     try {
       return mc("openDatabase")(opts);
     } catch (err) {
@@ -162,21 +165,18 @@ function openDatabaseWithLockGuard() {
       if (!transient || attempt === attempts) {
         break;
       }
-      // Cooldown-aware backoff: sleep OUTSIDE the held lock (finally below
-      // releases it) so waiters proceed. 2s, 4s, 8s, ... capped 15s.
-      const delayMs = Math.min(15000, 2000 * Math.pow(2, attempt - 1));
-      sleepSync(delayMs);
+      // Record cooldown here; never sleep while holding the bind mutex.
+      retryDelayMs = Math.min(15000, 2000 * Math.pow(2, attempt - 1));
     } finally {
       releaseBindLock(lockPath);
     }
+    if (retryDelayMs) sleepSync(retryDelayMs);
   }
   throw lastError;
 }
 
-// Atomic mkdir mutex with stale-lock breaking (holder-death + 120s age).
-// Declared before the boot bind below executes it (function hoisting covers
-// the functions, but the const must precede its first READ at runtime).
-const BIND_LOCK_STALE_MS = 120000;
+// Atomic mkdir mutex with a 30s mkdir-to-pid publication grace.
+// Never reclaim a lock whose holder PID is still alive.
 
 function acquireBindLock(lockPath) {
   const deadline = Date.now() + 90000;
@@ -193,8 +193,8 @@ function acquireBindLock(lockPath) {
         throw err;
       }
     }
-    // Lock held by someone: break it only when the holder is provably dead
-    // (pid liveness check) or the lock is older than the stale window.
+    // A newly-created directory briefly has no pid file. Do not mistake
+    // that publication window for a dead owner and delete its live lock.
     let holderPid = NaN;
     let mtimeMs = 0;
     try {
@@ -217,7 +217,11 @@ function acquireBindLock(lockPath) {
         holderAlive = err && err.code !== "ESRCH";
       }
     }
-    const stale = !holderAlive || Date.now() - mtimeMs > BIND_LOCK_STALE_MS;
+    const ageMs = Date.now() - mtimeMs;
+    // Never reap a live holder, even if I/O pressure makes its bind slow.
+    // Under severe I/O pressure, publishing pid after mkdir can stall;
+    // allow 30s when pid is absent, 5s for a confirmed dead PID.
+    const stale = !holderAlive && ageMs > (Number.isFinite(holderPid) ? 5000 : 30000);
     if (stale) {
       try {
         rmSync(lockPath, { recursive: true, force: true });
