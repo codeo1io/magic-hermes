@@ -31,7 +31,7 @@
 
 ### Refactor 20 high-complexity function(s)
 - id: `rm-001` | track: reliability | priority: 90.0 | status: candidate
-- signals: reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L104, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L104, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L134, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L177, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L181 (+15 more)
+- signals: reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L104, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L104, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L134, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L181, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L240 (+15 more)
 - acceptance: Each flagged function is decomposed below the branch threshold with behavior locked by characterization tests
 - evidence: ast-based branch-count check passes at HEAD (full suite green; conductor validation digest validation:v1:<sha> recorded in the shipping PR)
 
