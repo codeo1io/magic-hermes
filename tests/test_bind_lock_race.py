@@ -24,11 +24,12 @@ def _node_script():
     return (
         'import {mkdirSync, readFileSync, rmSync, statSync, '
         'writeFileSync} from "node:fs";\n'
+        'import {randomUUID} from "node:crypto";\n'
         'import {join} from "node:path";\n'
         + helpers
-        + '\nacquireBindLock(process.argv[1]);\n'
+        + '\nconst token = acquireBindLock(process.argv[1]);\n'
         + 'process.stdout.write("acquired\\n");\n'
-        + 'releaseBindLock(process.argv[1]);\n'
+        + 'releaseBindLock(process.argv[1], token);\n'
     )
 
 
@@ -138,6 +139,26 @@ def test_lock_is_durable_and_backoff_is_outside_mutex():
         'join(tmpdir(), "hermes", "magic-context", "context.db.bindlock")'
         not in source
     )
-    assert source.index("releaseBindLock(lockPath);") < source.index(
+    assert source.index("releaseBindLock(lockPath, bindToken);") < source.index(
         "if (retryDelayMs) sleepSync(retryDelayMs);"
     )
+
+@pytest.mark.skipif(not NODE, reason="node not installed")
+def test_delayed_release_does_not_delete_replacement_owner(tmp_path):
+    """A stale binder must not unlink a lock with a different acquisition."""
+    lock = tmp_path / "context.db.bindlock"
+    script = _node_script().replace(
+        "releaseBindLock(process.argv[1], token);",
+        'writeFileSync(join(process.argv[1], "pid"), "99999999 replacement\\n");'
+        "releaseBindLock(process.argv[1], token);"
+        'if (!readFileSync(join(process.argv[1], "pid"), "utf8")'
+        '.includes("replacement")) '
+        'process.exit(9);'
+        'rmSync(process.argv[1], { recursive: true, force: true });',
+    )
+    proc = subprocess.run(
+        [NODE, "--input-type=module", "-e", script, str(lock)],
+        capture_output=True, text=True, timeout=12, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not lock.exists()

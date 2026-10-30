@@ -148,7 +148,7 @@ function openDatabaseWithLockGuard() {
       : join(homedir(), ".local", "share");
     const lockPath = (dbPath || join(dataHome, "cortexkit", "magic-context", "context.db")) + ".bindlock";
     mkdirSync(dirname(lockPath), { recursive: true });
-    acquireBindLock(lockPath);
+    const bindToken = acquireBindLock(lockPath);
     let retryDelayMs = 0;
     try {
       return mc("openDatabase")(opts);
@@ -168,7 +168,7 @@ function openDatabaseWithLockGuard() {
       // Record cooldown here; never sleep while holding the bind mutex.
       retryDelayMs = Math.min(15000, 2000 * Math.pow(2, attempt - 1));
     } finally {
-      releaseBindLock(lockPath);
+      releaseBindLock(lockPath, bindToken);
     }
     if (retryDelayMs) sleepSync(retryDelayMs);
   }
@@ -186,8 +186,11 @@ function acquireBindLock(lockPath) {
       // Write OUR pid inside the lock so waiters can break it if we die
       // mid-open (holder-death detection), and so the stale-age breaker
       // has a hard identity to attribute the break to.
-      writeFileSync(join(lockPath, "pid"), String(process.pid) + "\n");
-      return;
+      // A random per-acquisition token fences a delayed release from deleting
+      // a successor's lock after an interrupted/recovered bind.
+      const token = randomUUID();
+      writeFileSync(join(lockPath, "pid"), `${process.pid} ${token}\n`);
+      return token;
     } catch (err) {
       if (err && err.code !== "EEXIST") {
         throw err;
@@ -237,8 +240,13 @@ function acquireBindLock(lockPath) {
   }
 }
 
-function releaseBindLock(lockPath) {
+function releaseBindLock(lockPath, token) {
+  // The lock may have been recovered/replaced while a slow binder was
+  // unwinding. Only its exact acquisition token may release it.
+  if (!token) return;
   try {
+    const owner = readFileSync(join(lockPath, "pid"), "utf8").trim();
+    if (owner !== `${process.pid} ${token}`) return;
     rmSync(lockPath, { recursive: true, force: true });
   } catch {}
 }
