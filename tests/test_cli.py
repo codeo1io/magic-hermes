@@ -200,6 +200,95 @@ class TestConfigureHermes:
         assert "ruamel.yaml" in str(excinfo.value)
 
 
+class TestInstallLease:
+    """U6 (plan 2026-10-31, Mode 2) — `install` records the wiring-intent
+    lease right after the config write; `--skip-config` arms nothing;
+    a re-install refreshes `updated_at` while preserving `created_at`."""
+
+    def _run_install(self, isolated_home, *, skip_config=False):
+        tested = cli.tested_magic_context_version()
+        # a current managed copy ⇒ plan "reuse" ⇒ no npm run needed
+        make_package(
+            isolated_home
+            / ".local"
+            / "share"
+            / "magic-hermes"
+            / "node_modules"
+            / "@cortexkit"
+            / "pi-magic-context",
+            tested,
+        )
+        sidecar = mock.MagicMock()
+        sidecar.call.return_value = {
+            "harness": "hermes",
+            "package_version": tested,
+        }
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+        with (
+            mock.patch.object(cli, "npm_latest_version", return_value=None),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+        ):
+            return cli.run_install(skip_config=skip_config)
+
+    def _lease(self, isolated_home):
+        return (
+            isolated_home
+            / ".local"
+            / "share"
+            / "magic-hermes"
+            / "wiring-lease.json"
+        )
+
+    def test_install_writes_the_lease(self, isolated_home, capsys):
+        rc = self._run_install(isolated_home)
+        out = capsys.readouterr().out
+        assert rc == 0
+        lease = self._lease(isolated_home)
+        assert lease.is_file()
+        payload = json.loads(lease.read_text(encoding="utf-8"))
+        assert payload["schema"] == 1
+        assert payload["plugin"] == "magic-hermes"
+        assert payload["wires"] == ["context.engine", "memory.provider"]
+        assert isinstance(payload["created_at"], float)
+        # the one-line operator note names the lease path
+        assert "wiring lease" in out
+        assert str(lease) in out
+
+    def test_skip_config_writes_no_lease(self, isolated_home, capsys):
+        rc = self._run_install(isolated_home, skip_config=True)
+        capsys.readouterr()
+        assert rc == 0
+        assert not self._lease(isolated_home).exists()
+
+    def test_dry_run_writes_no_lease(self, isolated_home, capsys):
+        tested = cli.tested_magic_context_version()
+        with mock.patch.object(cli, "npm_latest_version", return_value=None):
+            rc = cli.run_install(dry_run=True)
+        capsys.readouterr()
+        assert rc == 0
+        assert not self._lease(isolated_home).exists()
+        _ = tested
+
+    def test_reinstall_refreshes_updated_at_preserves_created_at(
+        self, isolated_home, capsys
+    ):
+        from magic_hermes import wiring
+
+        with mock.patch.object(wiring.time, "time", return_value=1000.0):
+            assert self._run_install(isolated_home) == 0
+        capsys.readouterr()
+        with mock.patch.object(wiring.time, "time", return_value=2000.0):
+            assert self._run_install(isolated_home) == 0
+        capsys.readouterr()
+        payload = json.loads(
+            self._lease(isolated_home).read_text(encoding="utf-8")
+        )
+        assert payload["created_at"] == 1000.0
+        assert payload["updated_at"] == 2000.0
+
+
 class TestTextScanFallback:
     def test_scans_wiring_from_unparsed_config(self, isolated_home):
         config = Path(cli.hermes_config_path())
@@ -1016,6 +1105,21 @@ class TestDoctorWallBudget:
             < cli._DOCTOR_WALL_BUDGET_S
         )
         assert 0.0 < cli._DOCTOR_WALL_RENDER_RESERVE_S < 1.0
+
+    def test_bind_wait_margin_keeps_verdict_inside_observer_shot(self):
+        # U2 (plan 2026-10-31, Mode 1): the deferred-bind wait is bounded
+        # by the doctor budget minus a margin, so the sidecar's degraded
+        # response — not a Python-side timeout — renders. The margin is a
+        # third consumer of the same 90 s observer window: budget +
+        # render reserve + margin must still fit with room to spare.
+        margin = cli._DOCTOR_BIND_WAIT_MARGIN_S
+        assert isinstance(margin, float) and margin > 0.0
+        assert (
+            cli._DOCTOR_WALL_BUDGET_S
+            + cli._DOCTOR_WALL_RENDER_RESERVE_S
+            + margin
+            < 90.0
+        )
 
 
 class TestDoctorSkipWording:

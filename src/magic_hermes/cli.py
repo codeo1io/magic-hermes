@@ -48,10 +48,17 @@ from .runtime import (
     magic_context_package_candidates,
     supported_magic_context_series,
     tested_magic_context_version,
-    xdg_data_home,
 )
+from .wiring import (
+    PLUGIN_NAME,
+    _load_yaml,
+    configure_hermes,
+    hermes_config_path,
+    managed_npm_root,
+    write_lease,
+)
+from .wiring import describe as _wiring_describe
 
-PLUGIN_NAME = "magic-hermes"
 UPSTREAM_PACKAGE = "@cortexkit/pi-magic-context"
 # Fast-fail retry budget for the doctor sidecar pair (R2, finding
 # c7d63424): a first attempt failing within 15 s looks like the
@@ -76,7 +83,13 @@ _DOCTOR_WALL_BUDGET_S = 75.0
 # kept back from the budget so the rendered report (and process
 # teardown) still fits after the last sidecar wait fires
 _DOCTOR_WALL_RENDER_RESERVE_S = 0.25
-HERMES_CONFIG_RELPATH = Path(".hermes") / "config.yaml"
+# U2 (plan 2026-10-31, Mode 1): margin kept back from the doctor call's
+# remaining budget when bounding the sidecar's deferred-bind wait
+# (``bind_wait_s``), so the sidecar's degraded response — not a
+# Python-side timeout exception — is what renders. Two independent
+# belts with the bridge-side deadline derivation (U1): the deferred
+# bind can never outrun the verdict budget.
+_DOCTOR_BIND_WAIT_MARGIN_S = 2.0
 SHARED_DB_RELPATH = (
     Path(".local") / "share" / "cortexkit" / "magic-context" / "context.db"
 )
@@ -97,25 +110,6 @@ def _semver_tuple(version: str) -> tuple[int, int, int] | None:
 # ---------------------------------------------------------------------------
 # detection helpers
 # ---------------------------------------------------------------------------
-
-
-def hermes_home() -> Path:
-    """Return the Hermes home directory (profile-aware)."""
-
-    override = os.environ.get("HERMES_HOME")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".hermes"
-
-
-def hermes_config_path() -> Path:
-    return hermes_home() / "config.yaml"
-
-
-def managed_npm_root() -> Path:
-    """Return the Hermes-owned npm prefix managed by this installer."""
-
-    return xdg_data_home() / PLUGIN_NAME
 
 
 def discover_installations() -> list[tuple[Path, str | None]]:
@@ -286,97 +280,6 @@ def run_npm_install(root: Path, version: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Hermes config wiring
-# ---------------------------------------------------------------------------
-
-
-def _load_yaml(path: Path) -> tuple[Any, Any]:
-    """Return (document, saver). Prefers ruamel.yaml for comment retention."""
-
-    try:
-        from ruamel.yaml import YAML  # type: ignore[import-not-found]
-
-        yaml = YAML()
-        yaml.preserve_quotes = True
-        with path.open(encoding="utf-8") as handle:
-            document = yaml.load(handle)
-
-        def saver(target: Path, doc: Any) -> None:
-            tmp = target.with_suffix(target.suffix + ".tmp")
-            with tmp.open("w", encoding="utf-8") as handle:
-                yaml.dump(doc, handle)
-            tmp.replace(target)
-
-        return document, saver
-    except ImportError:
-        import yaml  # type: ignore[import-not-found]
-
-        with path.open(encoding="utf-8") as handle:
-            document = yaml.safe_load(handle)
-
-        def saver(target: Path, doc: Any) -> None:
-            tmp = target.with_suffix(target.suffix + ".tmp")
-            with tmp.open("w", encoding="utf-8") as handle:
-                yaml.safe_dump(doc, handle, sort_keys=False)
-            tmp.replace(target)
-
-        return document, saver
-
-
-def configure_hermes(config_path: Path | None = None) -> list[str]:
-    """Point Hermes at the plugin. Idempotent; returns the changed keys."""
-
-    path = config_path or hermes_config_path()
-    if not path.is_file():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
-    try:
-        document, saver = _load_yaml(path)
-    except ImportError:
-        raise SystemExit(
-            "configuring Hermes requires a YAML library (ruamel.yaml keeps "
-            "comments; PyYAML also works). Install one into the same "
-            "environment as magic-hermes, e.g. "
-            "`pip install ruamel.yaml`, then re-run `magic-hermes install`. "
-            "The upstream package install itself is unaffected."
-        ) from None
-    if not isinstance(document, dict):
-        document = {}
-
-    changed: list[str] = []
-
-    context = document.setdefault("context", {})
-    if not isinstance(context, dict):
-        context = document["context"] = {}
-    if context.get("engine") != "magic-context":
-        context["engine"] = "magic-context"
-        changed.append("context.engine")
-
-    memory = document.setdefault("memory", {})
-    if not isinstance(memory, dict):
-        memory = document["memory"] = {}
-    if memory.get("provider") != "magic_context":
-        memory["provider"] = "magic_context"
-        changed.append("memory.provider")
-
-    plugins = document.setdefault("plugins", {})
-    if not isinstance(plugins, dict):
-        plugins = document["plugins"] = {}
-    enabled = plugins.setdefault("enabled", [])
-    if not isinstance(enabled, list):
-        enabled = plugins["enabled"] = []
-    if PLUGIN_NAME not in enabled:
-        enabled.append(PLUGIN_NAME)
-        changed.append("plugins.enabled")
-
-    if changed:
-        backup = path.with_name(path.name + f".bak.{int(time.time())}")
-        shutil.copy2(path, backup)
-        saver(path, document)
-    return changed
-
-
-# ---------------------------------------------------------------------------
 # doctor checks
 # ---------------------------------------------------------------------------
 
@@ -431,6 +334,58 @@ def _missing_wiring_labels(
         )
         if not ok
     ]
+
+
+def _config_wiring_row_suffix(config_path: Path) -> str:
+    """U6 (plan 2026-10-31, Mode 2): the lease-aware tail of the unwired
+    FAIL row.
+
+    Truthful in every variant (W4/R3): the row names lease/convergence
+    state, never claims activation, and keeps ``magic-hermes install``
+    as the explicit re-wire act. No lease (or an unreadable lease)
+    renders today's message byte-for-byte. The state read is fail-open —
+    a convergence-module failure can never break the verdict render.
+    """
+
+    try:
+        state = _wiring_describe(config_path)
+    except Exception:
+        state = None
+    if not state or not state.get("has_lease"):
+        return " — run `magic-hermes install`"
+    lease = str(state.get("lease_path") or "<wiring lease>")
+    if state.get("plugin_enabled") is False:
+        # convergence cannot restore its own enablement: when
+        # plugins.enabled lost the plugin, the plugin never loads to
+        # run convergence — the row must not imply self-repair
+        return (
+            f" — wiring lease active at {lease}, but plugins.enabled "
+            "lost magic-hermes: convergence cannot restore its own "
+            "enablement (the plugin never loads to run it); run "
+            "`magic-hermes install`"
+        )
+    classification = state.get("classification")
+    if classification == "repairable":
+        return (
+            f" — wiring lease active at {lease}: convergence pending "
+            "(plugin load / hook recheck) or run `magic-hermes install`"
+        )
+    if classification == "deliberate":
+        engine = state.get("engine")
+        provider = state.get("provider")
+        return (
+            f" — wiring lease active at {lease}, but the config holds "
+            f"deliberate overrides (context.engine={engine!r}, "
+            f"memory.provider={provider!r}); delete the lease to opt "
+            "out of convergence, or run `magic-hermes install` to "
+            "re-wire explicitly"
+        )
+    # unknown classification (no YAML lib / unreadable config): the
+    # lease is named, but the row claims nothing about repairability
+    return (
+        f" — wiring lease active at {lease}; run `magic-hermes install` "
+        "to re-wire explicitly"
+    )
 
 
 def shared_db_path() -> Path | None:
@@ -664,7 +619,7 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                     "FAIL",
                     "Hermes config missing wiring: "
                     + ", ".join(_missing_wiring_labels(*wiring))
-                    + " — run `magic-hermes install`",
+                    + _config_wiring_row_suffix(config_path),
                 )
         else:
             wiring = _config_wiring_from_document(document)
@@ -675,7 +630,7 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                     "FAIL",
                     "Hermes config missing wiring: "
                     + ", ".join(_missing_wiring_labels(*wiring))
-                    + " — run `magic-hermes install`",
+                    + _config_wiring_row_suffix(config_path),
                 )
     else:
         report.add(
@@ -850,7 +805,15 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
             # down instead of the bare 60 s constant
             handshake_timeout = min(60.0, remaining)
             try:
-                with RuntimeClient(timeout=handshake_timeout) as client:
+                # U2 (Mode 1): the doctor spawns its sidecar in
+                # deferred-bind mode — hello answers before the
+                # shared-store bind resolves, and the bounded bind wait
+                # rides the doctor call params. Session traffic never
+                # sets the flag (R5).
+                with RuntimeClient(
+                    timeout=handshake_timeout,
+                    extra_env={"MAGIC_HERMES_DEFER_BIND": "1"},
+                ) as client:
                     handshake = client.call("hello", timeout=handshake_timeout)
                     # quick_check scans the entire shared DB; the sidecar bounds
                     # that scan by default (size/contention gates in the
@@ -866,7 +829,12 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                         break
                     bridge = client.call(
                         "doctor",
-                        {"full_integrity": full_integrity},
+                        {
+                            "full_integrity": full_integrity,
+                            "bind_wait_s": max(
+                                0.0, doctor_budget - _DOCTOR_BIND_WAIT_MARGIN_S
+                            ),
+                        },
                         timeout=min(300.0, doctor_budget),
                     )
                 sidecar_healthy = True
@@ -955,11 +923,23 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                 # outcome — the probe-error lane must not claim that probe
                 # reads succeeded; every probe-success skip lane keeps the
                 # truthful claim.
-                probe_claim = (
-                    "the store opened but the probe read failed"
-                    if reason.startswith("probe-error")
-                    else "the store opened and probe reads succeeded"
-                )
+                # U2 (plan 2026-10-31, Mode 1): the bind-contention lane
+                # is the third shape — the deferred shared-store bind
+                # never landed inside the doctor's wait budget, so the
+                # row must claim neither an opened store nor any probe
+                # read; the reason text quotes the waited/budget numbers.
+                if reason.startswith("bind-contention"):
+                    probe_claim = (
+                        "the deferred shared-store bind never landed "
+                        "inside the doctor's wait budget, so the store "
+                        "was not opened and no probe reads ran"
+                    )
+                elif reason.startswith("probe-error"):
+                    probe_claim = "the store opened but the probe read failed"
+                else:
+                    probe_claim = (
+                        "the store opened and probe reads succeeded"
+                    )
                 report.add(
                     "WARN",
                     "Shared DB integrity scan skipped in doctor budget "
@@ -983,10 +963,17 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                     + ", ".join(bridge.get("missing_core_symbols") or []),
                 )
         if isinstance(handshake, dict):
+            # U2 (Mode 1): hello reports the deferred-bind state
+            # additively; an old sidecar without the field keeps today's
+            # row wording byte-for-byte.
+            bind_state = handshake.get("bind_state")
+            bind_suffix = (
+                f", bind={bind_state}" if bind_state is not None else ""
+            )
             report.add(
                 "PASS",
                 f"Sidecar handshake ok (harness={handshake.get('harness')}, "
-                f"v{handshake.get('package_version')})",
+                f"v{handshake.get('package_version')}{bind_suffix})",
             )
 
     if json_output:
@@ -1000,8 +987,15 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
         }
         if isinstance(bridge, dict):
             # Additive scan-evidence fields from the sidecar (absent on
-            # sidecars without the bounded-scan rider).
-            for key in ("scan_mode", "store_bytes", "probe_ms"):
+            # sidecars without the bounded-scan rider; the deferred-bind
+            # fields ride the same additive contract).
+            for key in (
+                "scan_mode",
+                "store_bytes",
+                "probe_ms",
+                "bind_state",
+                "bind_waited_ms",
+            ):
                 if key in bridge:
                     payload[key] = bridge[key]
         print(json.dumps(payload, indent=2))
@@ -1416,6 +1410,11 @@ def run_install(
             print(f"│  Hermes config updated: {', '.join(changed)} (backup written)")
         else:
             print("│  Hermes config already wired")
+        # U6 (plan 2026-10-31, Mode 2): record operator intent as the
+        # wiring lease — the write authorization convergence runs under.
+        # --skip-config never reaches this block, so it arms nothing.
+        lease = write_lease()
+        print(f"│  wiring lease recorded: {lease}")
 
     # End-to-end verification: the sidecar must boot and open the shared DB.
     try:
