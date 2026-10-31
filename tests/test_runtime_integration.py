@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 from packaging.version import Version as _Version
 
 from magic_hermes.runtime import (
     RuntimeClient,
+    RuntimeProtocolError,
     runtime_available,
     supported_magic_context_series,
 )
@@ -3393,6 +3398,226 @@ def test_doctor_reports_zero_wal_bytes_without_wal_sibling(tmp_path):
     assert doctor["scan_mode"] == "full"
     assert doctor["wal_bytes"] == 0
     assert doctor["store_bytes"] == main_bytes
+
+
+# --- deferred-bind doctor role (plan 2026-10-31 unit U1, Mode 1) ------------
+#
+# The doctor sidecar runs with MAGIC_HERMES_DEFER_BIND=1: RPC is served
+# before the shared-store bind resolves (hello answers immediately with
+# a bind_state), the doctor RPC awaits the bind bounded by bind_wait_s,
+# and contention degrades honestly to `skipped:bind-contention` while
+# fence/non-transient failures rethrow the module-load-path error for
+# the typed FAIL lanes. Session mode (no flag) is pinned unchanged.
+
+
+def _hold_bind_lock(db_path):
+    """Seed the bridge's cross-process bind mutex with OUR live pid.
+
+    The sidecar's acquireBindLock sees a live holder and waits (it never
+    reaps a live pid), deterministically reproducing the shared-store
+    contention window Mode 1 exists to tolerate."""
+    lock_path = Path(str(db_path) + ".bindlock")
+    lock_path.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4()
+    (lock_path / "pid").write_text(f"{os.getpid()} {token}\n", encoding="utf-8")
+    return lock_path
+
+
+def test_doctor_role_hello_serves_before_bind_resolves(tmp_path, monkeypatch):
+    db_path = tmp_path / "defer-hello.db"
+    _hold_bind_lock(db_path)
+    monkeypatch.setenv("MAGIC_HERMES_DEFER_BIND", "1")
+    started = time.monotonic()
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        hello = client.call("hello", timeout=5)
+    elapsed = time.monotonic() - started
+    assert hello["harness"] == "hermes"
+    assert hello["package_version"]
+    assert hello["bind_state"] == "pending"
+    assert elapsed < 5.0
+
+
+def test_doctor_role_deferred_bind_completes_through_real_mutex(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "defer-complete.db"
+    lock_path = _hold_bind_lock(db_path)
+    monkeypatch.setenv("MAGIC_HERMES_DEFER_BIND", "1")
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        hello = client.call("hello", timeout=10)
+        assert hello["bind_state"] == "pending"
+        # release the mutex: the waiter acquires on its 250ms poll and
+        # completes the REAL open/migration path
+        shutil.rmtree(lock_path)
+        doctor = client.call(
+            "doctor", {"full_integrity": False, "bind_wait_s": 30}, timeout=60
+        )
+    assert doctor["database_health"] == "ok"
+    assert doctor["bind_state"] == "bound"
+    assert doctor["scan_mode"] == "full"
+    assert doctor["store_bytes"] > 0
+
+
+def test_doctor_role_bind_contention_degrades_honestly(tmp_path, monkeypatch):
+    db_path = tmp_path / "defer-contention.db"
+    _hold_bind_lock(db_path)
+    monkeypatch.setenv("MAGIC_HERMES_DEFER_BIND", "1")
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        hello = client.call("hello", timeout=10)
+        assert hello["bind_state"] == "pending"
+        doctor = client.call(
+            "doctor", {"full_integrity": False, "bind_wait_s": 1}, timeout=60
+        )
+    health = doctor["database_health"]
+    assert health.startswith("skipped:bind-contention")
+    assert "bind pending after" in health
+    assert "(budget 1000ms)" in health
+    assert doctor["scan_mode"] == "bind-pending"
+    assert doctor["bind_state"] == "pending"
+    assert doctor["bind_waited_ms"] >= 900
+    # honest absence: the store never opened, so no store evidence
+    assert "store_bytes" not in doctor
+    assert "probe_ms" not in doctor
+    assert "wal_bytes" not in doctor
+
+
+def test_session_role_hello_still_waits_for_the_bind(tmp_path):
+    # R5 pin: without the defer flag the boot stays bind-before-serve —
+    # hello must NOT answer while the mutex is held (the containment the
+    # session semantics rely on), and the client-side timeout disposes
+    # the sidecar instead of leaving it queued on the mutex.
+    db_path = tmp_path / "session-hold.db"
+    _hold_bind_lock(db_path)
+    started = time.monotonic()
+    with (
+        pytest.raises(RuntimeProtocolError, match="timed out"),
+        RuntimeClient(db_path=db_path, timeout=60) as client,
+    ):
+        client.call("hello", timeout=5)
+    assert time.monotonic() - started < 15.0
+
+
+def test_doctor_role_fence_refusal_rethrows_lane_skew_sentence(
+    tmp_path, monkeypatch
+):
+    # R3 parity: a schema-fence refusal in the deferred role composes the
+    # module-load-path error (lastFenceDiagnostic included) and rethrows
+    # it through the doctor RPC error channel, so the host's
+    # _LANE_SKEW_FENCE_RE types it exactly like a session-boot fence.
+    from magic_hermes import cli
+
+    db_path = tmp_path / "defer-fence.db"
+    log_path = tmp_path / "mc.log"
+    # bring the store up to the current lane with a normal session bind
+    # so the fence below is the only refusal cause
+    with RuntimeClient(db_path=db_path, timeout=60) as setup:
+        assert setup.call("hello", timeout=60)["harness"] == "hermes"
+    lane = sqlite3.connect(db_path).execute(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+    ).fetchone()[0]
+    assert lane >= 1
+    monkeypatch.setenv("MAGIC_HERMES_DEFER_BIND", "1")
+    monkeypatch.setenv("MAGIC_CONTEXT_LATEST_SUPPORTED_VERSION", str(lane - 1))
+    monkeypatch.setenv("MAGIC_CONTEXT_LOG_PATH", str(log_path))
+    monkeypatch.setenv("MAGIC_CONTEXT_LOG_SYNC", "1")
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        hello = client.call("hello", timeout=10)
+        assert hello["bind_state"] in {"pending", "failed"}
+        with pytest.raises(RuntimeProtocolError) as excinfo:
+            client.call(
+                "doctor", {"full_integrity": False, "bind_wait_s": 30}, timeout=60
+            )
+    message = str(excinfo.value)
+    assert "Magic Context refused to open its shared context database" in message
+    assert "storage fatal" in message
+    assert f"migration lane v{lane} is newer" in message
+    assert f"(max v{lane - 1})" in message
+    # byte-composability with the host's typed verdict: the regex that
+    # minted the lane-skew FAIL row types this message
+    skew = cli._shared_store_lane_skew([message])
+    assert skew is not None
+    assert skew == (lane, lane - 1)
+
+
+def test_doctor_role_transient_busy_degrades_not_fails(tmp_path, monkeypatch):
+    # Classification refinement: a transient busy AFTER the mutex was won
+    # (an external writer holds the write txn through the sidecar's
+    # migration open) is load contention — the degraded shape, never a
+    # thrown FAIL. The boot busy timeout is the adapter's hard-clamped
+    # 5000ms, so the first attempt blocks that long before the transient
+    # retry/backoff and the bind_wait_s cap classify the outcome.
+    db_path = tmp_path / "defer-busy.db"
+    holder = sqlite3.connect(db_path, timeout=1)
+    holder.execute("PRAGMA journal_mode=WAL")
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute(
+        "CREATE TABLE IF NOT EXISTS contention_probe (id INTEGER PRIMARY KEY)"
+    )
+    try:
+        monkeypatch.setenv("MAGIC_HERMES_DEFER_BIND", "1")
+        monkeypatch.setenv("MAGIC_CONTEXT_BIND_ATTEMPTS", "1")
+        with RuntimeClient(db_path=db_path, timeout=60) as client:
+            hello = client.call("hello", timeout=10)
+            # the single attempt may already have exhausted itself before
+            # hello was served — either state is honest; the contract is
+            # the doctor outcome below
+            assert hello["bind_state"] in {"pending", "failed"}
+            doctor = client.call(
+                "doctor", {"full_integrity": False, "bind_wait_s": 12}, timeout=60
+            )
+    finally:
+        holder.rollback()
+        holder.close()
+    assert doctor["database_health"].startswith("skipped:bind-contention")
+    assert doctor["scan_mode"] == "bind-pending"
+    assert doctor["bind_state"] in {"pending", "failed"}
+    assert "store_bytes" not in doctor
+
+
+def test_doctor_role_stdin_close_exits_promptly_while_pending(tmp_path):
+    # Close-path cancellation: with the bind still pending, closing stdin
+    # cancels the controller at its next checkpoint — the sidecar exits
+    # in ~one poll interval, well under the 90s mutex deadline.
+    db_path = tmp_path / "defer-close.db"
+    _hold_bind_lock(db_path)
+    env = os.environ.copy()
+    env["MAGIC_HERMES_DEFER_BIND"] = "1"
+    env["MAGIC_CONTEXT_DB_PATH"] = str(db_path)
+    from magic_hermes.runtime import (
+        magic_context_package_candidates,
+        runtime_script_path,
+    )
+
+    package_root = None
+    for candidate in magic_context_package_candidates():
+        if (candidate / "dist" / "index.js").is_file():
+            package_root = str(candidate)
+            break
+    assert package_root is not None
+    env["MAGIC_CONTEXT_PACKAGE_ROOT"] = package_root
+    proc = subprocess.Popen(
+        ["node", "--no-warnings", str(runtime_script_path())],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    )
+    try:
+        request = json.dumps({"id": 1, "method": "hello", "params": {}}) + "\n"
+        proc.stdin.write(request)
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        response = json.loads(line)
+        assert response["result"]["bind_state"] == "pending"
+    finally:
+        started = time.monotonic()
+        proc.stdin.close()
+        code = proc.wait(timeout=20)
+        elapsed = time.monotonic() - started
+    assert elapsed < 10.0
+    assert code == 0
 
 
 def test_historian_publish_last_compartment_ids_match_full_fetch(

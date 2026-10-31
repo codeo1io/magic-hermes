@@ -13,6 +13,22 @@ from typing import Any
 from .engine import MagicContextEngine
 from .runtime import RuntimeClient, runtime_available, runtime_unavailable_reason
 
+# Wiring convergence (plan 2026-10-31 unit U5, finding c7d63424 Mode 2):
+# the host gateway legitimately rewrites ~/.hermes/config.yaml and can
+# serialize Hermes' factory-default context.engine/memory.provider back
+# over the plugin's wiring while plugins.enabled keeps magic-hermes,
+# silently unplugging the plugin from the host. ``magic-hermes install``
+# records operator intent as a lease file; the stdlib-only ``wiring``
+# module (plan unit U4) repairs exactly those two keys — only from
+# factory-default state, only under the lease. The import is module-level
+# per the plan's surface pin, with a cross-lane tolerance guard: a source
+# tree where wiring.py has not landed yet (the parallel implement unit
+# owns it) still loads the plugin, with convergence inert until it ships.
+try:  # pragma: no cover - exercised only in pre-join source trees
+    from . import wiring
+except ImportError:  # pragma: no cover - see above
+    wiring = None
+
 log = logging.getLogger(__name__)
 
 PLUGIN_API_VERSION = "0.2"
@@ -71,6 +87,15 @@ class _DreamerHostBridge:
             self._child_capabilities[child_session_id] = str(capability)
 
     def _on_pre_tool_call(self, **payload: Any) -> dict[str, str] | None:
+        if wiring is not None:
+            # U5: rate-limited wiring recheck on the always-on hook —
+            # cheap when not due (one monotonic compare under a lock) and
+            # fail-open: a recheck failure must never raise into the host
+            # tool-call dispatch.
+            try:
+                wiring.recheck()
+            except Exception:
+                log.debug("Hermes wiring recheck failed", exc_info=True)
         session_id = str(payload.get("session_id") or "")
         tool_name = str(payload.get("tool_name") or "")
         with self._lock:
@@ -426,6 +451,21 @@ def load(
         reason = runtime_unavailable_reason()
         log.warning("magic-hermes is disabled: %s", reason)
         return {"enabled": False, "reason": reason}
+
+    if wiring is not None:
+        # U5: converge at plugin load — the gateway process whose config
+        # save path clobbers the wiring is the same process class that
+        # loads this plugin. Containment mirrors _register_dreamer_tools:
+        # convergence is fail-open by design (plan W2) and must never
+        # abort registration.
+        try:
+            wiring.converge()
+        except Exception:
+            log.warning(
+                "Hermes wiring convergence failed at plugin load; the "
+                "config file was left untouched",
+                exc_info=True,
+            )
 
     root = str(Path(project_root).resolve()) if project_root is not None else None
 

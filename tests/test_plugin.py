@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import sys
+import time
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -309,3 +312,182 @@ def test_launch_seq_map_is_bounded(tmp_path, hermes_lifecycle_stubs, monkeypatch
         )
 
     assert len(bridge._launch_seq) <= 256
+
+
+# --- wiring convergence triggers (plan unit U5, finding c7d63424 Mode 2) ----
+#
+# The wiring machinery itself (lease, classifier, configure_hermes writer)
+# is plan unit U4 and lands with the parallel implement lane; these
+# contracts activate at the unit join. The containment tests below run
+# unconditionally because they monkeypatch plugin.wiring directly.
+
+try:
+    from magic_hermes import wiring as _wiring
+except ImportError:  # unit U4 lands in the parallel implement lane
+    _wiring = None
+
+requires_wiring = pytest.mark.skipif(
+    _wiring is None,
+    reason="magic_hermes.wiring lands with the parallel implement lane "
+    "(plan unit U4); these contracts activate at the unit join",
+)
+
+
+def _drifted_hermes_config(home: Path) -> Path:
+    """Write the live 2026-10-30 clobber shape and return its path.
+
+    Factory wiring on both keys (engine: compressor, provider: null) while
+    plugins.enabled keeps magic-hermes — the exact state that unplugs the
+    plugin while flagging the doctor's unwired FAIL row. A host-managed
+    comment exercises comment preservation through the repair."""
+    config = home / ".hermes" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "# hermes config (host-managed)\n"
+        "context:\n"
+        "  engine: compressor\n"
+        "memory:\n"
+        "  provider: null\n"
+        "plugins:\n"
+        "  enabled:\n"
+        "    - magic-hermes\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+def _write_wiring_lease(home: Path) -> Path:
+    """Write the operator-intent lease per the plan's pinned schema."""
+    lease = home / ".local" / "share" / "magic-hermes" / "wiring-lease.json"
+    lease.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    lease.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "plugin": "magic-hermes",
+                "wires": ["context.engine", "memory.provider"],
+                "created_at": now,
+                "updated_at": now,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return lease
+
+
+def _isolated_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+
+
+@requires_wiring
+def test_load_converges_drifted_wiring_under_lease(monkeypatch, tmp_path):
+    _isolated_home(monkeypatch, tmp_path)
+    config = _drifted_hermes_config(tmp_path)
+    _write_wiring_lease(tmp_path)
+    monkeypatch.setattr(plugin, "runtime_available", lambda: True)
+    monkeypatch.setattr(plugin, "RuntimeClient", FakeRuntimeClient)
+    context = FakeContext()
+
+    result = plugin.load(context, project_root=tmp_path)
+
+    assert result["enabled"] is True
+    assert context.engine.name == "magic-context"
+    text = config.read_text(encoding="utf-8")
+    assert "engine: magic-context" in text
+    assert "provider: magic_context" in text
+    assert "- magic-hermes" in text
+    # comment preservation through the repair (plan W3)
+    assert "# hermes config (host-managed)" in text
+
+
+def test_load_survives_wiring_convergence_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(plugin, "runtime_available", lambda: True)
+    monkeypatch.setattr(plugin, "RuntimeClient", FakeRuntimeClient)
+
+    class ExplodingWiring:
+        def converge(self):
+            raise RuntimeError("wiring convergence exploded")
+
+    monkeypatch.setattr(plugin, "wiring", ExplodingWiring())
+    context = FakeContext()
+
+    result = plugin.load(context, project_root=tmp_path)
+
+    # containment: registration proceeds despite the convergence failure
+    assert result["enabled"] is True
+    assert context.engine.name == "magic-context"
+    assert set(context.tasks) == {"mc_historian"}
+
+
+def test_load_skips_convergence_when_runtime_unavailable(monkeypatch):
+    monkeypatch.setattr(plugin, "runtime_available", lambda: False)
+
+    calls = []
+
+    class RecordingWiring:
+        def converge(self):
+            calls.append("converge")
+
+    monkeypatch.setattr(plugin, "wiring", RecordingWiring())
+    result = plugin.load(FakeContext())
+
+    assert result["enabled"] is False
+    assert calls == []
+
+
+@requires_wiring
+def test_pre_tool_call_recheck_repairs_when_due(monkeypatch, tmp_path):
+    _isolated_home(monkeypatch, tmp_path)
+    config = _drifted_hermes_config(tmp_path)
+    _write_wiring_lease(tmp_path)
+    monkeypatch.setenv("MAGIC_HERMES_WIRING_RECHECK_S", "0")
+    bridge = plugin._DreamerHostBridge(FakeContext())
+
+    verdict = bridge._on_pre_tool_call(
+        session_id="root-session", tool_name="read_file"
+    )
+
+    # an ordinary (non-child) session: the capability logic is untouched
+    assert verdict is None
+    text = config.read_text(encoding="utf-8")
+    assert "engine: magic-context" in text
+    assert "provider: magic_context" in text
+
+
+@requires_wiring
+def test_pre_tool_call_recheck_not_due_leaves_config_untouched(
+    monkeypatch, tmp_path
+):
+    _isolated_home(monkeypatch, tmp_path)
+    config = _drifted_hermes_config(tmp_path)
+    _write_wiring_lease(tmp_path)
+    bridge = plugin._DreamerHostBridge(FakeContext())
+
+    # force the check due once so the recheck's last-check state is NOW
+    monkeypatch.setenv("MAGIC_HERMES_WIRING_RECHECK_S", "0")
+    bridge._on_pre_tool_call(session_id="root-session", tool_name="read_file")
+    assert "engine: magic-context" in config.read_text(encoding="utf-8")
+
+    # re-drift the file; with the interval far from due the recheck must
+    # not write (plan W1: the interval bounds the flap rate)
+    _drifted_hermes_config(tmp_path)
+    monkeypatch.setenv("MAGIC_HERMES_WIRING_RECHECK_S", "86400")
+    before = config.read_text(encoding="utf-8")
+    bridge._on_pre_tool_call(session_id="root-session", tool_name="read_file")
+    assert config.read_text(encoding="utf-8") == before
+    assert "engine: compressor" in before
+
+
+def test_pre_tool_call_recheck_failure_never_escapes(monkeypatch, tmp_path):
+    class ExplodingWiring:
+        def recheck(self):
+            raise RuntimeError("wiring recheck exploded")
+
+    monkeypatch.setattr(plugin, "wiring", ExplodingWiring())
+    bridge = plugin._DreamerHostBridge(FakeContext())
+
+    # the failure is contained: the hook returns its ordinary value and
+    # never raises into the host tool-call dispatch
+    assert bridge._on_pre_tool_call(session_id="s", tool_name="read_file") is None

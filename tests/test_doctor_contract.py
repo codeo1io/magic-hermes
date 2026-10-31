@@ -450,6 +450,8 @@ RESPONSE = json.loads(os.environ["DOCTOR_SIDECAR_RESPONSE"])
 
 
 class _FakeSidecar:
+    doctor_calls = 0
+
     def __init__(self, *args, **kwargs):
         pass
 
@@ -465,6 +467,13 @@ class _FakeSidecar:
             if error:
                 raise RuntimeError(error)
             return {"harness": "hermes", "package_version": TESTED}
+        # count attempts (before any raise) so failure regimes are
+        # observable too; the doctor-only error knob is the deferred-bind
+        # failure channel (hello healthy, doctor raises)
+        _FakeSidecar.doctor_calls += 1
+        error = os.environ.get("DOCTOR_SIDECAR_DOCTOR_ERROR")
+        if error:
+            raise RuntimeError(error)
         return RESPONSE
 
 
@@ -473,7 +482,12 @@ with mock.patch.object(
     "discover_installations",
     return_value=[(Path(os.environ["DOCTOR_PACKAGE"]), TESTED)],
 ), mock.patch.object(cli, "RuntimeClient", _FakeSidecar):
-    sys.exit(cli.run_doctor())
+    rc = cli.run_doctor()
+    # observable call accounting for the matrix rows: proves a degraded
+    # response terminates the sidecar interaction (no second long wait)
+    # and pins the fast-fail retry count on failure regimes
+    print(f"DOCTOR_CALLS={_FakeSidecar.doctor_calls}", file=sys.stderr)
+    sys.exit(rc)
 '''
 
 
@@ -637,6 +651,95 @@ class TestObserverBudgetMatrix:
         assert "lane v95" in proc.stdout
         assert "scripts/sync_magic_context_release.py" in proc.stdout
         assert "/ FAIL 1" in proc.stdout
+
+    # --- bind-regime rows (plan 2026-10-31 units U1/U3, Mode 1) ----------
+
+    def test_bind_pending_regime_renders_warn_verdict(self, tmp_path, isolated_home):
+        # The deferred-bind doctor sidecar degrades the store lanes to
+        # `skipped:bind-contention` when the shared-store bind does not
+        # land inside the doctor's remaining budget. Under the observer
+        # the verdict must still render: rc 0, "FAIL 0", the
+        # bind-contention WARN present. (The honest per-lane wording for
+        # the bind-contention prefix — no "store opened" claim — is unit
+        # U2's contract, landed with the even implement lane; this row
+        # pins the CLI-side budget invariant either way.)
+        proc = self._run_row(
+            tmp_path,
+            isolated_home,
+            {},
+            {
+                "database_health": (
+                    "skipped:bind-contention bind pending after "
+                    "68000ms (budget 68000ms)"
+                ),
+                "scan_mode": "bind-pending",
+                "bind_state": "pending",
+                "bind_waited_ms": 68000,
+            },
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "FAIL 0" in proc.stdout
+        assert "bind-contention" in proc.stdout
+        assert "WARN 1 / FAIL 0" in proc.stdout
+
+    def test_bind_never_lands_regime_renders_without_second_wait(
+        self, tmp_path, isolated_home
+    ):
+        # The bind-never-lands regime: the same degraded shape with the
+        # full-budget waited figure. Receiving the degraded response
+        # must TERMINATE the sidecar interaction — no second long wait
+        # (retry or re-spawn) after the sidecar already reported
+        # budget-bound bind contention, or the 90 s observer shot would
+        # be spent twice. The driver's call accounting makes that
+        # observable: exactly one doctor call.
+        proc = self._run_row(
+            tmp_path,
+            isolated_home,
+            {},
+            {
+                "database_health": (
+                    "skipped:bind-contention bind pending after "
+                    "73000ms (budget 73000ms)"
+                ),
+                "scan_mode": "bind-pending",
+                "bind_state": "pending",
+                "bind_waited_ms": 73000,
+            },
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "FAIL 0" in proc.stdout
+        assert "bind-contention" in proc.stdout
+        assert "DOCTOR_CALLS=1" in proc.stderr
+
+    def test_fence_after_hello_renders_typed_fail_within_observer_shot(
+        self, tmp_path, isolated_home
+    ):
+        # The deferred-bind fence channel: hello answers (the handshake
+        # no longer waits for the bind), then the rethrown module-load
+        # path refusal arrives as the doctor RPC's error. It must render
+        # the SAME typed lane-skew FAIL row the hello-channel fence
+        # does — the fence sentence survives into the RPC error message
+        # — inside the observer shot, with exactly the one fast-fail
+        # retry (two doctor calls).
+        fence = (
+            "doctor: Magic Context refused to open its shared context "
+            "database. Reason (from /tmp/magic-context.log): "
+            "[magic-context] storage fatal: refusing to open context.db; "
+            "upstream migration lane v95 is newer than this binary "
+            "supports (max v94). A pinned or stale plugin is likely "
+            "sharing this database with a newer instance"
+        )
+        proc = self._run_row(
+            tmp_path,
+            isolated_home,
+            {"DOCTOR_SIDECAR_DOCTOR_ERROR": fence},
+        )
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert proc.stdout.count("shared-store lane skew") == 1
+        assert "lane v95" in proc.stdout
+        assert "max v94" in proc.stdout
+        assert "/ FAIL 1" in proc.stdout
+        assert "DOCTOR_CALLS=2" in proc.stderr
 
 
 class TestDeploySmoke:
