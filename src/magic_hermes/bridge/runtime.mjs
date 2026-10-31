@@ -3453,6 +3453,16 @@ function deferredBindDegraded(controller, startedAt, bindWaitS) {
     health += " — " + String(controller.contentionDetail).slice(0, 160);
   }
   const result = doctorResultShell(null);
+  // The degraded lane's bind_state is the pinned contract shape
+  // ("pending"), NOT the controller's live state: when the caller's
+  // race timer and the controller's tightened mutex deadline fire near
+  // simultaneously, the controller may already have recorded a
+  // contention-classified failure by the time this result is composed
+  // (observed on a slower GitHub runner 2026-10-31, CI-only). The
+  // verdict's semantics are "bind still pending under contention" —
+  // evidence about load, never a concluded bind failure (U16c honesty;
+  // the Python contract pins bind_state "pending" in this shape).
+  result.bind_state = "pending";
   result.database_health = health;
   result.scan_mode = "bind-pending";
   result.bind_waited_ms = Math.round(waitedMs);
