@@ -99,6 +99,18 @@ verifies the runtime end to end:
 plan, `--package-root PATH` binds an arbitrary copy, and `--skip-config`
 leaves Hermes config untouched.
 
+`install` also records a small wiring-intent lease at
+`~/.local/share/magic-hermes/wiring-lease.json` (or the `XDG_DATA_HOME`
+equivalent). Host-side config rewrites occasionally serialize
+`context.engine`/`memory.provider` back to Hermes factory defaults while
+leaving the plugin enabled; with the lease on record, the plugin converges
+exactly that factory-default drift back at load time and on a rate-limited
+recheck (default every 15 minutes; `MAGIC_HERMES_WIRING_RECHECK_S`
+overrides, clamped to one day). Convergence never overrides deliberate
+values, writes only through the same comment-preserving backup path as
+`install`, and `--skip-config` writes no lease. Deleting the lease file is
+the documented opt-out.
+
 ### 1b. Check installation health
 
 ```bash

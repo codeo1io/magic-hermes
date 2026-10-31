@@ -81,11 +81,21 @@ def _run_doctor(
     full_integrity=False,
     json_output=False,
     sidecar_error=None,
+    hello_report=None,
+    doctor_error=None,
+    ctor_sink=None,
+    config_writer=None,
 ):
     """Run cli.run_doctor against a patched sidecar.
 
     ``doctor_report`` is the dict the mocked ``doctor`` RPC returns;
-    ``sidecar_error`` (if set) makes every sidecar call raise instead.
+    ``sidecar_error`` (if set) makes every sidecar call raise instead;
+    ``hello_report`` merges additive fields into the hello response
+    (e.g. ``bind_state``); ``doctor_error`` makes only the ``doctor``
+    call raise (hello stays healthy — the deferred-bind failure
+    channel); ``ctor_sink`` (a list) collects the RuntimeClient
+    constructor kwargs; ``config_writer`` replaces the default wired
+    config fixture (the lease-aware wiring-row tests).
     Returns ``(rc, doctor_call_params)``; the caller reads stdout via
     its own ``capsys``.
     """
@@ -95,7 +105,10 @@ def _run_doctor(
     if not db.exists():
         hg.make_fixture_db(db)
     monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
-    _wire_config()
+    if config_writer is None:
+        _wire_config()
+    else:
+        config_writer()
 
     tested = cli.tested_magic_context_version()
     package = make_package(tmp_path / "pkg", tested)
@@ -107,7 +120,12 @@ def _run_doctor(
         if sidecar_error is not None:
             raise sidecar_error
         if method == "hello":
-            return {"harness": "hermes", "package_version": tested}
+            hello = {"harness": "hermes", "package_version": tested}
+            if hello_report:
+                hello.update(hello_report)
+            return hello
+        if doctor_error is not None:
+            raise doctor_error
         report = {
             "database_health": "ok",
             "core_symbols_ready": True,
@@ -121,11 +139,16 @@ def _run_doctor(
     client.__enter__.return_value = sidecar
     client.__exit__.return_value = False
 
+    def _capture_ctor(*args, **kwargs):
+        if ctor_sink is not None:
+            ctor_sink.append(kwargs)
+        return client
+
     with (
         mock.patch.object(
             cli, "discover_installations", return_value=[(package, tested)]
         ),
-        mock.patch.object(cli, "RuntimeClient", return_value=client),
+        mock.patch.object(cli, "RuntimeClient", side_effect=_capture_ctor),
         # the retry backoff is real wall-clock sleep; these tests exercise
         # the report mapping, not the timing, so zero it out
         mock.patch.object(cli, "_SIDECAR_RETRY_BACKOFF_S", 0.0),
@@ -252,13 +275,17 @@ class TestJsonContract:
         self, tmp_path, monkeypatch, isolated_home, capsys
     ):
         # an older sidecar (no rider) reports neither scan_mode nor health
-        # prefixes it does not know — the JSON shape must not invent keys
+        # prefixes it does not know — the JSON shape must not invent keys.
+        # The deferred-bind fields (U2) are equally additive: an old
+        # sidecar reports no bind_state and the payload must not mint one.
         rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, {}, json_output=True)
         payload = json.loads(capsys.readouterr().out)
         assert rc == 0
         assert "scan_mode" not in payload
         assert "store_bytes" not in payload
         assert "probe_ms" not in payload
+        assert "bind_state" not in payload
+        assert "bind_waited_ms" not in payload
 
 
 class TestHonestyInvariant:
@@ -390,14 +417,14 @@ class TestFullIntegrityPlumbing:
             tmp_path, monkeypatch, isolated_home, {}, full_integrity=True
         )
         capsys.readouterr()
-        assert params == {"full_integrity": True}
+        assert params["full_integrity"] is True
 
     def test_default_is_not_full_integrity(
         self, tmp_path, monkeypatch, isolated_home, capsys
     ):
         _, params = _run_doctor(tmp_path, monkeypatch, isolated_home, {})
         capsys.readouterr()
-        assert params == {"full_integrity": False}
+        assert params["full_integrity"] is False
 
     def test_parser_accepts_flag_and_main_plumbs_it(self):
         args = cli.build_parser().parse_args(["doctor", "--full-integrity"])
@@ -434,6 +461,372 @@ class TestRetryBudget:
         assert isinstance(reserve, float) and 0.0 < reserve < 1.0
         assert budget + reserve < 90.0
         assert budget >= cli._SIDECAR_FAST_FAIL_S + cli._SIDECAR_RETRY_BACKOFF_S
+
+
+class TestDeferredBindContract:
+    """U2 (plan 2026-10-31, Mode 1) — the doctor sidecar is spawned in
+    deferred-bind mode, the bounded wait is passed in the doctor call,
+    and bind contention renders as the honest WARN lane.
+
+    The bridge side of the contract (U1) answers hello before the
+    shared-store bind resolves; these tests pin the Python side against
+    the pinned response shapes — the Node sidecar is never spawned."""
+
+    def test_bind_contention_renders_honest_warn_verdict(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        report = {
+            "database_health": (
+                "skipped:bind-contention bind pending after 68000ms "
+                "(budget 68000ms)"
+            ),
+            "scan_mode": "bind-pending",
+            "bind_state": "pending",
+            "bind_waited_ms": 68000,
+        }
+        rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, report)
+        out = capsys.readouterr().out
+        # maestro contract: rc==0 and "FAIL 0" in stdout
+        assert rc == 0
+        assert "FAIL 0" in out
+        # exactly one WARN row names the contention with its numbers
+        assert out.count("bind-contention") == 1
+        assert "68000ms" in out
+        assert "PRAGMA quick_check" in out
+        # honesty (U16c discipline): the row must NOT claim the store
+        # opened or that probe reads succeeded — the bind never landed
+        warn_line = next(
+            line for line in out.splitlines() if "bind-contention" in line
+        )
+        assert "the store opened" not in warn_line
+        assert "probe reads succeeded" not in warn_line
+        assert "bind never landed" in warn_line
+        # the quick_check PASS wording is reserved for real scans
+        assert "quick_check ok" not in out
+
+    def test_doctor_call_carries_bounded_bind_wait_and_defer_env(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        ctor_kwargs: list[dict] = []
+        _, params = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, ctor_sink=ctor_kwargs
+        )
+        capsys.readouterr()
+        # the sidecar is spawned in deferred-bind mode
+        assert ctor_kwargs, "the doctor must construct a RuntimeClient"
+        assert all(
+            kw.get("extra_env") == {"MAGIC_HERMES_DEFER_BIND": "1"}
+            for kw in ctor_kwargs
+        )
+        # the bounded wait rides the doctor call params: positive, and
+        # derived from the wall budget minus the margin (75 - 0.25 - 2)
+        assert params is not None
+        bind_wait_s = params["bind_wait_s"]
+        assert isinstance(bind_wait_s, float)
+        assert 0.0 < bind_wait_s <= 75.0 - 0.25
+        assert bind_wait_s <= 75.0 - 0.25 - 2.0 + 5.0  # elapsed allowance
+
+    def test_bound_state_renders_in_handshake_row_and_json(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        report = {"bind_state": "bound", "scan_mode": "quick_check"}
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            report,
+            hello_report={"bind_state": "bound"},
+            json_output=True,
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        # additive fields ride the JSON payload when present
+        assert payload["bind_state"] == "bound"
+        assert payload["scan_mode"] == "quick_check"
+        # the handshake PASS row names the bind state
+        handshake = next(
+            c for c in payload["checks"] if "handshake ok" in c["message"]
+        )
+        assert handshake["status"] == "PASS"
+        assert "bind=bound" in handshake["message"]
+
+    def test_pending_handshake_without_bind_state_keeps_row_shape(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # an old sidecar reports no bind_state: the handshake row keeps
+        # today's wording byte-for-byte (additive-absence)
+        rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, {})
+        out = capsys.readouterr().out
+        assert rc == 0
+        handshake = next(
+            line for line in out.splitlines() if "handshake ok" in line
+        )
+        assert "bind=" not in handshake
+
+    def test_json_carries_bind_waited_ms_additively(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        report = {
+            "database_health": (
+                "skipped:bind-contention bind pending after 73000ms "
+                "(budget 73000ms)"
+            ),
+            "scan_mode": "bind-pending",
+            "bind_state": "pending",
+            "bind_waited_ms": 73000,
+        }
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, report, json_output=True
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["bind_state"] == "pending"
+        assert payload["bind_waited_ms"] == 73000
+        assert payload["scan_mode"] == "bind-pending"
+        assert payload["summary"]["fail"] == 0
+
+    def test_fence_after_hello_renders_typed_lane_skew_once(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # the deferred-bind fence channel: hello answers (healthy — no
+        # more waiting on the bind), then the rethrown module-load-path
+        # refusal arrives as the doctor RPC's error. The fence sentence
+        # must type it exactly like the hello-channel fence (R3).
+        fence = RuntimeError(
+            "doctor: Magic Context refused to open its shared context "
+            "database. Reason (from /tmp/magic-context.log): "
+            "[magic-context] storage fatal: refusing to open context.db; "
+            "upstream migration lane v95 is newer than this binary "
+            "supports (max v94). A pinned or stale plugin is likely "
+            "sharing this database with a newer instance"
+        )
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, doctor_error=fence
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert out.count("shared-store lane skew") == 1
+        assert "lane v95" in out
+        assert "max v94" in out
+        summary_line = next(line for line in out.splitlines() if "Summary:" in line)
+        assert "FAIL 1" in summary_line
+
+    def test_non_fence_bind_error_renders_single_generic_fail(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # a bind failure that is neither a fence sentence nor transient
+        # (structural) rethrows through the same RPC error channel and
+        # renders today's generic sidecar-failure family — exactly one
+        # FAIL row, rc 1, wording unchanged.
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            doctor_error=RuntimeError(
+                "doctor: Magic Context refused to open its shared context "
+                "database. Reason (from /tmp/magic-context.log): "
+                "storage fatal: disk I/O error reading the store header"
+            ),
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert out.count("Magic Context sidecar failed") >= 1
+        fail_lines = [line for line in out.splitlines() if "FAIL" in line]
+        assert all("lane skew" not in line for line in fail_lines)
+        summary_line = next(line for line in out.splitlines() if "Summary:" in line)
+        assert "FAIL 1" in summary_line
+        assert "FAIL 0" not in out
+
+
+DRIFTED_CONFIG = (
+    "# hermes config (host-managed)\n"
+    "language: en\n"
+    "context:\n"
+    "  engine: compressor\n"
+    "memory:\n"
+    "  provider: null\n"
+    "plugins:\n"
+    "  enabled:\n"
+    "    - magic-hermes\n"
+)
+
+
+def _write_drifted_config():
+    config = Path(cli.hermes_config_path())
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(DRIFTED_CONFIG, encoding="utf-8")
+    return config
+
+
+def _write_foreign_engine_config():
+    config = Path(cli.hermes_config_path())
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "context:\n"
+        "  engine: sqlite-vec\n"
+        "memory:\n"
+        "  provider: null\n"
+        "plugins:\n"
+        "  enabled:\n"
+        "    - magic-hermes\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+def _write_pluginless_config():
+    config = Path(cli.hermes_config_path())
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "context:\n"
+        "  engine: magic-context\n"
+        "memory:\n"
+        "  provider: magic_context\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+def _seed_lease(isolated_home):
+    from magic_hermes import wiring
+
+    wiring.write_lease(now=100.0)
+
+
+class TestLeaseAwareWiringRows:
+    """U6 (plan 2026-10-31, Mode 2) — the unwired-config FAIL rows name
+    lease/convergence state truthfully. Every variant keeps status FAIL
+    and rc 1 (W4/R3): the doctor reports wiring, never claims activation."""
+
+    def _wiring_rows(self, out):
+        return [
+            line for line in out.splitlines() if "Hermes config missing wiring" in line
+        ]
+
+    def test_lease_plus_repairable_names_convergence_pending(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _seed_lease(isolated_home)
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            config_writer=_write_drifted_config,
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        rows = self._wiring_rows(out)
+        assert len(rows) == 1
+        row = rows[0]
+        assert "FAIL" in row
+        assert "context.engine=magic-context" in row  # the missing labels stay
+        assert "wiring lease active at" in row
+        lease_path = str(
+            isolated_home / ".local" / "share" / "magic-hermes" / "wiring-lease.json"
+        )
+        assert lease_path in row
+        assert "convergence pending" in row
+        assert "magic-hermes install" in row
+
+    def test_lease_plus_deliberate_names_the_override(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _seed_lease(isolated_home)
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            config_writer=_write_foreign_engine_config,
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        rows = self._wiring_rows(out)
+        assert len(rows) == 1
+        row = rows[0]
+        assert "sqlite-vec" in row
+        assert "deliberate" in row
+        assert "wiring lease active at" in row
+        # the opt-out is named
+        assert "delete the lease" in row
+
+    def test_lease_present_but_plugin_lost_names_enablement_gap(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _seed_lease(isolated_home)
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            config_writer=_write_pluginless_config,
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        rows = self._wiring_rows(out)
+        assert len(rows) == 1
+        row = rows[0]
+        assert "plugins.enabled" in row  # missing-label for the plugin itself
+        assert "lost magic-hermes" in row
+        assert "cannot restore its own enablement" in row
+        # no self-repair hint: convergence cannot fix this shape
+        assert "convergence pending" not in row
+
+    def test_no_lease_keeps_todays_message(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            config_writer=_write_drifted_config,
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        rows = self._wiring_rows(out)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.endswith("— run `magic-hermes install`")
+        assert "lease" not in row
+        assert "convergence" not in row
+
+    def test_wired_config_stays_pass_regardless_of_lease(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _seed_lease(isolated_home)
+        rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, {})
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Hermes config wired at" in out
+        assert "Hermes config missing wiring" not in out
+
+    def test_text_scan_fallback_renders_lease_aware_variant(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _seed_lease(isolated_home)
+        with mock.patch.dict(
+            "sys.modules", {"ruamel.yaml": None, "yaml": None}
+        ):
+            rc, _ = _run_doctor(
+                tmp_path,
+                monkeypatch,
+                isolated_home,
+                {},
+                config_writer=_write_drifted_config,
+            )
+        out = capsys.readouterr().out
+        assert rc == 1
+        rows = self._wiring_rows(out)
+        assert len(rows) == 1
+        row = rows[0]
+        # lease-aware but honest: without a YAML parser the doctor cannot
+        # classify the drift, so it must not claim convergence is pending
+        assert "wiring lease active at" in row
+        assert "magic-hermes install" in row
+        assert "convergence pending" not in row
 
 
 _OBSERVER_DRIVER = r'''
