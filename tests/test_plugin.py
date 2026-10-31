@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import sys
-import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -357,23 +355,17 @@ def _drifted_hermes_config(home: Path) -> Path:
 
 
 def _write_wiring_lease(home: Path) -> Path:
-    """Write the operator-intent lease per the plan's pinned schema."""
-    lease = home / ".local" / "share" / "magic-hermes" / "wiring-lease.json"
-    lease.parent.mkdir(parents=True, exist_ok=True)
-    now = time.time()
-    lease.write_text(
-        json.dumps(
-            {
-                "schema": 1,
-                "plugin": "magic-hermes",
-                "wires": ["context.engine", "memory.provider"],
-                "created_at": now,
-                "updated_at": now,
-            }
-        ),
-        encoding="utf-8",
-    )
-    return lease
+    """Write the operator-intent lease per the plan's pinned schema.
+
+    Routed through the real writer so the lease lands at the XDG-resolved
+    ``lease_path()`` the convergence reads. The isolated home overrides
+    XDG_DATA_HOME to a non-default layout, and a hand-rolled default-layout
+    path silently misses it — the targeted join run caught exactly that
+    (2026-10-31: three requires_wiring tests failed green-lane code).
+    """
+    from magic_hermes import wiring
+
+    return wiring.write_lease()
 
 
 def _isolated_home(monkeypatch, tmp_path):
