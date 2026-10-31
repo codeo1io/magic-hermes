@@ -51,9 +51,10 @@ from .runtime import (
 )
 from .wiring import (
     PLUGIN_NAME,
-    _load_yaml,
     configure_hermes,
     hermes_config_path,
+    lease_path,
+    load_yaml,
     managed_npm_root,
     write_lease,
 )
@@ -831,8 +832,18 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                         "doctor",
                         {
                             "full_integrity": full_integrity,
+                            # The bind wait derives from the SAME cap as
+                            # the call timeout below (min(300.0,
+                            # doctor_budget)): at raised wall budgets
+                            # (>302 s — the degraded-scan WARN row's own
+                            # remedy) the sidecar's degraded response must
+                            # still precede the Python timeout, or the
+                            # honest skipped:bind-contention WARN inverts
+                            # into a "Runtime timed out" FAIL (d-m1cli).
                             "bind_wait_s": max(
-                                0.0, doctor_budget - _DOCTOR_BIND_WAIT_MARGIN_S
+                                0.0,
+                                min(300.0, doctor_budget)
+                                - _DOCTOR_BIND_WAIT_MARGIN_S,
                             ),
                         },
                         timeout=min(300.0, doctor_budget),
@@ -995,6 +1006,7 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                 "probe_ms",
                 "bind_state",
                 "bind_waited_ms",
+                "bind_budget_ms",
             ):
                 if key in bridge:
                     payload[key] = bridge[key]
@@ -1326,7 +1338,7 @@ def parse_hermes_config(path: Path) -> dict[str, Any] | None:
     """
 
     try:
-        document, _ = _load_yaml(path)
+        document, _ = load_yaml(path)
     except ImportError:
         return None
     return document if isinstance(document, dict) else None
@@ -1413,8 +1425,26 @@ def run_install(
         # U6 (plan 2026-10-31, Mode 2): record operator intent as the
         # wiring lease — the write authorization convergence runs under.
         # --skip-config never reaches this block, so it arms nothing.
-        lease = write_lease()
-        print(f"│  wiring lease recorded: {lease}")
+        # An unrecordable lease (read-only data root, a concurrent
+        # install racing the tmp name) must not abort install mid-flow
+        # (d-cor3): the config is already wired and announced, so the
+        # flow continues with a warning — convergence simply stays inert
+        # until a later install records the lease.
+        try:
+            lease = write_lease()
+        except OSError as exc:
+            print(
+                f"│  WARNING: wiring lease could not be recorded at "
+                f"{lease_path()}: {exc}",
+                file=sys.stderr,
+            )
+            print(
+                "│  convergence stays inert until a later install records "
+                "the lease",
+                file=sys.stderr,
+            )
+        else:
+            print(f"│  wiring lease recorded: {lease}")
 
     # End-to-end verification: the sidecar must boot and open the shared DB.
     try:
@@ -1443,7 +1473,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     install = sub.add_parser(
-        "install", help="install/update Magic Context and wire Hermes config"
+        "install",
+        help="install/update Magic Context, wire Hermes config, and record "
+        "the wiring-intent lease (delete "
+        "~/.local/share/magic-hermes/wiring-lease.json to opt out of "
+        "convergence)",
     )
     install.add_argument("--version", help="upstream version to install")
     install.add_argument(
@@ -1455,7 +1489,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="show the plan without changing anything"
     )
     install.add_argument(
-        "--skip-config", action="store_true", help="leave Hermes config untouched"
+        "--skip-config",
+        action="store_true",
+        help="leave Hermes config untouched and record no wiring lease",
     )
 
     doctor = sub.add_parser("doctor", help="check installation health")

@@ -131,6 +131,12 @@ const mc = (name) => {
 //      BIND_ATTEMPTS times before failing the bind.
 // Failure stays fail-loud (throw) — a run that cannot bind degrades to MC
 // disabled, never a silent wrong-context fallback.
+//
+// MIRRORED below by acquireBindLockAsync/runDeferredBind (the doctor
+// role's deferred bind, plan U1): keep the mutex semantics, graces,
+// 90s deadline, transient-lock regex, and backoff shape in lockstep
+// with this battle-deployed variant — the plan's named mitigation for
+// sync/async drift (a future edit here must land there too).
 function openDatabaseWithLockGuard() {
   const dbPath = process.env.MAGIC_CONTEXT_DB_PATH || "";
   const opts = dbPath ? { dbPath } : {};
@@ -177,7 +183,9 @@ function openDatabaseWithLockGuard() {
 
 // Atomic mkdir mutex with a 30s mkdir-to-pid publication grace.
 // Never reclaim a lock whose holder PID is still alive.
-
+// Async mirror: acquireBindLockAsync below (250ms event-loop-yielding
+// poll, per-poll deadline re-evaluation) — keep graces, token fencing,
+// and holder-death reap identical here.
 function acquireBindLock(lockPath) {
   const deadline = Date.now() + 90000;
   for (;;) {
@@ -532,7 +540,14 @@ let deferredBindController = null;
 
 if (DEFER_BIND) {
   deferredBindController = createDeferredBindController();
-  deferredBindController.start();
+  // Yield one macrotask before starting the bind (d-cor0): with the
+  // mutex free, runDeferredBind's openDatabase is synchronous and
+  // would otherwise resume off the acquire microtask — ahead of any
+  // stdin "line" macrotask — making a buffered hello's latency equal
+  // the open duration. A hello already buffered is a poll-phase event
+  // and is served before this check-phase callback runs (R1: hello
+  // completes without waiting for the bind, mutex-free case included).
+  setImmediate(() => deferredBindController.start());
 } else {
   db = openDatabaseWithLockGuard();
   if (!db) {
@@ -3453,6 +3468,16 @@ function deferredBindDegraded(controller, startedAt, bindWaitS) {
     health += " — " + String(controller.contentionDetail).slice(0, 160);
   }
   const result = doctorResultShell(null);
+  // The degraded lane's bind_state is the pinned contract shape
+  // ("pending"), NOT the controller's live state: when the caller's
+  // race timer and the controller's tightened mutex deadline fire near
+  // simultaneously, the controller may already have recorded a
+  // contention-classified failure by the time this result is composed
+  // (observed on a slower GitHub runner 2026-10-31, CI-only). The
+  // verdict's semantics are "bind still pending under contention" —
+  // evidence about load, never a concluded bind failure (U16c honesty;
+  // the Python contract pins bind_state "pending" in this shape).
+  result.bind_state = "pending";
   result.database_health = health;
   result.scan_mode = "bind-pending";
   result.bind_waited_ms = Math.round(waitedMs);

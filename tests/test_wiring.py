@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import stat
 import sys
 from pathlib import Path
 from unittest import mock
@@ -311,7 +313,7 @@ class TestConverge:
         _drifted_config(isolated_home)
         _seed_lease(isolated_home)
 
-        def exploding_configure(config_path=None):
+        def exploding_configure(config_path=None, **kwargs):
             raise OSError("disk full")
 
         monkeypatch.setattr(wiring, "configure_hermes", exploding_configure)
@@ -319,6 +321,62 @@ class TestConverge:
 
         assert result.status == "error"
         assert "disk full" in result.detail
+
+    def test_unplugged_plugin_is_never_reenabled(self, isolated_home):
+        # d-sec0-cor1 (W2): the lease authorizes exactly WIRED_KEYS. A
+        # deliberate full unwire — factory engine/provider AND the plugin
+        # removed from plugins.enabled, lease retained — is repaired on
+        # the two leased keys only; convergence must never re-append the
+        # plugin: enablement is install's explicit operator act (W4), and
+        # a still-loaded gateway's pre_tool_call recheck must not revert
+        # a deliberate unplug.
+        config = _drifted_config(isolated_home)
+        config.write_text(
+            DRIFTED_CONFIG.replace("    - magic-hermes\n", ""),
+            encoding="utf-8",
+        )
+        _seed_lease(isolated_home)
+
+        result = wiring.converge()
+
+        assert result.status == "repaired"
+        assert result.changed == ["context.engine", "memory.provider"]
+        assert "magic-hermes" not in config.read_text(encoding="utf-8")
+
+    def test_operator_value_in_classify_to_write_window_wins(
+        self, isolated_home, monkeypatch
+    ):
+        # U4 key decision (d-cor2-adv1): the write step re-reads and
+        # reclassifies immediately before configuring. A deliberate
+        # value landing between the first classification and the write
+        # must WIN — converge returns the fresh classification as a
+        # no-op and never overwrites it.
+        config = _drifted_config(isolated_home)
+        _seed_lease(isolated_home)
+        verdicts = iter(["repairable", "deliberate"])
+        monkeypatch.setattr(
+            wiring, "classify_document", lambda doc: next(verdicts)
+        )
+        before = config.read_bytes()
+
+        result = wiring.converge()
+
+        assert result.status == "deliberate"
+        assert config.read_bytes() == before
+        assert list(config.parent.glob("config.yaml.bak.*")) == []
+
+    def test_repair_preserves_the_config_file_mode(self, isolated_home):
+        # d-cor2: the tmp+replace rewrite must carry the target's mode
+        # across (0600 stays 0600) instead of widening to the umask
+        # default — the Hermes config can carry provider credentials.
+        config = _drifted_config(isolated_home)
+        _seed_lease(isolated_home)
+        os.chmod(config, 0o600)
+
+        result = wiring.converge()
+
+        assert result.status == "repaired"
+        assert stat.S_IMODE(os.stat(config).st_mode) == 0o600
 
     def test_backup_retention_keeps_newest_ten(self, isolated_home):
         config = _drifted_config(isolated_home)
@@ -342,6 +400,39 @@ class TestConverge:
         assert 1_700_000_000 not in remaining
         assert 1_700_000_001 not in remaining
         assert 1_700_000_002 not in remaining
+        assert 1_700_000_011 in remaining
+
+    def test_prune_never_deletes_foreign_backup_siblings(self, isolated_home):
+        # d-adv2: retention owns only ``bak.<epoch>`` siblings. Operator-
+        # made files that merely match the glob (``.bak.manual``,
+        # ``.bak.pre-experiment``) sort as oldest under a float() key and
+        # were deleted FIRST — new destructive behavior on files the
+        # repo never owned. They must survive any prune.
+        config = _drifted_config(isolated_home)
+        _seed_lease(isolated_home)
+        parent = config.parent
+        foreign = [
+            parent / "config.yaml.bak.manual",
+            parent / "config.yaml.bak.pre-experiment",
+        ]
+        for path in foreign:
+            path.write_text("operator copy\n", encoding="utf-8")
+        for index in range(12):
+            backup = parent / f"config.yaml.bak.{1_700_000_000 + index}"
+            backup.write_text("old\n", encoding="utf-8")
+
+        wiring.converge()
+
+        for path in foreign:
+            assert path.is_file(), f"foreign backup deleted: {path.name}"
+            assert path.read_text(encoding="utf-8") == "operator copy\n"
+        remaining = {
+            int(p.name.rsplit(".", 1)[1])
+            for p in parent.glob("config.yaml.bak.*")
+            if p.name.rsplit(".", 1)[1].isdigit()
+        }
+        assert len(remaining) == 10
+        assert 1_700_000_000 not in remaining
         assert 1_700_000_011 in remaining
 
 
