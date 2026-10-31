@@ -349,12 +349,18 @@ class RuntimeClient:
         timeout: float = 130.0,
         callback_handler: HostCallback | None = None,
         idle_ttl_s: float = _DEFAULT_IDLE_TTL_S,
+        extra_env: dict[str, str] | None = None,
     ) -> None:
         self.package_root = Path(package_root).resolve() if package_root else None
         self.db_path = Path(db_path).resolve() if db_path else None
         self.timeout = timeout
         self.callback_handler = callback_handler
         self.idle_ttl_s = max(0.0, float(idle_ttl_s))
+        # Role-scoped spawn-environment fork (plan 2026-10-31 U2): the
+        # doctor passes {"MAGIC_HERMES_DEFER_BIND": "1"} so only its
+        # sidecar defers the shared-store bind; session traffic never
+        # sets it and keeps the fail-loud boot byte-identical (R5).
+        self.extra_env = dict(extra_env) if extra_env else None
         self._lock = threading.Lock()
         # Host callbacks may execute for minutes (Dreamer child agents).  Keep
         # stdin writes independently serialized so the main reader can accept a
@@ -412,6 +418,9 @@ class RuntimeClient:
             db_path=self.db_path,
             timeout=self.timeout,
             callback_handler=self.callback_handler,
+            # carried, not dropped: a deep-copied doctor client must not
+            # silently revert to the fail-loud session boot (U2)
+            extra_env=dict(self.extra_env) if self.extra_env else None,
         )
         memo[id(self)] = copied
         return copied
@@ -430,6 +439,8 @@ class RuntimeClient:
             environment["MAGIC_CONTEXT_PACKAGE_ROOT"] = str(self.package_root)
         if self.db_path is not None:
             environment["MAGIC_CONTEXT_DB_PATH"] = str(self.db_path)
+        if self.extra_env:
+            environment.update(self.extra_env)
 
         try:
             process = subprocess.Popen(

@@ -131,6 +131,12 @@ const mc = (name) => {
 //      BIND_ATTEMPTS times before failing the bind.
 // Failure stays fail-loud (throw) — a run that cannot bind degrades to MC
 // disabled, never a silent wrong-context fallback.
+//
+// MIRRORED below by acquireBindLockAsync/runDeferredBind (the doctor
+// role's deferred bind, plan U1): keep the mutex semantics, graces,
+// 90s deadline, transient-lock regex, and backoff shape in lockstep
+// with this battle-deployed variant — the plan's named mitigation for
+// sync/async drift (a future edit here must land there too).
 function openDatabaseWithLockGuard() {
   const dbPath = process.env.MAGIC_CONTEXT_DB_PATH || "";
   const opts = dbPath ? { dbPath } : {};
@@ -177,7 +183,9 @@ function openDatabaseWithLockGuard() {
 
 // Atomic mkdir mutex with a 30s mkdir-to-pid publication grace.
 // Never reclaim a lock whose holder PID is still alive.
-
+// Async mirror: acquireBindLockAsync below (250ms event-loop-yielding
+// poll, per-poll deadline re-evaluation) — keep graces, token fencing,
+// and holder-death reap identical here.
 function acquireBindLock(lockPath) {
   const deadline = Date.now() + 90000;
   for (;;) {
@@ -258,6 +266,20 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// Timer-based sleep for the deferred-bind role (plan 2026-10-31 unit U1):
+// yields the event loop — unlike sleepSync's Atomics.wait, which would
+// block the RPC loop even inside a background promise — and unrefs the
+// timer so a cancelled wait never holds the process open after stdin
+// closes.
+function sleepAsync(ms) {
+  return new Promise((resolveSleep) => {
+    const timer = setTimeout(resolveSleep, ms);
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+  });
+}
+
 function bindAttempts() {
   const raw = parseInt(process.env.MAGIC_CONTEXT_BIND_ATTEMPTS || "", 10);
   if (Number.isFinite(raw) && raw >= 1 && raw <= 10) {
@@ -266,12 +288,274 @@ function bindAttempts() {
   return 4;
 }
 
-const db = openDatabaseWithLockGuard();
-if (!db) {
-  throw new Error(
-    "Magic Context refused to open its shared context database. " +
-    lastFenceDiagnostic()
-  );
+// --- deferred-bind role machinery (plan unit U1; doctor sidecar only) -----
+//
+// Mode 1 of finding c7d63424: the doctor sidecar's hello was blocked by
+// the module-load shared-store bind, which legally exceeds the 60 s
+// handshake cap on the contended ~9.8 GB store — a hard FAIL despite a
+// healthy capability. With MAGIC_HERMES_DEFER_BIND=1 the sidecar serves
+// RPC before the bind resolves; hello answers immediately with a
+// bind_state; the doctor RPC awaits the bind bounded by the caller's
+// bind_wait_s (remaining doctor budget minus margin) and degrades
+// honestly to the skipped:bind-contention family on expiry or transient
+// contention. Fence/non-transient failures rethrow the module-load-path
+// error composition so the typed lane-skew FAIL lane still fires. The
+// session path (no flag) keeps the synchronous bind byte-identical (R5).
+
+// Async mirror of acquireBindLock: identical mutex semantics — atomic
+// mkdir, pid+token publication, 30 s publication / 5 s death graces,
+// never reaping a live holder, token-fenced release in releaseBindLock
+// (shared with the sync path) — but the 250 ms wait poll yields the
+// event loop, and the deadline is re-evaluated every poll so the doctor
+// call's bind_wait_s cap can tighten an in-flight wait.
+async function acquireBindLockAsync(lockPath, controller) {
+  const enteredAt = Date.now();
+  for (;;) {
+    controller._checkpoint();
+    try {
+      mkdirSync(lockPath);
+      // Write OUR pid inside the lock so waiters can break it if we die
+      // mid-open (holder-death detection), and so the stale-age breaker
+      // has a hard identity to attribute the break to. A random
+      // per-acquisition token fences a delayed release from deleting a
+      // successor's lock after an interrupted/recovered bind.
+      const token = randomUUID();
+      writeFileSync(join(lockPath, "pid"), `${process.pid} ${token}\n`);
+      return token;
+    } catch (err) {
+      if (err && err.code !== "EEXIST") {
+        throw err;
+      }
+    }
+    // A newly-created directory briefly has no pid file. Do not mistake
+    // that publication window for a dead owner and delete its live lock.
+    let holderPid = NaN;
+    let mtimeMs = 0;
+    try {
+      const holder = readFileSync(join(lockPath, "pid"), "utf8");
+      holderPid = parseInt(holder.trim(), 10);
+    } catch {}
+    try {
+      mtimeMs = statSync(lockPath).mtimeMs;
+    } catch {
+      continue; // vanished between EEXIST and stat: retry immediately
+    }
+    // process.kill(pid, 0) THROWS ESRCH for a dead pid (it does not
+    // return false) — wrap or a holder-death break crashes the binder.
+    let holderAlive = false;
+    if (Number.isFinite(holderPid)) {
+      try {
+        process.kill(holderPid, 0);
+        holderAlive = true;
+      } catch (err) {
+        holderAlive = err && err.code !== "ESRCH";
+      }
+    }
+    const ageMs = Date.now() - mtimeMs;
+    // Never reap a live holder, even if I/O pressure makes its bind slow.
+    const stale = !holderAlive && ageMs > (Number.isFinite(holderPid) ? 5000 : 30000);
+    if (stale) {
+      try {
+        rmSync(lockPath, { recursive: true, force: true });
+      } catch {}
+      continue;
+    }
+    const cap = controller._capDeadlineMs;
+    const deadline = cap !== null ? cap : enteredAt + 90000;
+    if (Date.now() >= deadline) {
+      const waitedS = Math.max(1, Math.round((Date.now() - enteredAt) / 1000));
+      const err = new Error(
+        `bind mutex acquisition timed out after ${waitedS}s (${lockPath})`
+      );
+      err.bindContention = true;
+      throw err;
+    }
+    await sleepAsync(250);
+  }
+}
+
+// Async mirror of openDatabaseWithLockGuard with the same algorithm,
+// stderr attempt lines, transient-lock regex, backoff shape, and
+// release-before-cooldown discipline (the sync path above stays the
+// battle-deployed session boot). Doctor-role differences, per plan U1:
+//   - the mutex deadline is re-evaluated per poll (acquireBindLockAsync)
+//     and the whole loop runs under controller checkpoints, so the
+//     bind derives its budget from the caller-passed bind_wait_s, never
+//     outrunning the verdict budget;
+//   - a null openDatabase return composes EXACTLY the module-load-path
+//     fence error (lastFenceDiagnostic included) so the rethrown
+//     sentence reaches the doctor RPC error channel byte-compatibly;
+//   - transient-family exhaustion is classified bindContention (the
+//     degraded lane — load, not corruption); fence and non-transient
+//     errors rethrow for the typed FAIL lanes.
+async function runDeferredBind(controller) {
+  const dbPath = process.env.MAGIC_CONTEXT_DB_PATH || "";
+  const opts = dbPath ? { dbPath } : {};
+  const attempts = bindAttempts();
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    controller._checkpoint();
+    const dataHome = process.env.XDG_DATA_HOME
+      ? resolve(process.env.XDG_DATA_HOME)
+      : join(homedir(), ".local", "share");
+    const lockPath = (dbPath || join(dataHome, "cortexkit", "magic-context", "context.db")) + ".bindlock";
+    mkdirSync(dirname(lockPath), { recursive: true });
+    const bindToken = await acquireBindLockAsync(lockPath, controller);
+    let retryDelayMs = 0;
+    try {
+      const opened = mc("openDatabase")(opts);
+      if (opened == null) {
+        // Schema-fence / migration refusal: same composition as the
+        // module-load path below (R3).
+        throw new Error(
+          "Magic Context refused to open its shared context database. " +
+          lastFenceDiagnostic()
+        );
+      }
+      db = opened;
+      controller.handle = opened;
+      controller.state = "bound";
+      controller._settle();
+      return;
+    } catch (err) {
+      if (err && (err.bindCancelled || err.bindContention)) {
+        throw err;
+      }
+      lastError = err;
+      const transient = /database is locked|SQLITE_BUSY|storage unavailable/i.test(
+        String(err && err.message ? err.message : err)
+      );
+      process.stderr.write(
+        "magic-hermes: openDatabase attempt " + attempt + "/" + attempts +
+        " failed" + (transient ? " (transient lock)" : "") + ": " +
+        String(err && err.message ? err.message : err) + "\n"
+      );
+      if (!transient) {
+        throw err;
+      }
+      if (attempt < attempts) {
+        // Record cooldown here; never sleep while holding the bind mutex.
+        retryDelayMs = Math.min(15000, 2000 * Math.pow(2, attempt - 1));
+      }
+    } finally {
+      releaseBindLock(lockPath, bindToken);
+    }
+    if (retryDelayMs) {
+      await sleepAsync(retryDelayMs);
+    }
+  }
+  // Attempts exhausted on the transient-lock family: load contention,
+  // not store corruption — the degraded lane (plan U1 classification).
+  if (lastError !== null) {
+    lastError.bindContention = true;
+    throw lastError;
+  }
+  throw new Error("deferred bind exhausted attempts without a result");
+}
+
+function createDeferredBindController() {
+  // State machine: pending -> bound (handle set, module-scope db
+  // assigned) | failed (failure stored). A cancelled controller stays
+  // pending — the sidecar is exiting and no verdict depends on it.
+  const controller = {
+    state: "pending",
+    handle: null,
+    failure: null,
+    contentionDetail: null,
+    settled: null,
+    _resolveSettled: null,
+    _capDeadlineMs: null,
+    _cancelled: false,
+  };
+  controller.settled = new Promise((resolveSettled) => {
+    controller._resolveSettled = resolveSettled;
+  });
+  controller._settle = () => {
+    controller._resolveSettled();
+  };
+  controller._checkpoint = () => {
+    if (controller._cancelled) {
+      const stopped = new Error(
+        "deferred bind cancelled (sidecar input closed)"
+      );
+      stopped.bindCancelled = true;
+      throw stopped;
+    }
+    const cap = controller._capDeadlineMs;
+    if (cap !== null && Date.now() >= cap) {
+      const expired = new Error(
+        "deferred bind budget expired before the shared-store bind resolved"
+      );
+      expired.bindContention = true;
+      throw expired;
+    }
+  };
+  controller.tightenDeadline = (deadlineMs) => {
+    if (
+      controller._capDeadlineMs === null ||
+      deadlineMs < controller._capDeadlineMs
+    ) {
+      controller._capDeadlineMs = deadlineMs;
+    }
+  };
+  controller.cancel = () => {
+    controller._cancelled = true;
+    controller._settle();
+  };
+  controller.start = () => {
+    runDeferredBind(controller).then(
+      () => {},
+      (err) => {
+        if (err && err.bindCancelled) {
+          controller._settle();
+          return;
+        }
+        controller.failure = err instanceof Error ? err : new Error(String(err));
+        controller.contentionDetail = err && err.bindContention
+          ? String((err && err.message) || err)
+          : null;
+        controller.state = "failed";
+        controller._settle();
+      }
+    );
+  };
+  return controller;
+}
+
+function currentBindState() {
+  return DEFER_BIND && deferredBindController !== null
+    ? deferredBindController.state
+    : "bound";
+}
+
+// Deferred-bind role fork (plan unit U1): the doctor's sidecar spawn
+// sets MAGIC_HERMES_DEFER_BIND=1 and serves RPC while the bind runs in
+// the background controller; every other spawn (sessions, install
+// verification) keeps the synchronous bind-before-serve boot below
+// byte-identical (R5).
+const DEFER_BIND = process.env.MAGIC_HERMES_DEFER_BIND === "1";
+
+let db = null;
+let deferredBindController = null;
+
+if (DEFER_BIND) {
+  deferredBindController = createDeferredBindController();
+  // Yield one macrotask before starting the bind (d-cor0): with the
+  // mutex free, runDeferredBind's openDatabase is synchronous and
+  // would otherwise resume off the acquire microtask — ahead of any
+  // stdin "line" macrotask — making a buffered hello's latency equal
+  // the open duration. A hello already buffered is a poll-phase event
+  // and is served before this check-phase callback runs (R1: hello
+  // completes without waiting for the bind, mutex-free case included).
+  setImmediate(() => deferredBindController.start());
+} else {
+  db = openDatabaseWithLockGuard();
+  if (!db) {
+    throw new Error(
+      "Magic Context refused to open its shared context database. " +
+      lastFenceDiagnostic()
+    );
+  }
 }
 
 function lastFenceDiagnostic() {
@@ -2953,7 +3237,32 @@ function doctorScanEstimateMs(storeBytes) {
   }
 }
 
-function runtimeDoctor(args = {}) {
+// Shared result shell for every doctor outcome (plan unit U1): the
+// static, store-independent identity fields plus the session-dependent
+// fields. runtimeDoctor fills the store evidence; the deferred-bind
+// degraded path deliberately fills NONE of it (honest absence — the
+// store never opened), per the U16c discipline.
+function doctorResultShell(session) {
+  return {
+    package_version: packageJson.version,
+    package_root: packageRoot,
+    harness: "hermes",
+    supported_series: SUPPORTED_SERIES.join("."),
+    core_symbols_ready: missingCoreSymbols.length === 0,
+    missing_core_symbols: [...missingCoreSymbols],
+    database_health: "unknown",
+    scan_mode: "full",
+    session_bound: Boolean(session),
+    project_identity: session?.projectIdentity ?? null,
+    project_root: session?.projectRoot ?? null,
+    compaction_enabled: session ? Boolean(session.config.compaction?.enabled) : null,
+    config_loaded_from: session ? [...(session.configLoadedFrom || [])] : [],
+    config_warnings: session ? [...(session.configWarnings || [])] : [],
+    bind_state: currentBindState()
+  };
+}
+
+function runtimeDoctor(args = {}, scanDeadlineCapS = undefined) {
   const sessionId = String(args.session_id || "");
   const session = sessionId ? sessions.get(sessionId) : null;
   const fullIntegrity = args.full_integrity === true;
@@ -2973,10 +3282,16 @@ function runtimeDoctor(args = {}) {
   // Scan deadline slice (U14, R4): the projected quick_check must fit
   // inside this many seconds or the scan is never started. Parsed with
   // the same invalid-falls-back-to-default rule as the merged knobs.
-  const scanDeadlineS = doctorScanGateFromEnv(
+  let scanDeadlineS = doctorScanGateFromEnv(
     "MAGIC_CONTEXT_DOCTOR_SCAN_DEADLINE_S",
     45
   );
+  if (typeof scanDeadlineCapS === "number" && Number.isFinite(scanDeadlineCapS)) {
+    // Late-bind clamp (plan unit U1, R4): a scan that starts after a bind
+    // consumed most of the doctor's budget must not overrun the wall —
+    // clamp the effective deadline to the remaining budget.
+    scanDeadlineS = Math.min(scanDeadlineS, Math.max(0, scanDeadlineCapS));
+  }
   let databaseHealth = "unknown";
   let scanMode = "full";
   let storeBytes = null;
@@ -3074,22 +3389,9 @@ function runtimeDoctor(args = {}) {
   } catch (error) {
     databaseHealth = "error:" + (error instanceof Error ? error.message : String(error));
   }
-  const result = {
-    package_version: packageJson.version,
-    package_root: packageRoot,
-    harness: "hermes",
-    supported_series: SUPPORTED_SERIES.join("."),
-    core_symbols_ready: missingCoreSymbols.length === 0,
-    missing_core_symbols: [...missingCoreSymbols],
-    database_health: databaseHealth,
-    scan_mode: scanMode,
-    session_bound: Boolean(session),
-    project_identity: session?.projectIdentity ?? null,
-    project_root: session?.projectRoot ?? null,
-    compaction_enabled: session ? Boolean(session.config.compaction?.enabled) : null,
-    config_loaded_from: session ? [...(session.configLoadedFrom || [])] : [],
-    config_warnings: session ? [...(session.configWarnings || [])] : []
-  };
+  const result = doctorResultShell(session);
+  result.database_health = databaseHealth;
+  result.scan_mode = scanMode;
   if (storeBytes !== null) {
     result.store_bytes = storeBytes;
   }
@@ -3145,13 +3447,105 @@ function resolveHostCallback(message) {
   }
 }
 
+// Deferred-bind degraded result (plan unit U1, R2): the bind did not
+// resolve within the doctor's remaining budget (or failed on the
+// transient-lock family). Store evidence is honestly absent — no
+// store_bytes, no probe_ms: the store never opened — and the health
+// string quotes the waited/budget numbers for the WARN row.
+function deferredBindDegraded(controller, startedAt, bindWaitS) {
+  const waitedMs = Math.max(0, Date.now() - startedAt);
+  const budgetMs =
+    typeof bindWaitS === "number" && Number.isFinite(bindWaitS)
+      ? Math.max(0, Math.round(bindWaitS * 1000))
+      : null;
+  let health =
+    "skipped:bind-contention bind pending after " +
+    Math.round(waitedMs) +
+    "ms (budget " +
+    (budgetMs === null ? "unbounded" : String(budgetMs) + "ms") +
+    ")";
+  if (controller.contentionDetail) {
+    health += " — " + String(controller.contentionDetail).slice(0, 160);
+  }
+  const result = doctorResultShell(null);
+  // The degraded lane's bind_state is the pinned contract shape
+  // ("pending"), NOT the controller's live state: when the caller's
+  // race timer and the controller's tightened mutex deadline fire near
+  // simultaneously, the controller may already have recorded a
+  // contention-classified failure by the time this result is composed
+  // (observed on a slower GitHub runner 2026-10-31, CI-only). The
+  // verdict's semantics are "bind still pending under contention" —
+  // evidence about load, never a concluded bind failure (U16c honesty;
+  // the Python contract pins bind_state "pending" in this shape).
+  result.bind_state = "pending";
+  result.database_health = health;
+  result.scan_mode = "bind-pending";
+  result.bind_waited_ms = Math.round(waitedMs);
+  if (budgetMs !== null) {
+    result.bind_budget_ms = budgetMs;
+  }
+  return result;
+}
+
+// Doctor RPC dispatcher (plan unit U1): in session mode identical to
+// runtimeDoctor; in the deferred-bind role it bounds the bind wait by
+// the caller-passed bind_wait_s (absent => await indefinitely,
+// preserving legacy semantics for any other caller), clamps the scan
+// deadline to the remaining budget on late binds, classifies transient
+// contention into the degraded lane, and rethrows fence/non-transient
+// failures for the typed FAIL lanes (R3).
+async function doctorDispatch(args) {
+  if (!DEFER_BIND || deferredBindController === null) {
+    return runtimeDoctor(args);
+  }
+  const controller = deferredBindController;
+  const bindWaitS = args.bind_wait_s;
+  const hasBindWait =
+    typeof bindWaitS === "number" && Number.isFinite(bindWaitS) && bindWaitS >= 0;
+  const startedAt = Date.now();
+  if (hasBindWait) {
+    // First belt: the bind's own deadlines derive from the caller's
+    // budget, so the bind can never outrun the verdict budget; the
+    // response race below is the second belt.
+    controller.tightenDeadline(startedAt + Math.round(bindWaitS * 1000));
+  }
+  if (controller.state === "pending") {
+    if (hasBindWait) {
+      await Promise.race([
+        controller.settled,
+        sleepAsync(Math.max(0, Math.round(bindWaitS * 1000)))
+      ]);
+    } else {
+      await controller.settled;
+    }
+  }
+  if (controller.state === "bound") {
+    let scanDeadlineCapS;
+    if (hasBindWait) {
+      const remainingMs = Math.round(bindWaitS * 1000) - (Date.now() - startedAt);
+      scanDeadlineCapS = Math.max(0, remainingMs / 1000);
+    }
+    return runtimeDoctor(args, scanDeadlineCapS);
+  }
+  if (controller.state === "failed") {
+    if (controller.failure && controller.failure.bindContention) {
+      return deferredBindDegraded(controller, startedAt, hasBindWait ? bindWaitS : null);
+    }
+    throw controller.failure;
+  }
+  // Still pending: the bounded wait expired, or the controller was
+  // cancelled as the sidecar exits — degraded lane, never a FAIL.
+  return deferredBindDegraded(controller, startedAt, hasBindWait ? bindWaitS : null);
+}
+
 const methods = {
   hello: async () => ({
     package_root: packageRoot,
     package_version: packageJson.version,
-    harness: "hermes"
+    harness: "hermes",
+    bind_state: currentBindState()
   }),
-  doctor: async (args) => runtimeDoctor(args),
+  doctor: async (args) => doctorDispatch(args),
   dreamer_tool_schemas: async () => dreamerToolSchemas(),
   bind,
   model_update: async (args) => updateModel(args),
@@ -3170,6 +3564,11 @@ const methods = {
   dreamer_run_due: async (args) => dreamerRunDue(args),
   dreamer_run_manual: async (args) => dreamerRunManual(args),
   close: async () => {
+    if (db === null) {
+      // Deferred-bind role with the bind unresolved: nothing is open —
+      // a clean no-op so the doctor teardown path stays simple.
+      return { closed: true };
+    }
     mc("closeQuietly")(db);
     return { closed: true };
   }
@@ -3180,6 +3579,19 @@ let requestChain = Promise.resolve();
 
 async function handleTopLevelRequest(request) {
   try {
+    if (
+      DEFER_BIND &&
+      db === null &&
+      request.method !== "hello" &&
+      request.method !== "doctor" &&
+      request.method !== "close"
+    ) {
+      throw new Error(
+        "Method '" + String(request.method || "") + "' is not available " +
+        "in the deferred-bind sidecar role before the shared-store bind " +
+        "resolves"
+      );
+    }
     const method = methods[request.method];
     if (!method) {
       throw new Error("Unknown runtime method: " + String(request.method || ""));
@@ -3220,7 +3632,17 @@ lines.on("line", (line) => {
   requestChain = requestChain.then(() => handleTopLevelRequest(message));
 });
 
-await new Promise((resolveClose) => lines.on("close", resolveClose));
+await new Promise((resolveClose) => {
+  lines.on("close", () => {
+    // Close-path cancellation (plan unit U1): a doctor sidecar whose
+    // bind is still pending must exit at its next checkpoint, not
+    // linger on the 90 s mutex deadline after the verdict rendered.
+    if (deferredBindController !== null) {
+      deferredBindController.cancel();
+    }
+    resolveClose();
+  });
+});
 await requestChain;
 for (const pending of pendingHostCallbacks.values()) {
   pending.reject(new Error("Runtime input closed during host callback"));
