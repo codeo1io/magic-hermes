@@ -3570,8 +3570,50 @@ def test_doctor_role_transient_busy_degrades_not_fails(tmp_path, monkeypatch):
         holder.close()
     assert doctor["database_health"].startswith("skipped:bind-contention")
     assert doctor["scan_mode"] == "bind-pending"
-    assert doctor["bind_state"] in {"pending", "failed"}
+    # deferredBindDegraded is the sole composer of the degraded shape and
+    # always pins bind_state "pending" (U16c) — a "failed" here would mean
+    # the live controller state leaked back into the verdict (d-t2)
+    assert doctor["bind_state"] == "pending"
     assert "store_bytes" not in doctor
+
+
+def test_doctor_role_close_stray_and_unbounded_wait_guards(tmp_path, monkeypatch):
+    # U1 guard branches (review d-testing#1): while the bind is pending
+    # behind the mutex, `close` is a clean no-op (nothing is open), a
+    # db-dependent method is refused with the deferred-role sentence,
+    # and a doctor call WITHOUT bind_wait_s keeps the legacy unbounded
+    # wait (await controller.settled) and completes once the lock is
+    # released mid-call.
+    db_path = tmp_path / "defer-guards.db"
+    lock_path = _hold_bind_lock(db_path)
+    monkeypatch.setenv("MAGIC_HERMES_DEFER_BIND", "1")
+    with RuntimeClient(db_path=db_path, timeout=60) as client:
+        hello = client.call("hello", timeout=10)
+        assert hello["bind_state"] == "pending"
+
+        closed = client.call("close", timeout=10)
+        assert closed == {"closed": True}
+
+        with pytest.raises(
+            RuntimeProtocolError,
+            match="not available in the deferred-bind sidecar role",
+        ):
+            client.call("pressure_state", {}, timeout=10)
+
+        # release the mutex WHILE the unbounded doctor call is in flight:
+        # the call must have entered `await controller.settled` pending,
+        # then complete through the real bind once the lock frees
+        def _release_later():
+            time.sleep(1.0)
+            shutil.rmtree(lock_path, ignore_errors=True)
+
+        releaser = threading.Thread(target=_release_later)
+        releaser.start()
+        doctor = client.call("doctor", {"full_integrity": False}, timeout=60)
+        releaser.join()
+
+    assert doctor["bind_state"] == "bound"
+    assert doctor["database_health"] == "ok"
 
 
 def test_doctor_role_stdin_close_exits_promptly_while_pending(tmp_path):

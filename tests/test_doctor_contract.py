@@ -526,6 +526,26 @@ class TestDeferredBindContract:
         assert 0.0 < bind_wait_s <= 75.0 - 0.25
         assert bind_wait_s <= 75.0 - 0.25 - 2.0 + 5.0  # elapsed allowance
 
+    def test_raised_wall_budget_keeps_bind_wait_under_rpc_timeout(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # d-m1cli (P1): the degraded-scan WARN row's own remedy raises
+        # MAGIC_CONTEXT_DOCTOR_WALL_BUDGET_S past ~302 s and re-runs
+        # --full-integrity. The bind wait must derive from the SAME
+        # min(300, budget) cap as the doctor RPC timeout, so the
+        # sidecar's degraded response always precedes the Python
+        # timeout — never inverting the honest WARN into a "Runtime
+        # timed out after 300.0s" FAIL on the remedy path.
+        monkeypatch.setenv(cli._DOCTOR_WALL_BUDGET_ENV, "400")
+        _, params = _run_doctor(tmp_path, monkeypatch, isolated_home, {})
+        capsys.readouterr()
+        assert params is not None
+        bind_wait_s = params["bind_wait_s"]
+        assert isinstance(bind_wait_s, float)
+        # min(300.0, ~399.75) - 2.0: the degraded answer lands at the
+        # bind wait, strictly before the 300 s client timeout fires
+        assert 0.0 < bind_wait_s <= 300.0 - cli._DOCTOR_BIND_WAIT_MARGIN_S
+
     def test_bound_state_renders_in_handshake_row_and_json(
         self, tmp_path, monkeypatch, isolated_home, capsys
     ):
@@ -574,6 +594,7 @@ class TestDeferredBindContract:
             "scan_mode": "bind-pending",
             "bind_state": "pending",
             "bind_waited_ms": 73000,
+            "bind_budget_ms": 73000,
         }
         rc, _ = _run_doctor(
             tmp_path, monkeypatch, isolated_home, report, json_output=True
@@ -582,6 +603,7 @@ class TestDeferredBindContract:
         assert rc == 0
         assert payload["bind_state"] == "pending"
         assert payload["bind_waited_ms"] == 73000
+        assert payload["bind_budget_ms"] == 73000
         assert payload["scan_mode"] == "bind-pending"
         assert payload["summary"]["fail"] == 0
 

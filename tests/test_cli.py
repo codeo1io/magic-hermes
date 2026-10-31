@@ -262,6 +262,26 @@ class TestInstallLease:
         assert rc == 0
         assert not self._lease(isolated_home).exists()
 
+    def test_unrecordable_lease_warns_but_completes(self, isolated_home, capsys):
+        # d-cor3: an OSError from write_lease (read-only data root, a
+        # concurrent install racing the tmp name) must not abort install
+        # mid-flow with a raw traceback — the config is already wired and
+        # announced, so the flow continues with an actionable warning and
+        # convergence stays inert until a later install records the lease.
+        with mock.patch.object(
+            cli, "write_lease", side_effect=OSError(13, "Permission denied")
+        ):
+            rc = self._run_install(isolated_home)
+        captured = capsys.readouterr()
+
+        assert rc == 0
+        assert "wiring lease recorded" not in captured.out
+        assert "could not be recorded" in captured.err
+        assert "convergence stays inert" in captured.err
+        assert str(self._lease(isolated_home)) in captured.err
+        # the install still verified the sidecar and completed
+        assert "install complete" in captured.out
+
     def test_dry_run_writes_no_lease(self, isolated_home, capsys):
         tested = cli.tested_magic_context_version()
         with mock.patch.object(cli, "npm_latest_version", return_value=None):

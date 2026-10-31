@@ -24,9 +24,13 @@ module repairs exactly that defect class, and nothing else:
   fail to load because of convergence (the
   ``_register_dreamer_tools`` containment precedent).
 - **Idempotent, atomic, comment-preserving writes** through the
-  ``configure_hermes`` machinery moved here from ``cli.py`` (behaviour
-  unchanged; ``cli`` re-exports so every existing import keeps working),
-  with timestamped backups pruned to the newest ten.
+  ``configure_hermes`` machinery moved here from ``cli.py`` (``cli``
+  re-exports so every existing import keeps working), with timestamped
+  backups pruned to the newest ten. Convergence invokes it scoped to
+  exactly ``WIRED_KEYS`` — the lease's declared wires — so a background
+  recheck never re-appends the plugin to ``plugins.enabled`` (W2:
+  ``install`` wires everything; convergence repairs only what the lease
+  authorizes).
 - **Rate-limited recheck.** The pure ``should_recheck`` decision plus
   lock-guarded module state; the interval comes from
   ``MAGIC_HERMES_WIRING_RECHECK_S`` (default 900 s, clamped to
@@ -48,6 +52,7 @@ import os
 import shutil
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -55,7 +60,6 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 PLUGIN_NAME = "magic-hermes"
-HERMES_CONFIG_RELPATH = Path(".hermes") / "config.yaml"
 
 # The wiring lease: the operator-intent record written by
 # `magic-hermes install` (plan W2). `--skip-config` writes no lease.
@@ -125,8 +129,21 @@ def managed_npm_root() -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _load_yaml(path: Path) -> tuple[Any, Any]:
-    """Return (document, saver). Prefers ruamel.yaml for comment retention."""
+def load_yaml(path: Path) -> tuple[Any, Any]:
+    """Return (document, saver). Prefers ruamel.yaml for comment retention.
+
+    The saver preserves the target's existing file mode across the
+    tmp+replace rewrite (a fresh target gets 0600) — the Hermes config
+    can carry provider credentials and must not widen to the umask
+    default just because convergence rewrote it.
+    """
+
+    def copy_mode(tmp: Path, target: Path) -> None:
+        try:
+            mode = os.stat(target).st_mode & 0o777
+        except OSError:
+            mode = 0o600
+        os.chmod(tmp, mode)
 
     try:
         from ruamel.yaml import YAML  # type: ignore[import-not-found]
@@ -140,6 +157,7 @@ def _load_yaml(path: Path) -> tuple[Any, Any]:
             tmp = target.with_suffix(target.suffix + ".tmp")
             with tmp.open("w", encoding="utf-8") as handle:
                 yaml.dump(doc, handle)
+            copy_mode(tmp, target)
             tmp.replace(target)
 
         return document, saver
@@ -153,20 +171,40 @@ def _load_yaml(path: Path) -> tuple[Any, Any]:
             tmp = target.with_suffix(target.suffix + ".tmp")
             with tmp.open("w", encoding="utf-8") as handle:
                 yaml.safe_dump(doc, handle, sort_keys=False)
+            copy_mode(tmp, target)
             tmp.replace(target)
 
         return document, saver
 
 
-def configure_hermes(config_path: Path | None = None) -> list[str]:
-    """Point Hermes at the plugin. Idempotent; returns the changed keys."""
+# Back-compat alias for the private name this helper carried when it
+# lived in cli.py (the rename made it a public cross-module API).
+_load_yaml = load_yaml
+
+
+_ALL_REPAIR_KEYS = ("context.engine", "memory.provider", "plugins.enabled")
+
+
+def configure_hermes(
+    config_path: Path | None = None, *, keys: Iterable[str] | None = None
+) -> list[str]:
+    """Point Hermes at the plugin. Idempotent; returns the changed keys.
+
+    ``keys`` restricts the repair to a subset of the three wiring keys
+    (d-sec0-cor1): convergence passes exactly ``WIRED_KEYS`` — the
+    lease's declared wires — so a deliberately unplugged plugin is never
+    re-appended to ``plugins.enabled`` by a background recheck;
+    ``install`` keeps the default (all three) because it is the explicit
+    operator wiring act.
+    """
 
     path = config_path or hermes_config_path()
     if not path.is_file():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
+        os.chmod(path, 0o600)
     try:
-        document, saver = _load_yaml(path)
+        document, saver = load_yaml(path)
     except ImportError:
         raise SystemExit(
             "configuring Hermes requires a YAML library (ruamel.yaml keeps "
@@ -178,31 +216,35 @@ def configure_hermes(config_path: Path | None = None) -> list[str]:
     if not isinstance(document, dict):
         document = {}
 
+    wanted = frozenset(_ALL_REPAIR_KEYS if keys is None else keys)
     changed: list[str] = []
 
-    context = document.setdefault("context", {})
-    if not isinstance(context, dict):
-        context = document["context"] = {}
-    if context.get("engine") != "magic-context":
-        context["engine"] = "magic-context"
-        changed.append("context.engine")
+    if "context.engine" in wanted:
+        context = document.setdefault("context", {})
+        if not isinstance(context, dict):
+            context = document["context"] = {}
+        if context.get("engine") != WIRED_ENGINE:
+            context["engine"] = WIRED_ENGINE
+            changed.append("context.engine")
 
-    memory = document.setdefault("memory", {})
-    if not isinstance(memory, dict):
-        memory = document["memory"] = {}
-    if memory.get("provider") != "magic_context":
-        memory["provider"] = "magic_context"
-        changed.append("memory.provider")
+    if "memory.provider" in wanted:
+        memory = document.setdefault("memory", {})
+        if not isinstance(memory, dict):
+            memory = document["memory"] = {}
+        if memory.get("provider") != WIRED_PROVIDER:
+            memory["provider"] = WIRED_PROVIDER
+            changed.append("memory.provider")
 
-    plugins = document.setdefault("plugins", {})
-    if not isinstance(plugins, dict):
-        plugins = document["plugins"] = {}
-    enabled = plugins.setdefault("enabled", [])
-    if not isinstance(enabled, list):
-        enabled = plugins["enabled"] = []
-    if PLUGIN_NAME not in enabled:
-        enabled.append(PLUGIN_NAME)
-        changed.append("plugins.enabled")
+    if "plugins.enabled" in wanted:
+        plugins = document.setdefault("plugins", {})
+        if not isinstance(plugins, dict):
+            plugins = document["plugins"] = {}
+        enabled = plugins.setdefault("enabled", [])
+        if not isinstance(enabled, list):
+            enabled = plugins["enabled"] = []
+        if PLUGIN_NAME not in enabled:
+            enabled.append(PLUGIN_NAME)
+            changed.append("plugins.enabled")
 
     if changed:
         backup = path.with_name(path.name + f".bak.{int(time.time())}")
@@ -266,6 +308,11 @@ def write_lease(now: float | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = 0o600
+    os.chmod(tmp, mode)
     tmp.replace(path)
     return path
 
@@ -327,22 +374,28 @@ class ConvergeResult:
 
 
 def _prune_backups(config_path: Path, keep: int = BACKUP_KEEP) -> None:
-    """Keep the newest ``keep`` ``config.yaml.bak.<epoch>`` siblings."""
+    """Keep the newest ``keep`` ``config.yaml.bak.<epoch>`` siblings.
 
-    def stamp(backup: Path) -> float:
+    Only siblings whose suffix parses as a numeric epoch are ours to
+    delete (d-adv2): operator-made files that merely match the glob —
+    ``config.yaml.bak.manual``, ``.bak.pre-experiment`` — are left
+    untouched no matter how crowded the directory gets.
+    """
+
+    def stamp(backup: Path) -> float | None:
         try:
             return float(backup.name.rsplit(".", 1)[1])
         except (ValueError, IndexError):
-            return float("-inf")
+            return None
 
-    backups = sorted(
-        (
-            p
-            for p in config_path.parent.glob(config_path.name + ".bak.*")
-            if p.is_file()
-        ),
-        key=stamp,
-    )
+    stamped = []
+    for candidate in config_path.parent.glob(config_path.name + ".bak.*"):
+        if not candidate.is_file():
+            continue
+        candidate_stamp = stamp(candidate)
+        if candidate_stamp is not None:
+            stamped.append((candidate_stamp, candidate))
+    backups = [p for _, p in sorted(stamped, key=lambda pair: pair[0])]
     for stale in backups[:-keep] if keep > 0 else backups:
         try:
             stale.unlink()
@@ -367,7 +420,7 @@ def converge(config_path: Path | None = None) -> ConvergeResult:
         log.debug("wiring convergence: no config file at %s", path)
         return ConvergeResult("no-config", lease_path=lease)
     try:
-        document, _saver = _load_yaml(path)
+        document, _saver = load_yaml(path)
     except ImportError:
         return ConvergeResult("no-yaml-lib", lease_path=lease)
     except Exception as exc:  # torn read / parse error / unreadable
@@ -376,13 +429,27 @@ def converge(config_path: Path | None = None) -> ConvergeResult:
     classification = classify_document(document)
     if classification != "repairable":
         return ConvergeResult(classification, lease_path=lease)
-    # The re-read happens inside configure_hermes (it repairs only what
-    # differs from the values it reads), so a host clobber landing between
-    # the classification above and the write wins that round and the next
-    # recheck re-converges — containment, not locking (plan: lost-update
-    # containment).
+    # Plan U4 key decision — re-read + reclassify immediately before the
+    # write: an operator value (or host clobber) landing between the
+    # classification above and this fresh read WINS and is returned,
+    # never overwritten — last-writer-wins, converged by idempotence on
+    # the next recheck. The residual window is configure_hermes's own
+    # read-to-replace gap (atomic tmp+replace, no locking).
     try:
-        changed = configure_hermes(path)
+        fresh_document, _saver = load_yaml(path)
+    except ImportError:
+        return ConvergeResult("no-yaml-lib", lease_path=lease)
+    except Exception as exc:  # torn read / parse error / unreadable
+        log.debug("wiring convergence: config unreadable at %s: %s", path, exc)
+        return ConvergeResult("unparseable", lease_path=lease, detail=str(exc))
+    fresh = classify_document(fresh_document)
+    if fresh != "repairable":
+        return ConvergeResult(fresh, lease_path=lease)
+    # Scoped to the lease's declared wires (d-sec0-cor1): convergence
+    # repairs exactly WIRED_KEYS and never re-appends the plugin to
+    # plugins.enabled — enablement is install's explicit act (W2/W4).
+    try:
+        changed = configure_hermes(path, keys=WIRED_KEYS)
         _prune_backups(path)
     except (Exception, SystemExit) as exc:  # containment is the contract
         log.warning("wiring convergence failed at %s: %s", path, exc)
@@ -478,7 +545,7 @@ def describe(config_path: Path | None = None) -> dict[str, Any]:
         state["classification"] = "no-config"
         return state
     try:
-        document, _saver = _load_yaml(path)
+        document, _saver = load_yaml(path)
     except ImportError:
         state["classification"] = "no-yaml-lib"
         return state
