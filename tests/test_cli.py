@@ -309,6 +309,186 @@ class TestInstallLease:
         assert payload["updated_at"] == 2000.0
 
 
+class TestWire:
+    """Unit 1 (plan 2026-11-01, run ef749c7e329e) — `wire` is the loud,
+    network-free convergence verb: exactly `configure_hermes()` +
+    `write_lease()`, no npm planning, no sidecar boot. The deliberate
+    divergence from `install`'s d-cor3 lease-warning path is pinned
+    below: install's primary job is the npm package (a lease miss warns
+    and the flow continues); wire's primary job IS the config + lease,
+    so any failure must exit non-zero — a silent lease miss is exactly
+    the drift class the lease exists to close (maestro c7d63424)."""
+
+    def _config(self):
+        return Path(cli.hermes_config_path())
+
+    def _lease(self, isolated_home):
+        return (
+            isolated_home
+            / ".local"
+            / "share"
+            / "magic-hermes"
+            / "wiring-lease.json"
+        )
+
+    def test_repairs_factory_clobbered_config_and_records_lease(
+        self, isolated_home, capsys
+    ):
+        from magic_hermes import wiring
+
+        config = self._config()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "# managed by magic-hermes\n"
+            "language: en\n"
+            "\n"
+            "context:\n"
+            "  engine: compressor\n"
+            "\n"
+            "memory:\n"
+            "  provider: null\n"
+            "\n"
+            "plugins:\n"
+            "  enabled:\n"
+            "    - magic-hermes\n",
+            encoding="utf-8",
+        )
+        pytest.importorskip("ruamel.yaml")
+        document, _ = wiring.load_yaml(config)
+        # the host-clobber signature: factory drift, plugin still enabled
+        assert wiring.classify_document(document) == "repairable"
+
+        rc = cli.run_wire()
+
+        assert rc == 0
+        text = config.read_text(encoding="utf-8")
+        assert "# managed by magic-hermes" in text  # comments preserved
+        assert "engine: magic-context" in text
+        assert "provider: magic_context" in text
+        lease = self._lease(isolated_home)
+        payload = json.loads(lease.read_text(encoding="utf-8"))
+        assert payload["schema"] == 1
+        assert payload["plugin"] == "magic-hermes"
+        assert payload["wires"] == ["context.engine", "memory.provider"]
+        assert isinstance(payload["created_at"], float)
+        out = capsys.readouterr().out
+        # changed-key summary names exactly the two clobbered keys —
+        # plugins.enabled was already satisfied and stays untouched
+        assert "context.engine" in out
+        assert "memory.provider" in out
+        assert "plugins.enabled" not in out
+        assert str(lease) in out
+
+    def test_already_converged_idempotent_preserves_lease_created_at(
+        self, isolated_home, capsys
+    ):
+        from magic_hermes import wiring
+
+        with mock.patch.object(wiring.time, "time", return_value=1000.0):
+            assert cli.run_wire() == 0
+        capsys.readouterr()
+        config = self._config()
+        backups_after_first = sorted(
+            p.name for p in config.parent.glob("config.yaml.bak.*")
+        )
+
+        with mock.patch.object(wiring.time, "time", return_value=2000.0):
+            assert cli.run_wire() == 0
+        out = capsys.readouterr().out
+
+        assert "already wired" in out
+        # no repair on an already-converged config ⇒ no new backup
+        backups_after_second = sorted(
+            p.name for p in config.parent.glob("config.yaml.bak.*")
+        )
+        assert backups_after_second == backups_after_first
+        # lease refreshed: updated_at moves, created_at is preserved
+        payload = json.loads(
+            self._lease(isolated_home).read_text(encoding="utf-8")
+        )
+        assert payload["created_at"] == 1000.0
+        assert payload["updated_at"] == 2000.0
+
+    def test_unwritable_config_path_fails_loud(
+        self, isolated_home, monkeypatch, capsys
+    ):
+        # HERMES_HOME under a regular file: mkdir of the config parent
+        # raises NotADirectoryError (an OSError) from real code —
+        # deterministic regardless of the uid the suite runs under
+        blocker = isolated_home / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(blocker / ".hermes"))
+
+        rc = cli.run_wire()
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "wire FAILED" in captured.err
+        assert "re-run `magic-hermes wire`" in captured.err
+        assert "wire complete" not in captured.out
+
+    def test_unrecordable_lease_fails_loud(self, isolated_home, capsys):
+        # the deliberate divergence from install's d-cor3 path: install
+        # warns and completes (test_unrecordable_lease_warns_but_completes)
+        # because its primary job is npm; wire exits non-zero because the
+        # config+lease state IS its whole job
+        pytest.importorskip("ruamel.yaml")
+        assert cli.run_wire() == 0
+        capsys.readouterr()
+
+        with mock.patch.object(
+            cli, "write_lease", side_effect=OSError(13, "Permission denied")
+        ):
+            rc = cli.run_wire()
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "wire FAILED" in captured.err
+        assert "Permission denied" in captured.err
+        assert "wire complete" not in captured.out
+
+    def test_absent_config_creates_and_converges(self, isolated_home, capsys):
+        # no config anywhere: configure_hermes' existing semantics — an
+        # empty file is created and all three keys land (asserted as-is,
+        # no new semantics invented)
+        pytest.importorskip("ruamel.yaml")
+
+        rc = cli.run_wire()
+
+        assert rc == 0
+        text = self._config().read_text(encoding="utf-8")
+        assert "engine: magic-context" in text
+        assert "provider: magic_context" in text
+        assert "magic-hermes" in text
+        assert self._lease(isolated_home).is_file()
+        out = capsys.readouterr().out
+        assert "plugins.enabled" in out
+
+    def test_foreign_engine_value_is_rewired(self, isolated_home, capsys):
+        # a deliberate (non-factory) override: lease-guarded convergence
+        # would classify this "deliberate" and write nothing — wire is
+        # the explicit operator re-wire act and sets the keys anyway
+        from magic_hermes import wiring
+
+        config = self._config()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n  engine: custom-engine\n", encoding="utf-8"
+        )
+        pytest.importorskip("ruamel.yaml")
+        document, _ = wiring.load_yaml(config)
+        assert wiring.classify_document(document) == "deliberate"
+
+        rc = cli.run_wire()
+
+        assert rc == 0
+        text = config.read_text(encoding="utf-8")
+        assert "engine: magic-context" in text
+        assert "provider: magic_context" in text
+        out = capsys.readouterr().out
+        assert "context.engine" in out
+
+
 class TestTextScanFallback:
     def test_scans_wiring_from_unparsed_config(self, isolated_home):
         config = Path(cli.hermes_config_path())

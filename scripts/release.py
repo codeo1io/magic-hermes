@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Build, validate, tag, push, and publish a Magic-Hermes GitHub release."""
+"""Build, validate, tag, push, and publish a Magic-Hermes GitHub release.
+
+Lane invariant (finding c7d63424daa3): a Magic-Hermes release is not
+published until the probe interpreter is deployed, wired, and
+doctor-verified — the deploy step converges the operational wiring through
+the deployed console script (``magic-hermes wire``) and requires a clean
+doctor exit (the same probe maestro runs) before ``publish_release``.
+"""
 
 from __future__ import annotations
 
@@ -33,9 +40,17 @@ MAGIC_CONTEXT_SYNC_FILES = {
 DEFAULT_DEPLOY_VENV = Path("/home/agent/.hermes/hermes-agent/venv")
 #: Overrides DEFAULT_DEPLOY_VENV (tests, other hosts).
 DEPLOY_VENV_ENV = "MAGIC_HERMES_DEPLOY_VENV"
-#: When set by the deploy/release lane, the deploy step additionally runs
-#: ``<venv>/bin/magic-hermes doctor`` and requires a clean exit.
+#: Legacy opt-in for the deploy doctor smoke. The smoke is now DEFAULT-ON
+#: (finding c7d63424daa3: a deployed-but-unverified probe is exactly the
+#: failure class the lane must refuse to ship), so this variable no longer
+#: gates anything — it stays defined (tolerated no-op) so historical
+#: invocations that set it keep working unchanged.
 DEPLOY_SMOKE_ENV = "MAGIC_HERMES_DEPLOY_SMOKE"
+#: Documented escape from the default-on deploy doctor smoke, for foreign
+#: or throwaway deploy targets whose console script or Hermes home may not
+#: support a doctor run. Convergence (``wire``) still runs — only the
+#: verification step is skipped.
+DEPLOY_NO_SMOKE_ENV = "MAGIC_HERMES_DEPLOY_NO_SMOKE"
 
 
 class ReleaseError(RuntimeError):
@@ -371,13 +386,14 @@ def deployed_version(target: Path) -> str | None:
 
 
 def deploy_release(artifacts: list[Path], version: str, target: Path) -> None:
-    """Install and verify the freshly built wheel in the probe venv.
+    """Install, converge, and verify the freshly built wheel in the probe venv.
 
     Ordering (callers): after ``commit_and_tag`` and before
     ``publish_release`` — the tag exists when bits land in the venv, and a
-    deploy failure aborts the release before the GitHub release object is
-    created. Idempotent: when the target already carries ``version`` the
-    install is skipped and verification still runs. A missing venv,
+    deploy failure (install, wiring convergence, or doctor verification)
+    aborts the release before the GitHub release object is created.
+    Idempotent: when the target already carries ``version`` the install is
+    skipped and convergence + verification still run. A missing venv,
     missing pip, or a failed verification is a loud error, never a skip.
     """
     python = target / "bin" / "python"
@@ -414,8 +430,30 @@ def deploy_release(artifacts: list[Path], version: str, target: Path) -> None:
     if not console_script.is_file():
         raise ReleaseError(f"console script missing after deploy: {console_script}")
 
-    if os.environ.get(DEPLOY_SMOKE_ENV):
-        run(str(console_script), "doctor")
+    # Convergence (finding c7d63424daa3): the deployed code itself repairs
+    # the operational wiring (context.engine / memory.provider) and records
+    # the lease, so the probe venv cannot end up "new wheel, inert wiring".
+    # Loud on failure — the deploy lane is an explicit operator act, the
+    # opposite context of the gateway's fail-open converge(); a release
+    # that cannot wire the target must abort before publish, never pass
+    # silently. Quiet on success; the chained failure carries the output.
+    try:
+        run(str(console_script), "wire", capture=True)
+    except ReleaseError as exc:
+        raise ReleaseError(f"wiring convergence failed during deploy: {exc}") from exc
+
+    # Verification: run the same doctor maestro probes, default-on, and
+    # require a clean exit before the release may publish. The escape env
+    # is documented for foreign/throwaway targets only; it skips the
+    # verification, never the convergence above.
+    if not os.environ.get(DEPLOY_NO_SMOKE_ENV):
+        try:
+            run(str(console_script), "doctor", capture=True)
+        except ReleaseError as exc:
+            raise ReleaseError(
+                "deploy verification failed — doctor is not clean after "
+                f"deploy and wiring convergence: {exc}"
+            ) from exc
 
 
 def redeploy_release(version: str, tag: str) -> None:
@@ -424,7 +462,10 @@ def redeploy_release(version: str, tag: str) -> None:
     Taken when the GitHub release exists and ``--deploy`` was requested:
     the tag must exist and point at current HEAD, so the wheel is rebuilt
     from exactly the released tree; commit and publish are skipped (both
-    already happened for this version).
+    already happened for this version). Routes through ``deploy_release``,
+    so the re-entry path carries the same convergence + doctor-verification
+    tail as a fresh release and cannot reintroduce the deploy-without-
+    converging hole.
     """
     if not tag_exists(tag):
         raise ReleaseError(
@@ -594,8 +635,11 @@ def main() -> int:
         action="store_true",
         help=(
             "after tagging, and before publishing, install and verify the "
-            "built wheel in the deploy target venv (default "
-            f"{DEFAULT_DEPLOY_VENV}; override with {DEPLOY_VENV_ENV})"
+            "built wheel in the deploy target venv, converge the host "
+            "wiring through the deployed console script, and require a "
+            "clean doctor exit (default "
+            f"{DEFAULT_DEPLOY_VENV}; override target with {DEPLOY_VENV_ENV}, "
+            f"skip the doctor step with {DEPLOY_NO_SMOKE_ENV}=1)"
         ),
     )
     args = parser.parse_args()

@@ -1,10 +1,15 @@
-"""Regression tests for the release-lane deploy step (finding d59758598379).
+"""Regression tests for the release-lane deploy step (findings d59758598379
+and c7d63424daa3).
 
 The deploy step closes the land→deploy delivery gap: after ``commit_and_tag``
 and before ``publish_release`` the freshly built wheel is installed into the
 interpreter maestro probes (``DEFAULT_DEPLOY_VENV``, overridable through
 ``MAGIC_HERMES_DEPLOY_VENV``) and verified in THAT interpreter — never the
-development one.
+development one. It then closes the deploy→operate gap: the deployed console
+script converges the host wiring (``magic-hermes wire``) and must pass a
+doctor smoke — DEFAULT-ON, with ``MAGIC_HERMES_DEPLOY_NO_SMOKE=1`` as the
+escape for foreign/throwaway targets — before the release may publish. The
+legacy ``MAGIC_HERMES_DEPLOY_SMOKE`` opt-in is a tolerated no-op.
 
 These tests never touch the real probe venv: every unit test fakes the
 subprocess layer (``release.run``) and ``deployed_version`` while building a
@@ -16,6 +21,7 @@ real built wheel into a throwaway venv (established repo precedent:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -75,6 +81,9 @@ class FakeRun:
     def install_calls(self) -> list[tuple[str, ...]]:
         return [call for call in self.calls if "install" in call]
 
+    def wire_calls(self) -> list[tuple[str, ...]]:
+        return [call for call in self.calls if "wire" in call]
+
     def doctor_calls(self) -> list[tuple[str, ...]]:
         return [call for call in self.calls if "doctor" in call]
 
@@ -96,9 +105,15 @@ class FakeVersion:
 
 
 @pytest.fixture(autouse=True)
-def _no_smoke_gate(monkeypatch):
-    """Unit tests pin the smoke gate OFF unless a test sets it explicitly."""
+def _clean_smoke_env(monkeypatch):
+    """Pin the default-on smoke contract unless a test opts out explicitly.
+
+    Both the legacy opt-in (``MAGIC_HERMES_DEPLOY_SMOKE``) and the escape
+    hatch (``MAGIC_HERMES_DEPLOY_NO_SMOKE``) are cleared, so ``wire`` +
+    ``doctor`` run in every deploy unless a test sets the escape itself.
+    """
     monkeypatch.delenv("MAGIC_HERMES_DEPLOY_SMOKE", raising=False)
+    monkeypatch.delenv("MAGIC_HERMES_DEPLOY_NO_SMOKE", raising=False)
 
 
 class TestDeployRelease:
@@ -126,7 +141,14 @@ class TestDeployRelease:
             str(wheel),
         )
         assert fake.install_calls() == [expected]
-        assert fake.doctor_calls() == []
+        # Default-on contract: after the install, converge wiring, then
+        # verify with the doctor — in that order, through the deployed
+        # console script.
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.calls.index(expected) < fake.calls.index((console, "wire"))
+        assert fake.calls.index((console, "wire")) < fake.calls.index(
+            (console, "doctor")
+        )
 
     def test_already_deployed_version_skips_pip(self, tmp_path, monkeypatch):
         target = make_target(tmp_path)
@@ -138,8 +160,13 @@ class TestDeployRelease:
 
         release.deploy_release(artifacts, VERSION, target)
 
-        assert fake.calls == []
+        assert fake.install_calls() == []
         assert version.calls  # verification consulted the target interpreter
+        # Already-current wheel: the install is skipped, but convergence and
+        # verification still run (idempotent deploy contract).
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.wire_calls() == [(console, "wire")]
+        assert fake.doctor_calls() == [(console, "doctor")]
 
     def test_missing_target_python_is_a_loud_error(self, tmp_path, monkeypatch):
         target = make_target(tmp_path, python=False)
@@ -211,12 +238,14 @@ class TestDeployRelease:
         with pytest.raises(release.ReleaseError, match="magic-hermes"):
             release.deploy_release(artifacts, VERSION, target)
 
-    def test_smoke_gate_runs_target_doctor_and_requires_success(
+    def test_doctor_smoke_runs_by_default_and_requires_success(
         self, tmp_path, monkeypatch
     ):
+        """Default-on verification (c7d63424): no env is set at all, yet the
+deployed console script's doctor must run and exit clean — the same probe
+maestro executes — or the release aborts."""
         target = make_target(tmp_path)
         artifacts = make_artifacts(tmp_path)
-        monkeypatch.setenv("MAGIC_HERMES_DEPLOY_SMOKE", "1")
 
         def doctor_fails(key):
             return "doctor" in key
@@ -228,25 +257,76 @@ class TestDeployRelease:
         with pytest.raises(release.ReleaseError, match="doctor"):
             release.deploy_release(artifacts, VERSION, target)
 
-        assert fake.doctor_calls() == [(str(target / "bin" / "magic-hermes"), "doctor")]
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.wire_calls() == [(console, "wire")]
+        assert fake.doctor_calls() == [(console, "doctor")]
 
-    def test_smoke_gate_unset_never_invokes_doctor(self, tmp_path, monkeypatch):
+    def test_no_smoke_escape_skips_doctor_but_not_wire(self, tmp_path, monkeypatch):
+        """MAGIC_HERMES_DEPLOY_NO_SMOKE=1 is the documented escape for
+        foreign/throwaway deploy targets — it skips verification only;
+        convergence (``wire``) still runs."""
         target = make_target(tmp_path)
         artifacts = make_artifacts(tmp_path)
+        monkeypatch.setenv("MAGIC_HERMES_DEPLOY_NO_SMOKE", "1")
         fake = FakeRun()
         monkeypatch.setattr(release, "run", fake)
         monkeypatch.setattr(release, "deployed_version", FakeVersion([None, VERSION]))
 
         release.deploy_release(artifacts, VERSION, target)
 
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.wire_calls() == [(console, "wire")]
         assert fake.doctor_calls() == []
+
+    def test_legacy_smoke_env_is_a_tolerated_no_op(self, tmp_path, monkeypatch):
+        """MAGIC_HERMES_DEPLOY_SMOKE (the pre-c7d63424 opt-in) no longer
+        gates anything; setting it must behave exactly like the default."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        monkeypatch.setenv("MAGIC_HERMES_DEPLOY_SMOKE", "1")
+        fake = FakeRun()
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(release, "deployed_version", FakeVersion([None, VERSION]))
+
+        release.deploy_release(artifacts, VERSION, target)
+
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.wire_calls() == [(console, "wire")]
+        assert fake.doctor_calls() == [(console, "doctor")]
+
+    def test_wire_failure_aborts_before_doctor(self, tmp_path, monkeypatch):
+        """The tonight-class regression (c7d63424): a deployed wheel plus
+        inert wiring must abort the release loudly — verification never
+        runs and publish is never reached."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+
+        def wire_fails(key):
+            return "wire" in key
+
+        fake = FakeRun(fail=wire_fails)
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(release, "deployed_version", FakeVersion([None, VERSION]))
+
+        with pytest.raises(release.ReleaseError, match="wire"):
+            release.deploy_release(artifacts, VERSION, target)
+
+        assert fake.wire_calls()  # convergence was attempted ...
+        assert fake.doctor_calls() == []  # ... and verification never ran
 
 
 class TestMainDeployWiring:
     """main(): ordering, redeploy path, and target selection."""
 
     @staticmethod
-    def _patch_lane(monkeypatch, order: list[str], artifacts: list[Path], target: Path):
+    def _patch_lane(
+        monkeypatch,
+        order: list[str],
+        artifacts: list[Path],
+        target: Path,
+        *,
+        patch_deploy: bool = True,
+    ):
         wheel = artifacts[0]
         monkeypatch.setattr(release, "ensure_tools", lambda: None)
         monkeypatch.setattr(release, "ensure_clean_or_release_version", lambda v: None)
@@ -269,16 +349,23 @@ class TestMainDeployWiring:
         )
         monkeypatch.setattr(
             release,
-            "deploy_release",
-            lambda artifacts_, version_, target_: order.append(
-                ("deploy", tuple(str(a) for a in artifacts_), version_, target_)
-            ),
-        )
-        monkeypatch.setattr(
-            release,
             "publish_release",
             lambda version, tag, artifacts_, checksum: order.append("publish"),
         )
+        if patch_deploy:
+            monkeypatch.setattr(
+                release,
+                "deploy_release",
+                lambda artifacts_, version_, target_: order.append(
+                    ("deploy", tuple(str(a) for a in artifacts_), version_, target_)
+                ),
+            )
+        else:
+            # Leave deploy_release real: the test fakes the subprocess layer
+            # (release.run / deployed_version) to exercise its body.
+            monkeypatch.setattr(
+                release, "deployed_version", FakeVersion([VERSION])
+            )
         return target
 
     def test_deploy_runs_between_commit_and_publish(self, tmp_path, monkeypatch):
@@ -294,6 +381,64 @@ class TestMainDeployWiring:
         names = [entry if isinstance(entry, str) else entry[0] for entry in order]
         assert names.index("commit_and_tag") < names.index("deploy")
         assert names.index("deploy") < names.index("publish")
+
+    def test_doctor_failure_aborts_the_release_before_publish(
+        self, tmp_path, monkeypatch
+    ):
+        """A doctor FAIL at smoke time (any non-wiring row — wire has
+        already removed the wiring one) must keep the GitHub release object
+        unpublished: the lane refuses to ship an unverified probe."""
+        order: list[str] = []
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        self._patch_lane(monkeypatch, order, artifacts, target, patch_deploy=False)
+
+        def doctor_fails(key):
+            return "doctor" in key
+
+        monkeypatch.setattr(release, "run", FakeRun(fail=doctor_fails))
+        monkeypatch.setenv("MAGIC_HERMES_DEPLOY_VENV", str(target))
+        monkeypatch.setattr(sys, "argv", ["release.py", VERSION, "--deploy"])
+
+        with pytest.raises(release.ReleaseError, match="doctor"):
+            release.main()
+
+        names = [entry if isinstance(entry, str) else entry[0] for entry in order]
+        assert "commit_and_tag" in names
+        assert "publish" not in names
+
+    def test_redeploy_route_runs_the_convergence_and_verification_tail(
+        self, tmp_path, monkeypatch
+    ):
+        """redeploy_release routes through deploy_release, so the re-entry
+        path inherits the wire + doctor tail — it cannot reintroduce the
+        deploy-without-converging hole."""
+        order: list[str] = []
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        self._patch_lane(monkeypatch, order, artifacts, target, patch_deploy=False)
+        monkeypatch.setattr(release, "release_exists", lambda tag: True)
+        monkeypatch.setattr(release, "tag_exists", lambda tag: True)
+        head = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111"
+        fake_git = FakeRun(
+            answers={
+                ("git", "rev-parse", "HEAD"): head,
+                ("git", "rev-list", "-n", "1", f"v{VERSION}"): head,
+            }
+        )
+        monkeypatch.setattr(release, "run", fake_git)
+        monkeypatch.setenv("MAGIC_HERMES_DEPLOY_VENV", str(target))
+        monkeypatch.setattr(sys, "argv", ["release.py", VERSION, "--deploy"])
+
+        assert release.main() == 0
+
+        names = [entry if isinstance(entry, str) else entry[0] for entry in order]
+        assert "build" in names
+        assert "commit_and_tag" not in names
+        assert "publish" not in names
+        console = str(target / "bin" / "magic-hermes")
+        assert fake_git.wire_calls() == [(console, "wire")]
+        assert fake_git.doctor_calls() == [(console, "doctor")]
 
     def test_deploy_target_defaults_to_constant_when_env_unset(
         self, tmp_path, monkeypatch
@@ -488,7 +633,17 @@ class TestEnsureDefaultBranchFFRecovery:
     ),
 )
 def test_deploy_release_into_throwaway_venv(tmp_path, monkeypatch):
+    # Throwaway target: take the documented escape so the default-on doctor
+    # step is skipped — this battery asserts the convergence artifacts on
+    # disk (wire writes them), not the smoke (unit tests pin that contract).
+    monkeypatch.setenv("MAGIC_HERMES_DEPLOY_NO_SMOKE", "1")
     monkeypatch.delenv("MAGIC_HERMES_DEPLOY_SMOKE", raising=False)
+    # Isolated Hermes home + data root: the wire step must write config and
+    # lease HERE, never in the operator's real home (R6 swim-lane rule).
+    hermes_home = tmp_path / "hermes-home"
+    data_home = tmp_path / "data-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
     wheels = sorted((release.ROOT / "dist").glob("magic_hermes-*.whl"))
     if not wheels:
         pytest.skip(
@@ -520,3 +675,14 @@ def test_deploy_release_into_throwaway_venv(tmp_path, monkeypatch):
     )
     assert probe.stdout.strip() == version
     assert (venv / "bin" / "magic-hermes").is_file()
+
+    # Convergence through the deployed code (c7d63424): wiring keys in the
+    # isolated config, lease recorded under the isolated data root.
+    config_text = (hermes_home / "config.yaml").read_text(encoding="utf-8")
+    assert re.search(r"engine:\s*magic-context", config_text)
+    assert re.search(r"provider:\s*magic_context", config_text)
+    leases = list(data_home.rglob("wiring-lease.json"))
+    assert leases, "wiring lease was not recorded under the isolated data root"
+    lease = json.loads(leases[0].read_text(encoding="utf-8"))
+    assert lease["plugin"] == "magic-hermes"
+    assert set(lease["wires"]) >= {"context.engine", "memory.provider"}

@@ -4,7 +4,9 @@
 installs or updates it into a Hermes-owned npm root, wires the Hermes
 config, and verifies the runtime end to end. `magic-hermes doctor`
 reports installation health in the style of the upstream
-`@cortexkit/magic-context doctor`.
+`@cortexkit/magic-context doctor`. `magic-hermes wire` converges the
+Hermes config wiring and records the intent lease — network-free,
+idempotent, and fail-loud (non-zero exit on any failure).
 """
 
 from __future__ import annotations
@@ -1465,6 +1467,43 @@ def run_install(
     return 0
 
 
+def run_wire() -> int:
+    """Converge the Hermes config wiring and record the intent lease.
+
+    Unit 1 (plan 2026-11-01, run ef749c7e329e): the network-free
+    convergence verb — exactly ``configure_hermes()`` + ``write_lease()``,
+    no npm planning, no sidecar boot, idempotent. Unlike ``install`` —
+    whose primary job is the npm package, so an unrecordable lease only
+    warns and the flow continues (d-cor3) — wire's primary job IS the
+    config + lease, so an OSError exits 1 loudly: a silent lease miss is
+    exactly the drift class the lease exists to close (maestro
+    c7d63424). The release lane's deploy step composes this command.
+    """
+
+    print("┌  magic-hermes wire")
+    try:
+        changed = configure_hermes()
+        if changed:
+            print(
+                f"│  Hermes config updated: {', '.join(changed)} "
+                "(backup written)"
+            )
+        else:
+            print("│  Hermes config already wired")
+        lease = write_lease()
+    except OSError as exc:
+        print(f"└  wire FAILED: {exc}", file=sys.stderr)
+        print(
+            "│  the config/lease state on disk may be partially "
+            "converged — fix the cause and re-run `magic-hermes wire`",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"│  wiring lease recorded: {lease}")
+    print("└  wire complete")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="magic-hermes",
@@ -1492,6 +1531,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-config",
         action="store_true",
         help="leave Hermes config untouched and record no wiring lease",
+    )
+
+    sub.add_parser(
+        "wire",
+        help="converge Hermes config wiring and record the intent lease "
+        "(network-free, idempotent; non-zero exit on any failure)",
     )
 
     doctor = sub.add_parser("doctor", help="check installation health")
@@ -1584,6 +1629,8 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             skip_config=args.skip_config,
         )
+    if args.command == "wire":
+        return run_wire()
     if args.command == "guard":
         return run_guard(action=args.action)
     if args.command == "db":
