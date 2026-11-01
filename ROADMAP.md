@@ -8,15 +8,16 @@
 
 ## Fleet context
 
-- dependents (changes here affect): agent
+- upstreams (this repo builds on): .github, agent, hermes-agent
+- dependents (changes here affect): (host), agent, maestro
 - graph: evidence-derived (imports/refs/deploy surfaces); advisory
 
 ## Open items
 
-### Add test coverage for 11 untested module(s)
+### Add test coverage for 12 untested module(s)
 - id: `rm-003` | track: reliability | priority: 100.0 | status: candidate
-- signals: reliability.no_tests:src/magic_hermes/_host_budget.py, reliability.no_tests:src/magic_hermes/bridge/loader.mjs, reliability.no_tests:src/magic_hermes/bridge/migrate-hooks.mjs, reliability.no_tests:src/magic_hermes/cli.py, reliability.no_tests:src/magic_hermes/db_toolkit.py (+6 more)
-- acceptance: Every module in ['src/magic_hermes/_host_budget.py', 'src/magic_hermes/bridge/loader.mjs', 'src/magic_hermes/bridge/migrate-hooks.mjs', 'src/magic_hermes/cli.py', 'src/magic_hermes/db_toolkit.py', 'src/magic_hermes/engine.py', 'src/magic_hermes/historian_guard.py', 'src/magic_hermes/memory_provider.py', 'src/magic_hermes/plugin.py', 'src/magic_hermes/provenance.py', 'src/magic_hermes/runtime.py'] has a corresponding test file with at least one passing test
+- signals: reliability.no_tests:src/magic_hermes/_host_budget.py, reliability.no_tests:src/magic_hermes/bridge/loader.mjs, reliability.no_tests:src/magic_hermes/bridge/migrate-hooks.mjs, reliability.no_tests:src/magic_hermes/cli.py, reliability.no_tests:src/magic_hermes/db_toolkit.py (+7 more)
+- acceptance: Every module in ['src/magic_hermes/_host_budget.py', 'src/magic_hermes/bridge/loader.mjs', 'src/magic_hermes/bridge/migrate-hooks.mjs', 'src/magic_hermes/cli.py', 'src/magic_hermes/db_toolkit.py', 'src/magic_hermes/engine.py', 'src/magic_hermes/historian_guard.py', 'src/magic_hermes/memory_provider.py', 'src/magic_hermes/plugin.py', 'src/magic_hermes/provenance.py', 'src/magic_hermes/runtime.py', 'src/magic_hermes/wiring.py'] has a corresponding test file with at least one passing test
 - evidence: full suite green (python -m pytest -q) at HEAD; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 
 ### Complete the v0.3.4 release/deploy chain and fix the pending-version skip
@@ -31,7 +32,7 @@
 
 ### Refactor 20 high-complexity function(s)
 - id: `rm-001` | track: reliability | priority: 90.0 | status: candidate
-- signals: reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L104, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L104, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L134, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L181, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L243 (+15 more)
+- signals: reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L104, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L104, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L140, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L189, reliability.complexity_hot:src/magic_hermes/bridge/runtime.mjs::L251 (+15 more)
 - acceptance: Each flagged function is decomposed below the branch threshold with behavior locked by characterization tests
 - evidence: ast-based branch-count check passes at HEAD (full suite green; conductor validation digest validation:v1:<sha> recorded in the shipping PR)
 
