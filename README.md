@@ -111,6 +111,18 @@ values, writes only through the same comment-preserving backup path as
 `install`, and `--skip-config` writes no lease. Deleting the lease file is
 the documented opt-out.
 
+`magic-hermes wire` is the network-free convergence verb: it repairs the
+same wiring keys through the same comment-preserving backup path and
+records the same lease as `install`, without npm planning or a sidecar
+boot — deterministic and idempotent, safe to re-run. It is loud where
+`install` is tolerant: any failure (unwritable config, unrecordable
+lease) exits non-zero instead of warning, because for `wire` the
+config+lease state is the whole job, and a silent lease miss is exactly
+the drift class the lease exists to close. Prefer `install` when the
+upstream package itself may need updating; use `wire` when only the
+operational wiring is in question (the release lane's deploy step uses
+it for exactly that).
+
 ### 1b. Check installation health
 
 ```bash
@@ -556,9 +568,20 @@ set `MAGIC_HERMES_DEPLOY_VENV` to deploy elsewhere — tests and other hosts
 use this override. A missing venv or interpreter, missing pip, or a failed
 verification is a hard release error, never a silent skip.
 
-Setting `MAGIC_HERMES_DEPLOY_SMOKE=1` additionally runs
-`<venv>/bin/magic-hermes doctor` after installation and requires a clean
-exit, so the exact interpreter that was just deployed proves its own health.
+The deploy also converges the operational wiring and verifies health
+before anything is published: after the version and console-script
+checks, `<venv>/bin/magic-hermes wire` must exit 0 (the two config wiring
+keys repaired through the comment-preserving backup path, the wiring
+lease recorded), and then `<venv>/bin/magic-hermes doctor` must exit
+clean — default-on, no opt-in — so the exact interpreter that was just
+deployed proves both its wiring and its own health. A failure at either
+step is a hard release error: the invariant is that a magic-hermes
+release is not published until the probe interpreter is deployed, wired,
+and doctor-verified. `MAGIC_HERMES_DEPLOY_NO_SMOKE=1` is the escape hatch
+for foreign or throwaway deploy targets (a stub console script, a Hermes
+home that does not exist): it skips the doctor step only — the wiring
+convergence always runs. The older `MAGIC_HERMES_DEPLOY_SMOKE=1` is
+accepted as a no-op; the smoke it used to opt into is now always on.
 
 When the GitHub release already exists, `release.py X.Y.Z --deploy` takes a
 redeploy path instead of aborting: it requires the tag to exist and point at
