@@ -63,6 +63,27 @@ def make_artifacts(tmp_path: Path, version: str = VERSION, *, with_wheel: bool =
     return artifacts
 
 
+def make_layered_target(
+    tmp_path: Path, deployed: str, stale: list[str]
+) -> tuple[Path, Path]:
+    """Fake deploy-target venv carrying layered magic_hermes dist-infos.
+
+    Mirrors the live probe venv at the c7d63424 investigation: stale
+    ``magic_hermes-*.dist-info`` directories stacked under the deployed
+    version's, plus one foreign package's metadata that must survive.
+    """
+    target = make_target(tmp_path)
+    site = target / "lib" / "python3.11" / "site-packages"
+    for version in (*stale, deployed):
+        dist = site / f"magic_hermes-{version}.dist-info"
+        dist.mkdir(parents=True, exist_ok=True)
+        (dist / "METADATA").write_text("", encoding="utf-8")
+    foreign = site / "other_pkg-1.0.dist-info"
+    foreign.mkdir(parents=True, exist_ok=True)
+    (foreign / "METADATA").write_text("", encoding="utf-8")
+    return target, site
+
+
 class FakeRun:
     """Records run() calls; answers canned queries, fails chosen prefixes."""
 
@@ -313,6 +334,142 @@ maestro executes — or the release aborts."""
 
         assert fake.wire_calls()  # convergence was attempted ...
         assert fake.doctor_calls() == []  # ... and verification never ran
+
+
+class TestPruneStaleDistInfos:
+    """prune_stale_dist_infos(): the layered-metadata repair (c7d63424).
+
+    The probe venv arrived at the 2026-11-01 investigation carrying
+    0.3.24/0.3.32/0.3.34 dist-infos stacked from historical manual deploys;
+    ambiguous metadata is an operational hazard the deploy lane must clean
+    at install time without ever touching foreign packages.
+    """
+
+    def test_layered_stale_dist_infos_are_pruned_to_the_deployed_version(
+        self, tmp_path
+    ):
+        target, site = make_layered_target(
+            tmp_path, "0.3.35", ["0.3.24", "0.3.32"]
+        )
+
+        removed = release.prune_stale_dist_infos(target, "0.3.35")
+
+        assert removed == [
+            "magic_hermes-0.3.24.dist-info",
+            "magic_hermes-0.3.32.dist-info",
+        ]
+        assert sorted(p.name for p in site.glob("magic_hermes-*.dist-info")) == [
+            "magic_hermes-0.3.35.dist-info"
+        ]
+        # foreign metadata is never touched
+        assert (site / "other_pkg-1.0.dist-info").is_dir()
+
+    def test_prunes_across_every_python_slot(self, tmp_path):
+        target = make_target(tmp_path)
+        for slot in ("python3.11", "python3.12"):
+            site = target / "lib" / slot / "site-packages"
+            for dist in (
+                "magic_hermes-0.3.24.dist-info",
+                "magic_hermes-0.3.35.dist-info",
+            ):
+                (site / dist).mkdir(parents=True)
+
+        removed = release.prune_stale_dist_infos(target, "0.3.35")
+
+        assert removed == [
+            "magic_hermes-0.3.24.dist-info",
+            "magic_hermes-0.3.24.dist-info",
+        ]
+        for slot in ("python3.11", "python3.12"):
+            remaining = sorted(
+                p.name
+                for p in (target / "lib" / slot / "site-packages").glob(
+                    "magic_hermes-*.dist-info"
+                )
+            )
+            assert remaining == ["magic_hermes-0.3.35.dist-info"]
+
+    def test_missing_site_packages_or_metadata_is_a_silent_no_op(
+        self, tmp_path
+    ):
+        target = make_target(tmp_path)  # no lib/ at all
+        assert release.prune_stale_dist_infos(target, "0.3.35") == []
+
+        site = target / "lib" / "python3.11" / "site-packages"
+        (site / "other_pkg-1.0.dist-info").mkdir(parents=True)
+        assert release.prune_stale_dist_infos(target, "0.3.35") == []
+        assert (site / "other_pkg-1.0.dist-info").is_dir()
+
+
+class TestDeployReleasePrunesStaleLayers:
+    """deploy_release(): the prune rides the deploy on every path.
+
+    Ordering contract: pruning happens after the version re-check and
+    before wiring/verification — both on the fresh-install path and on
+    the already-deployed skip path — so a failed removal aborts the
+    release before any wire act, and a successful deploy always ends
+    with exactly one magic_hermes dist-info in the target.
+    """
+
+    def test_fresh_install_prunes_stale_layers(self, tmp_path, monkeypatch):
+        target, site = make_layered_target(
+            tmp_path, "0.3.35", ["0.3.24", "0.3.32"]
+        )
+        artifacts = make_artifacts(tmp_path, version="0.3.35")
+        fake = FakeRun()
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, "0.3.35"])
+        )
+
+        release.deploy_release(artifacts, "0.3.35", target)
+
+        assert fake.install_calls()  # fresh-install path exercised
+        assert sorted(p.name for p in site.glob("magic_hermes-*.dist-info")) == [
+            "magic_hermes-0.3.35.dist-info"
+        ]
+        assert (site / "other_pkg-1.0.dist-info").is_dir()
+        # the deploy still finishes its convergence + verification tail
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.wire_calls() == [(console, "wire")]
+        assert fake.doctor_calls() == [(console, "doctor")]
+
+    def test_already_deployed_skip_path_still_prunes(self, tmp_path, monkeypatch):
+        target, site = make_layered_target(
+            tmp_path, "0.3.35", ["0.3.24", "0.3.32"]
+        )
+        artifacts = make_artifacts(tmp_path, version="0.3.35")
+        fake = FakeRun()
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(release, "deployed_version", FakeVersion(["0.3.35"]))
+
+        release.deploy_release(artifacts, "0.3.35", target)
+
+        assert fake.install_calls() == []  # skip-pip path
+        assert sorted(p.name for p in site.glob("magic_hermes-*.dist-info")) == [
+            "magic_hermes-0.3.35.dist-info"
+        ]
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.wire_calls() == [(console, "wire")]
+
+    def test_prune_failure_aborts_deploy_before_wire(self, tmp_path, monkeypatch):
+        target = make_target(tmp_path)
+        site = target / "lib" / "python3.11" / "site-packages"
+        (site / "magic_hermes-0.3.35.dist-info").mkdir(parents=True)
+        # a FILE where the stale dist-info directory belongs: rmtree fails
+        (site / "magic_hermes-0.3.24.dist-info").write_text(
+            "not a directory", encoding="utf-8"
+        )
+        artifacts = make_artifacts(tmp_path, version="0.3.35")
+        fake = FakeRun()
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(release, "deployed_version", FakeVersion(["0.3.35"]))
+
+        with pytest.raises(release.ReleaseError, match="prune"):
+            release.deploy_release(artifacts, "0.3.35", target)
+
+        assert fake.wire_calls() == []
+        assert fake.doctor_calls() == []
 
 
 class TestMainDeployWiring:

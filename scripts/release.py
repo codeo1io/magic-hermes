@@ -385,6 +385,40 @@ def deployed_version(target: Path) -> str | None:
     return probe.stdout.strip() or None
 
 
+#: dist-info directory shape this package leaves in a target's
+#: site-packages (layered leftovers make metadata resolution ambiguous).
+DIST_INFO_GLOB = "magic_hermes-*.dist-info"
+
+
+def prune_stale_dist_infos(target: Path, version: str) -> list[str]:
+    """Remove every ``magic_hermes-*.dist-info`` except the deployed version's.
+
+    Walks the POSIX venv layout (``lib/python*/site-packages``) under the
+    target: layered leftovers from earlier deploys make metadata
+    resolution ambiguous (observed 0.3.24/0.3.32/0.3.34 stacked in the
+    probe venv during the c7d63424 investigation, and pip's
+    force-reinstall does not reliably remove other versions' metadata).
+    A missing site-packages directory or absent magic_hermes metadata is
+    a silent no-op; a failed removal is loud so the deploy aborts before
+    wiring and publish. Never touches other packages' metadata.
+    """
+    keep = f"magic_hermes-{version}.dist-info"
+    removed: list[str] = []
+    for site_packages in sorted(target.glob("lib/python*/site-packages")):
+        for dist_info in sorted(site_packages.glob(DIST_INFO_GLOB)):
+            if dist_info.name == keep:
+                continue
+            try:
+                shutil.rmtree(dist_info)
+            except OSError as exc:
+                raise ReleaseError(
+                    f"failed to prune stale dist-info {dist_info} from "
+                    f"deploy target {target}: {exc}"
+                ) from exc
+            removed.append(dist_info.name)
+    return removed
+
+
 def deploy_release(artifacts: list[Path], version: str, target: Path) -> None:
     """Install, converge, and verify the freshly built wheel in the probe venv.
 
@@ -425,6 +459,16 @@ def deploy_release(artifacts: list[Path], version: str, target: Path) -> None:
                 f"target venv {target} reports magic-hermes {installed!r} "
                 f"after installing the wheel; expected {version}"
             )
+
+    # Layered metadata (finding c7d63424): historical manual deploys left
+    # 0.3.24/0.3.32/0.3.34 dist-infos stacked in the probe venv, and pip's
+    # force-reinstall does not reliably remove other versions' metadata —
+    # importlib resolution then reads an ambiguous target. Prune every
+    # other magic_hermes dist-info on BOTH the fresh-install and the
+    # already-deployed skip path, before convergence and verification.
+    stale = prune_stale_dist_infos(target, version)
+    if stale:
+        print(f"pruned stale dist-infos from {target}: {', '.join(stale)}")
 
     console_script = target / "bin" / "magic-hermes"
     if not console_script.is_file():
