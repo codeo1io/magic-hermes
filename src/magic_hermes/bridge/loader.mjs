@@ -109,6 +109,27 @@ const FALLBACK_EXPORTS = [
 // module instead — names are only taken from chunks that actually export
 // them, so worker scripts and wasm glue that never export our names are
 // read but never imported.
+
+// Exported names of a bundled ES module chunk: every `export { ... }`
+// clause's list, each entry contributing its final (exported) name —
+// `a`, `a as b` -> b, `default as b` -> b. Upstream's bundler emits
+// these clauses across multiple lines, so scan the whole source.
+// 2026-11-01 (#114): 0.49.35 stopped importing the message-index
+// symbols into index.js, deferring them to their defining chunk which
+// exports them PLAINLY (no `as` alias); the old alias-only regex never
+// matched a plain export and the adapter failed to load wholesale.
+function exportedNames(chunkSource) {
+  const names = new Set();
+  for (const match of chunkSource.matchAll(/\bexport\s*\{([^}]*)\}/g)) {
+    for (const part of match[1].split(",")) {
+      const seg = part.split(/\s+as\s+/);
+      const name = (seg.length > 1 ? seg[seg.length - 1] : seg[0]).trim();
+      if (/^[A-Za-z_$][\w$]*$/.test(name)) names.add(name);
+    }
+  }
+  return names;
+}
+
 function splitModuleUrls(adapterUrl) {
   const baseUrl = new URL(".", adapterUrl);
   const adapterName = new URL(adapterUrl).pathname.split("/").pop();
@@ -291,10 +312,11 @@ export async function load(url, context, nextLoad) {
     for (const chunkUrl of splitModuleUrls(url)) {
       if (remaining.size === 0) break;
       const chunkSource = String((await nextLoad(chunkUrl, { format: "module" })).source ?? "");
-      const fromChunk = [...remaining].filter((name) => {
-        const re = new RegExp("\\b" + name + "\\b[^\\n;]*\\bas\\b[\\s\\S]{0,200}?[,}]|export\\s*\\{[^}]*\\bas\\s+" + name + "\\b");
-        return re.test(chunkSource);
-      });
+      // Match by the chunk's ACTUAL exported names (plain `name` entries
+      // included), not by an `as`-alias regex — 0.49.35 exports the
+      // message-index symbols from their defining chunk without aliases.
+      const chunkExports = exportedNames(chunkSource);
+      const fromChunk = [...remaining].filter((name) => chunkExports.has(name));
       if (fromChunk.length === 0) continue;
       const specifier = new URL(chunkUrl).pathname;
       suffix += "\nexport { " + fromChunk.map((name) => name + " as __mh_" + name).join(", ") + ' } from "' + specifier + '";\n';
