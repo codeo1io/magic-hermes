@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from unittest import mock
@@ -309,6 +310,149 @@ class TestInstallLease:
         assert payload["updated_at"] == 2000.0
 
 
+class TestInstallWatcher:
+    """Unit 3 (plan 2c06dd22, finding c7d63424) — `install` arms the
+    out-of-band healer best-effort: watcher-unit installation is
+    attempted after the config+lease wiring, warns and continues on
+    any failure (KTD 4: install warns where deploy fails loudly), and
+    is skipped entirely by --skip-config (same arming rule as the
+    lease). The watcher_units module is faked into sys.modules here so
+    the battery stays hermetic — no systemd, no real unit dir — and the
+    blocked-import case pins the same degradation for trees where the
+    module is genuinely absent (fold-split landing)."""
+
+    def _run_install(self, isolated_home, *, skip_config=False):
+        tested = cli.tested_magic_context_version()
+        # a current managed copy ⇒ plan "reuse" ⇒ no npm run needed
+        make_package(
+            isolated_home
+            / ".local"
+            / "share"
+            / "magic-hermes"
+            / "node_modules"
+            / "@cortexkit"
+            / "pi-magic-context",
+            tested,
+        )
+        sidecar = mock.MagicMock()
+        sidecar.call.return_value = {
+            "harness": "hermes",
+            "package_version": tested,
+        }
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+        with (
+            mock.patch.object(cli, "npm_latest_version", return_value=None),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+        ):
+            return cli.run_install(skip_config=skip_config)
+
+    def _fake_console(self, tmp_path, monkeypatch, *, with_script=True):
+        # deterministic console-script resolution: point sys.executable
+        # at a throwaway bin dir (with or without a `magic-hermes`
+        # beside the interpreter) instead of relying on the test venv's
+        # own layout
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "python").write_text("", encoding="utf-8")
+        if with_script:
+            (bin_dir / "magic-hermes").write_text("", encoding="utf-8")
+        monkeypatch.setattr(sys, "executable", str(bin_dir / "python"))
+        return bin_dir / "magic-hermes"
+
+    def test_install_attempts_watcher_install(
+        self, isolated_home, tmp_path, monkeypatch, capsys
+    ):
+        console = self._fake_console(tmp_path, monkeypatch)
+        fake_units = mock.MagicMock()
+        monkeypatch.setitem(
+            sys.modules, "magic_hermes.watcher_units", fake_units
+        )
+
+        rc = self._run_install(isolated_home)
+
+        assert rc == 0
+        fake_units.install_watcher_units.assert_called_once_with(console)
+        out = capsys.readouterr().out
+        assert "magic-hermes-converge.timer" in out
+        assert "install complete" in out
+
+    def test_watcher_failure_warns_but_completes(
+        self, isolated_home, tmp_path, monkeypatch, capsys
+    ):
+        self._fake_console(tmp_path, monkeypatch)
+        fake_units = mock.MagicMock()
+        fake_units.install_watcher_units.side_effect = RuntimeError(
+            "systemctl --user unavailable"
+        )
+        monkeypatch.setitem(
+            sys.modules, "magic_hermes.watcher_units", fake_units
+        )
+
+        rc = self._run_install(isolated_home)
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "install complete" in captured.out
+        assert "watcher not installed" in captured.err
+        assert "systemctl --user unavailable" in captured.err
+
+    def test_skip_config_skips_watcher(
+        self, isolated_home, tmp_path, monkeypatch, capsys
+    ):
+        self._fake_console(tmp_path, monkeypatch)
+        fake_units = mock.MagicMock()
+        monkeypatch.setitem(
+            sys.modules, "magic_hermes.watcher_units", fake_units
+        )
+
+        rc = self._run_install(isolated_home, skip_config=True)
+
+        assert rc == 0
+        fake_units.install_watcher_units.assert_not_called()
+        capsys.readouterr()
+
+    def test_absent_console_script_degrades_to_note(
+        self, isolated_home, tmp_path, monkeypatch, capsys
+    ):
+        self._fake_console(tmp_path, monkeypatch, with_script=False)
+        fake_units = mock.MagicMock()
+        monkeypatch.setitem(
+            sys.modules, "magic_hermes.watcher_units", fake_units
+        )
+
+        rc = self._run_install(isolated_home)
+
+        assert rc == 0
+        fake_units.install_watcher_units.assert_not_called()
+        out = capsys.readouterr().out
+        assert "no `magic-hermes` console script" in out
+        assert "install complete" in out
+
+    def test_missing_watcher_module_degrades_to_note(
+        self, isolated_home, tmp_path, monkeypatch, capsys
+    ):
+        # same note whether the module is genuinely absent (fold-split
+        # tree) or its import fails for another reason: install never
+        # breaks on the ancillary watcher step
+        self._fake_console(tmp_path, monkeypatch)
+        real_import = __import__
+
+        def blocked(name, *args, **kwargs):
+            if name == "magic_hermes.watcher_units":
+                raise ModuleNotFoundError(name)
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=blocked):
+            rc = self._run_install(isolated_home)
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "install complete" in captured.out
+        assert "watcher not installed" in captured.err
+
+
 class TestWire:
     """Unit 1 (plan 2026-11-01, run ef749c7e329e) — `wire` is the loud,
     network-free convergence verb: exactly `configure_hermes()` +
@@ -487,6 +631,165 @@ class TestWire:
         assert "provider: magic_context" in text
         out = capsys.readouterr().out
         assert "context.engine" in out
+
+
+class TestConverge:
+    """Unit 1 (plan 2c06dd22, finding c7d63424) — `converge` is the
+    out-of-band, fail-open convergence verb the watcher timer runs:
+    exactly one `wiring.converge()` pass — no rate limit (that is the
+    in-process recheck's concern), no lease recording (KTD 3: `wire` is
+    the arming act, the watcher never arms). rc 0 for every
+    disarmed/miss status; rc 1 only on a write failure (KTD 5)."""
+
+    # The live 2026-10-30 host-clobber shape (mirrors test_wiring.py):
+    # factory wiring on both keys while plugins.enabled keeps the
+    # plugin, plus a host comment and an unrelated key that must survive.
+    DRIFTED_CONFIG = (
+        "# hermes config (host-managed)\n"
+        "language: en\n"
+        "context:\n"
+        "  engine: compressor\n"
+        "memory:\n"
+        "  provider: null\n"
+        "plugins:\n"
+        "  enabled:\n"
+        "    - magic-hermes\n"
+    )
+
+    WIRED_CONFIG = (
+        "context:\n"
+        "  engine: magic-context\n"
+        "memory:\n"
+        "  provider: magic_context\n"
+        "plugins:\n"
+        "  enabled:\n"
+        "    - magic-hermes\n"
+    )
+
+    def _config(self):
+        return Path(cli.hermes_config_path())
+
+    def _seed_lease(self, isolated_home):
+        from magic_hermes import wiring
+
+        return wiring.write_lease()
+
+    def test_repairs_factory_clobber_under_lease(self, isolated_home, capsys):
+        pytest.importorskip("ruamel.yaml")
+        config = self._config()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(self.DRIFTED_CONFIG, encoding="utf-8")
+        self._seed_lease(isolated_home)
+
+        rc = cli.run_converge()
+
+        assert rc == 0
+        text = config.read_text(encoding="utf-8")
+        assert "engine: magic-context" in text
+        assert "provider: magic_context" in text
+        assert "- magic-hermes" in text
+        # one timestamped backup of the clobbered state was kept
+        backups = list(config.parent.glob("config.yaml.bak.*"))
+        assert len(backups) == 1
+        assert "engine: compressor" in backups[0].read_text(encoding="utf-8")
+        out = capsys.readouterr().out
+        assert "Hermes config repaired" in out
+        assert "context.engine, memory.provider" in out
+        assert "converge complete" in out
+
+    def test_already_wired_writes_nothing(self, isolated_home, capsys):
+        pytest.importorskip("ruamel.yaml")
+        config = self._config()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(self.WIRED_CONFIG, encoding="utf-8")
+        self._seed_lease(isolated_home)
+        before = config.read_bytes()
+
+        rc = cli.run_converge()
+
+        assert rc == 0
+        assert config.read_bytes() == before
+        assert list(config.parent.glob("config.yaml.bak.*")) == []
+        out = capsys.readouterr().out
+        assert "already wired" in out
+
+    def test_no_lease_disarmed_writes_nothing(self, isolated_home, capsys):
+        pytest.importorskip("ruamel.yaml")
+        config = self._config()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(self.DRIFTED_CONFIG, encoding="utf-8")
+        before = config.read_bytes()
+
+        rc = cli.run_converge()
+
+        assert rc == 0
+        assert config.read_bytes() == before
+        assert list(config.parent.glob("config.yaml.bak.*")) == []
+        out = capsys.readouterr().out
+        assert "disarmed" in out
+        assert str(cli.lease_path()) in out
+
+    def test_deliberate_override_never_written(self, isolated_home, capsys):
+        pytest.importorskip("ruamel.yaml")
+        config = self._config()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "context:\n  engine: sqlite-vec\nmemory:\n  provider: null\n",
+            encoding="utf-8",
+        )
+        self._seed_lease(isolated_home)
+        before = config.read_bytes()
+
+        rc = cli.run_converge()
+
+        assert rc == 0
+        assert config.read_bytes() == before
+        out = capsys.readouterr().out
+        assert "deliberate" in out
+
+    def test_missing_config_is_a_named_noop(self, isolated_home, capsys):
+        self._seed_lease(isolated_home)
+
+        rc = cli.run_converge()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "no Hermes config" in out
+        assert "converge complete" in out
+
+    def test_write_failure_exits_loud(self, isolated_home, capsys):
+        from magic_hermes import wiring
+
+        pytest.importorskip("ruamel.yaml")
+        config = self._config()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(self.DRIFTED_CONFIG, encoding="utf-8")
+        self._seed_lease(isolated_home)
+
+        with mock.patch.object(
+            wiring,
+            "configure_hermes",
+            side_effect=OSError(13, "Permission denied"),
+        ):
+            rc = cli.run_converge()
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "converge FAILED" in captured.err
+        assert "Permission denied" in captured.err
+        assert "converge complete" not in captured.out
+
+    def test_main_dispatches_the_converge_verb(self, isolated_home, capsys):
+        pytest.importorskip("ruamel.yaml")
+        config = self._config()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(self.DRIFTED_CONFIG, encoding="utf-8")
+        self._seed_lease(isolated_home)
+
+        assert cli.main(["converge"]) == 0
+
+        assert "engine: magic-context" in config.read_text(encoding="utf-8")
+        assert "converge complete" in capsys.readouterr().out
 
 
 class TestTextScanFallback:
