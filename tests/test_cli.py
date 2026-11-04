@@ -426,9 +426,11 @@ class TestInstallWatcher:
 
         assert rc == 0
         fake_units.install_watcher_units.assert_not_called()
-        out = capsys.readouterr().out
-        assert "no `magic-hermes` console script" in out
-        assert "install complete" in out
+        captured = capsys.readouterr()
+        # Review finding 15: the absent-console degrade is a WARNING —
+        # stderr, like its sibling exception degrade, not stdout.
+        assert "no `magic-hermes` console script" in captured.err
+        assert "install complete" in captured.out
 
     def test_missing_watcher_module_degrades_to_note(
         self, isolated_home, tmp_path, monkeypatch, capsys
@@ -674,8 +676,22 @@ class TestConverge:
 
         return wiring.write_lease()
 
+    @staticmethod
+    def _require_yaml_lib():
+        # Review finding 8: importorskip("ruamel.yaml") hollowed these
+        # tests on pyyaml-only environments (ruamel is a dev extra,
+        # dependencies=[]); wiring falls back to PyYAML, so EITHER
+        # library is sufficient to run them.
+        import importlib.util
+
+        if not any(
+            importlib.util.find_spec(name)
+            for name in ("ruamel.yaml", "yaml")
+        ):
+            pytest.skip("no YAML library (ruamel.yaml or PyYAML) available")
+
     def test_repairs_factory_clobber_under_lease(self, isolated_home, capsys):
-        pytest.importorskip("ruamel.yaml")
+        self._require_yaml_lib()
         config = self._config()
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(self.DRIFTED_CONFIG, encoding="utf-8")
@@ -698,7 +714,7 @@ class TestConverge:
         assert "converge complete" in out
 
     def test_already_wired_writes_nothing(self, isolated_home, capsys):
-        pytest.importorskip("ruamel.yaml")
+        self._require_yaml_lib()
         config = self._config()
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(self.WIRED_CONFIG, encoding="utf-8")
@@ -714,7 +730,7 @@ class TestConverge:
         assert "already wired" in out
 
     def test_no_lease_disarmed_writes_nothing(self, isolated_home, capsys):
-        pytest.importorskip("ruamel.yaml")
+        self._require_yaml_lib()
         config = self._config()
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(self.DRIFTED_CONFIG, encoding="utf-8")
@@ -730,7 +746,7 @@ class TestConverge:
         assert str(cli.lease_path()) in out
 
     def test_deliberate_override_never_written(self, isolated_home, capsys):
-        pytest.importorskip("ruamel.yaml")
+        self._require_yaml_lib()
         config = self._config()
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(
@@ -757,10 +773,53 @@ class TestConverge:
         assert "no Hermes config" in out
         assert "converge complete" in out
 
+    def test_missing_yaml_library_is_a_named_noop(
+        self, isolated_home, capsys
+    ):
+        """Review finding 7: the no-yaml-lib CLI branch — runs on EVERY
+        environment (no yaml library needed to reach it; the
+        sys.modules-None trick mirrors test_wiring.py's precedent)."""
+        config = self._config()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(self.DRIFTED_CONFIG, encoding="utf-8")
+        self._seed_lease(isolated_home)
+        before = config.read_bytes()
+
+        with mock.patch.dict(
+            sys.modules, {"ruamel.yaml": None, "yaml": None}
+        ):
+            rc = cli.run_converge()
+
+        assert rc == 0
+        assert config.read_bytes() == before
+        out = capsys.readouterr().out
+        assert "no YAML library importable" in out
+        assert "converge complete" in out
+
+    def test_unparseable_config_is_a_named_noop(
+        self, isolated_home, capsys
+    ):
+        """Review finding 7: the unparseable CLI branch (needs a yaml
+        library present so converge reaches the parse attempt)."""
+        self._require_yaml_lib()
+        config = self._config()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text("{ unclosed mapping\n", encoding="utf-8")
+        self._seed_lease(isolated_home)
+        before = config.read_bytes()
+
+        rc = cli.run_converge()
+
+        assert rc == 0
+        assert config.read_bytes() == before
+        out = capsys.readouterr().out
+        assert "unreadable" in out
+        assert "converge complete" in out
+
     def test_write_failure_exits_loud(self, isolated_home, capsys):
         from magic_hermes import wiring
 
-        pytest.importorskip("ruamel.yaml")
+        self._require_yaml_lib()
         config = self._config()
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(self.DRIFTED_CONFIG, encoding="utf-8")
@@ -779,8 +838,53 @@ class TestConverge:
         assert "Permission denied" in captured.err
         assert "converge complete" not in captured.out
 
+    def test_unexpected_converge_crash_is_contained_not_raised(
+        self, isolated_home, capsys
+    ):
+        """Review finding 5 (CLI belt): wiring.converge() contains every
+        NAMED miss status but can leak unexpected exceptions (e.g.
+        UnicodeDecodeError from a non-UTF-8 lease — a pre-existing
+        wiring.py gap outside this batch). The timer must never see a
+        traceback: rc 1, stderr detail, same shape as status error."""
+        self._seed_lease(isolated_home)
+
+        with mock.patch.object(
+            cli,
+            "converge",
+            side_effect=UnicodeDecodeError(
+                "utf-8", b"\xff", 0, 1, "invalid start byte"
+            ),
+        ):
+            rc = cli.run_converge()
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "converge FAILED" in captured.err
+        assert "UnicodeDecodeError" in captured.err
+        assert "converge complete" not in captured.out
+
+    def test_unknown_status_never_renders_as_a_bare_pass(
+        self, isolated_home, capsys
+    ):
+        """Review finding 6: statuses are a closed set from
+        ConvergeResult — an unknown one (defensive pin) must name
+        itself on stderr instead of a bare "converge complete"."""
+        import types
+
+        fake = types.SimpleNamespace(
+            status="hypothetical", detail="", changed=()
+        )
+        with mock.patch.object(cli, "converge", return_value=fake):
+            rc = cli.run_converge()
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "unknown converge status" in captured.err
+        assert "'hypothetical'" in captured.err
+        assert "converge complete" in captured.out
+
     def test_main_dispatches_the_converge_verb(self, isolated_home, capsys):
-        pytest.importorskip("ruamel.yaml")
+        self._require_yaml_lib()
         config = self._config()
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(self.DRIFTED_CONFIG, encoding="utf-8")

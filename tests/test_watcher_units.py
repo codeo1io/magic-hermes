@@ -65,7 +65,7 @@ class TestRenderService:
 
         text = render_service(console)
 
-        assert f"ExecStart={console.resolve()} converge" in text
+        assert f'ExecStart="{console.resolve()}" converge' in text
         assert "Type=oneshot" in text
 
     def test_relative_console_path_is_resolved_absolute(
@@ -78,8 +78,28 @@ class TestRenderService:
 
         text = render_service(Path("magic-hermes"))
 
-        assert "ExecStart=/" in text
-        assert f"ExecStart={tmp_path / 'magic-hermes'}" in text
+        assert 'ExecStart="/' in text
+        assert f'ExecStart="{tmp_path / "magic-hermes"}"' in text
+
+    def test_whitespace_and_percent_paths_are_quoted_and_escaped(
+        self, tmp_path
+    ):
+        """Review finding 2: a venv path with whitespace splits into
+        argv words and a ``%`` is rewritten as a systemd specifier —
+        both leave a loadable-but-dead unit. The path must be quoted
+        and ``%`` doubled (systemd.unit(5))."""
+        console = (
+            tmp_path / "venv with space" / "bin%20magic"
+        )
+        console.parent.mkdir(parents=True)
+        console.write_text("", encoding="utf-8")
+
+        text = render_service(console)
+
+        escaped = str(console.resolve()).replace("%", "%%")
+        assert f'ExecStart="{escaped}" converge' in text
+        # the raw single-% path must NOT appear unescaped
+        assert str(console.resolve()) not in text
 
     def test_service_converges_but_never_wires(self, tmp_path):
         """KTD 3 regression pin: the watcher is the healing actor, never
@@ -99,6 +119,7 @@ class TestRenderTimer:
         assert (
             f"OnBootSec={watcher_units.FIRST_CHECK_DELAY_S}s" in text
         )
+        assert "AccuracySec=1s" in text
         assert "WantedBy=timers.target" in text
 
     def test_timer_drives_the_converge_service_by_name(self):
@@ -122,7 +143,6 @@ class TestInstallWatcherUnits:
         console = make_console(tmp_path)
         runner = FakeRunner()
         unit_dir = tmp_path / "units"
-
         result = install_watcher_units(
             console, unit_dir=unit_dir, runner=runner
         )
@@ -134,14 +154,20 @@ class TestInstallWatcherUnits:
         assert stat.S_IMODE(result.service_path.stat().st_mode) == 0o644
         assert stat.S_IMODE(result.timer_path.stat().st_mode) == 0o644
         assert (
-            f"ExecStart={console.resolve()} converge"
+            f'ExecStart="{console.resolve()}" converge'
             in result.service_path.read_text(encoding="utf-8")
         )
+        # Review finding 1: enable --now starts the TIMER only — the
+        # explicit service START is the post-arm verification that a
+        # dead ExecStart (stale venv, missing verb) fails loudly here
+        # instead of silently every 60 s.
         assert runner.calls == [
             ("systemctl", "--user", "daemon-reload"),
             ("systemctl", "--user", "enable", "--now", CONVERGE_TIMER_UNIT),
+            ("systemctl", "--user", "start", CONVERGE_SERVICE_UNIT),
         ]
         assert result.commands == tuple(runner.calls)
+        assert result.console == console.resolve()
 
     def test_install_is_idempotent(self, tmp_path):
         """Re-install overwrites cleanly and re-runs enable — the
@@ -165,8 +191,14 @@ class TestInstallWatcherUnits:
         )
         enables = [c for c in runner.calls if "enable" in c]
         reloads = [c for c in runner.calls if "daemon-reload" in c]
+        starts = [
+            c
+            for c in runner.calls
+            if c[1:3] == ("--user", "start")
+        ]
         assert len(enables) == 2
         assert len(reloads) == 2
+        assert len(starts) == 2
 
     def test_install_rewrites_a_stale_console_path(self, tmp_path):
         """The unit file tracks the console path it was installed WITH —
@@ -186,14 +218,49 @@ class TestInstallWatcherUnits:
         service = (unit_dir / CONVERGE_SERVICE_UNIT).read_text(
             encoding="utf-8"
         )
-        assert f"ExecStart={new_console.resolve()} converge" in service
+        assert f'ExecStart="{new_console.resolve()}" converge' in service
         assert str(old_console.resolve()) not in service
 
-    def test_default_unit_dir_is_the_systemd_user_dir(self):
-        assert (
+    def test_default_unit_dir_follows_xdg_config_home(self, monkeypatch):
+        """Review finding 11: systemd reads user units from
+        ``$XDG_CONFIG_HOME/systemd/user`` when the variable is set —
+        hard-coding ``~/.config`` would land units where systemd never
+        reads them on relocated-config hosts (resolved at call time,
+        not import time)."""
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        assert watcher_units.default_unit_dir() == (
             Path.home() / ".config" / "systemd" / "user"
-            == watcher_units.USER_UNIT_DIR
         )
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", "/srv/xdg-config")
+        assert watcher_units.default_unit_dir() == (
+            Path("/srv/xdg-config") / "systemd" / "user"
+        )
+
+    def test_service_start_verification_failure_raises(self, tmp_path):
+        """Review finding 1 loud half: if the post-arm service start
+        fails (dead ExecStart — stale venv, build without ``converge``),
+        the module raises so deploy aborts and install warns."""
+        console = make_console(tmp_path)
+        runner = FakeRunner(
+            fail=lambda call: call[-1] == CONVERGE_SERVICE_UNIT
+            and "start" in call
+        )
+
+        with pytest.raises(RuntimeError, match="start"):
+            install_watcher_units(
+                console, unit_dir=tmp_path / "units", runner=runner
+            )
+
+        # enable already ran — the failure aborts at the verification,
+        # after the timer was armed.
+        assert (
+            "systemctl",
+            "--user",
+            "enable",
+            "--now",
+            CONVERGE_TIMER_UNIT,
+        ) in runner.calls
 
     def test_runner_failure_raises(self, tmp_path):
         """KTD 4 loud half: a failing runner command raises out of the
