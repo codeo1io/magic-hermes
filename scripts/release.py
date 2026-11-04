@@ -55,10 +55,21 @@ DEPLOY_SMOKE_ENV = "MAGIC_HERMES_DEPLOY_SMOKE"
 DEPLOY_NO_SMOKE_ENV = "MAGIC_HERMES_DEPLOY_NO_SMOKE"
 #: Documented escape from the deploy-lane watcher installation, for
 #: deploy targets without a systemd user session (CI containers,
-#: ephemeral venvs): the out-of-band convergence timer is not installed
+#: ephemeral venvs): the out-of-band convergence timer is not ARMED
 #: there. Convergence (``wire``) and the doctor smoke still run — only
-#: the watcher step is skipped (mirrors DEPLOY_NO_SMOKE_ENV).
+#: the watcher ARMING is skipped (mirrors DEPLOY_NO_SMOKE_ENV); the
+#: pre-uninstall timer QUIESCE still runs when a timer is actually
+#: enabled (7e69362a finding 9: the uninstall deletes the console
+#: script — leaving an armed timer firing at a deleted path all day is
+#: the 1440-failures-per-day loop, and the README contract "skips only
+#: the watcher installation" is what the code implements).
 DEPLOY_NO_WATCHER_ENV = "MAGIC_HERMES_DEPLOY_NO_WATCHER"
+#: Systemd user units the deploy lane quieces/arms/recovers. Duplicated
+#: from ``magic_hermes.watcher_units`` (kept in sync by tests) so the
+#: quiesce and abort-recovery paths stay usable on foreign interpreters
+#: where ``magic_hermes`` is not importable.
+CONVERGE_SERVICE_UNIT = "magic-hermes-converge.service"
+CONVERGE_TIMER_UNIT = "magic-hermes-converge.timer"
 
 
 class ReleaseError(RuntimeError):
@@ -393,6 +404,112 @@ def deployed_version(target: Path) -> str | None:
     return probe.stdout.strip() or None
 
 
+def _quiesce_converge_timer() -> bool:
+    """Disarm the convergence timer before the uninstall deletes its console.
+
+    Returns True only when this call actually changed timer state — the
+    timer WAS enabled and the disable succeeded — so an aborting deploy
+    knows it owes a restore attempt (7e69362a finding 3: the quiesce
+    used to be the last state change on every abort path, stranding the
+    healer silently disabled, and a disabled timer journals nothing).
+
+    Guarded by an ``is-enabled`` probe: a timer the OPERATOR deliberately
+    paused (the documented pause semantic) is left untouched, and a
+    probe failure (no systemd user session, no systemctl binary —
+    OSError, not just ReleaseError) falls through as a no-op instead of
+    crashing the deploy (7e69362a finding 7).
+    """
+    try:
+        state = run(
+            "systemctl",
+            "--user",
+            "is-enabled",
+            CONVERGE_TIMER_UNIT,
+            capture=True,
+        ).strip()
+    except (ReleaseError, OSError):
+        return False  # no systemd user manager to consult — nothing armed
+    if state != "enabled":
+        return False  # paused by the operator, or not installed — leave it
+    try:
+        run("systemctl", "--user", "disable", "--now", CONVERGE_TIMER_UNIT)
+    except (ReleaseError, OSError) as exc:
+        print(
+            f"note: timer quiesce before uninstall failed (continuing): {exc}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _armed_console_path(unit_dir: Path | None) -> Path | None:
+    """The console the on-disk service unit fires, for abort recovery.
+
+    Prefers ``watcher_units.armed_console_path`` (same resolution rules
+    as the arming itself, XDG-aware); a foreign driving interpreter that
+    cannot import ``magic_hermes`` falls back to an inline read of the
+    default unit dir.
+    """
+    if unit_dir is not None:
+        service = Path(unit_dir) / CONVERGE_SERVICE_UNIT
+    else:
+        try:
+            from magic_hermes.watcher_units import armed_console_path
+
+            return armed_console_path()
+        except ImportError:
+            xdg = os.environ.get("XDG_CONFIG_HOME")
+            base = (
+                Path(xdg).expanduser()
+                if xdg and Path(xdg).is_absolute()
+                else Path.home() / ".config"
+            )
+            service = base / "systemd" / "user" / CONVERGE_SERVICE_UNIT
+    try:
+        text = service.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r'^ExecStart="([^"]+)"\s+converge\s*$', text, re.MULTILINE)
+    return Path(match.group(1)) if match else None
+
+
+def _restore_quiesced_timer(unit_dir: Path | None) -> str:
+    """Un-strand the healer an aborted deploy disabled (finding 3).
+
+    Re-enables the timer ONLY when the on-disk unit fires a console that
+    still exists — re-enabling a unit whose ExecStart was just deleted
+    by the uninstall would arm the 203/EXEC failure loop this recovery
+    exists to prevent. Otherwise returns an explicit note: a disabled
+    timer journals nothing, so the abort message must say the healer is
+    down and how to bring it back.
+    """
+    console = _armed_console_path(unit_dir)
+    if console is None:
+        return (
+            "the convergence timer is left DISABLED (quiesced before the "
+            "uninstall) and no service unit is on disk to re-arm — re-run "
+            "the deploy (it re-arms on success) or arm it manually: "
+            f"systemctl --user enable --now {CONVERGE_TIMER_UNIT}"
+        )
+    if not console.exists():
+        return (
+            f"the convergence timer is left DISABLED (quiesced before the "
+            f"uninstall): its unit still points at {console}, which no "
+            "longer exists — re-enabling it would arm a dead ExecStart (a "
+            "failure loop every 60 s). Re-run the deploy (it rewrites the "
+            "unit and re-arms) or remove the stale units"
+        )
+    try:
+        run("systemctl", "--user", "enable", "--now", CONVERGE_TIMER_UNIT)
+    except (ReleaseError, OSError) as exc:
+        return (
+            f"re-arming the convergence timer failed ({exc}); it is left "
+            "DISABLED — re-run the deploy, or: systemctl --user enable "
+            f"--now {CONVERGE_TIMER_UNIT}"
+        )
+    return f"the convergence timer was re-armed (it fires {console})"
+
+
 def deploy_release(
     artifacts: list[Path],
     version: str,
@@ -406,18 +523,33 @@ def deploy_release(
     ``publish_release`` — the tag exists when bits land in the venv, and a
     deploy failure (install, wiring convergence, watcher installation, or
     doctor verification) aborts the release before the GitHub release
-    object is created. Install hygiene: a version-changing install
-    UNINSTALLS the old package first (stacked dist-info defense — the
-    v0.3.35 wheel arrived by ad-hoc pip over older installs and left three
-    stacked dist-info directories; the post-install version assert remains
-    the real gate). Idempotent: when the target already carries ``version``
-    the pip steps are skipped and convergence + watcher installation +
-    verification still run. The watcher step (systemd user timer running
-    ``converge``) is skipped under ``MAGIC_HERMES_DEPLOY_NO_WATCHER=1`` —
-    the documented escape for targets without a systemd user session;
-    the doctor smoke escape stays ``MAGIC_HERMES_DEPLOY_NO_SMOKE``. A
-    missing venv, missing pip, or a failed verification is a loud error,
-    never a skip.
+    object is created. Install hygiene: a version-changing install first
+    QUIESCES an actually-ENABLED convergence timer (probe-gated,
+    tolerated ``disable --now`` — the uninstall would otherwise delete
+    the console script the timer fires every 60 s; a timer the operator
+    deliberately paused is left untouched) and UNINSTALLS the old
+    package (stacked dist-info defense — the v0.3.35 wheel arrived by
+    ad-hoc pip over older installs and left three stacked dist-info
+    directories; the post-install version assert remains the real
+    gate). Any abort AFTER a successful quiesce restores the timer when
+    the on-disk unit still fires an existing console, or appends a loud
+    "left disabled + how to recover" note — a disabled timer journals
+    nothing (7e69362a finding 3). Idempotent: when
+    the target already carries ``version`` the pip steps are skipped and
+    convergence + watcher installation + verification still run. The
+    watcher step (systemd user timer running ``converge``) installs the
+    units AND verifies the service actually runs (an explicit ``start``
+    of the oneshot — a dead ExecStart fails the lane and the failed
+    arming is rolled back with a best-effort ``disable --now`` instead
+    of leaving an active-looking timer failing every 60 s); it arms
+    with ``takeover=True`` (the deploy owns the shared watcher slot and
+    re-verifies; a quiet ``install`` from any venv never steals it) and
+    is skipped under ``MAGIC_HERMES_DEPLOY_NO_WATCHER=1`` — the
+    documented escape for targets without a systemd user session, which
+    skips ONLY the watcher installation (the quiesce above still runs
+    when a timer is actually enabled); the doctor smoke escape
+    stays ``MAGIC_HERMES_DEPLOY_NO_SMOKE``. A missing venv, missing pip,
+    or a failed verification is a loud error, never a skip.
 
     ``unit_dir`` redirects the watcher unit-file destination (tests); the
     systemctl commands themselves always run through the ``run`` seam, so
@@ -436,87 +568,138 @@ def deploy_release(
         )
 
     installed = deployed_version(target)
-    if installed != version:
+    version_change = installed != version
+    timer_quiesced = False
+    if version_change:
         run(str(python), "-m", "pip", "--version")
-        # Dist-info hygiene (c7d63424 root cause 3): ``pip install
-        # --force-reinstall`` does not reliably remove a
-        # differently-versioned residue, and stacked dist-info dirs made
-        # the deployed version ambiguous twice already. Uninstall FIRST;
-        # the failure is tolerated (a target without the package, or a
-        # broken uninstall, falls through) because the post-install
-        # version assert below is the real gate.
-        try:
-            run(str(python), "-m", "pip", "uninstall", "-y", "magic-hermes")
-        except ReleaseError as exc:
-            print(
-                f"note: pre-install uninstall failed (continuing): {exc}",
-                file=sys.stderr,
-            )
-        run(
-            str(python),
-            "-m",
-            "pip",
-            "install",
-            "--force-reinstall",
-            "--no-deps",
-            str(wheel),
-        )
-        installed = deployed_version(target)
-        if installed != version:
-            raise ReleaseError(
-                f"target venv {target} reports magic-hermes {installed!r} "
-                f"after installing the wheel; expected {version}"
-            )
-
-    console_script = target / "bin" / "magic-hermes"
-    if not console_script.is_file():
-        raise ReleaseError(f"console script missing after deploy: {console_script}")
-
-    # Convergence (finding c7d63424daa3): the deployed code itself repairs
-    # the operational wiring (context.engine / memory.provider) and records
-    # the lease, so the probe venv cannot end up "new wheel, inert wiring".
-    # Loud on failure — the deploy lane is an explicit operator act, the
-    # opposite context of the gateway's fail-open converge(); a release
-    # that cannot wire the target must abort before publish, never pass
-    # silently. Quiet on success; the chained failure carries the output.
+        # Quiesce the armed timer before the uninstall below deletes the
+        # console script it fires every 60 s (review finding 4): without
+        # this, every version-changing deploy opens a transient
+        # 203/EXEC failure window, and a deploy aborting after a
+        # successful uninstall strands a ~1440-failures/day loop until
+        # the next successful deploy. Probe-gated and TOLERATED (a target
+        # without the timer — first deploy, operator-paused, no systemd
+        # user session, a missing systemctl binary — falls through); the
+        # watcher step below re-enables (--now) on success, and an
+        # ABORTING deploy restores-or-explains via
+        # _restore_quiesced_timer (7e69362a finding 3: the quiesce must
+        # never be the silently-last state change). NOT gated by the
+        # NO_WATCHER escape (7e69362a finding 9): that escape skips only
+        # the watcher INSTALLATION — the uninstall below still deletes
+        # the console script under any armed timer.
+        timer_quiesced = _quiesce_converge_timer()
     try:
-        run(str(console_script), "wire", capture=True)
-    except ReleaseError as exc:
-        raise ReleaseError(f"wiring convergence failed during deploy: {exc}") from exc
-
-    # Out-of-band healing (c7d63424): the deploy lane leaves the target
-    # SELF-HEALING — install and enable the systemd user timer that runs
-    # ``magic-hermes converge`` every minute (lease-gated, so a
-    # deliberately unwired host stays unwired; see watcher_units). Loud
-    # on failure — an operator deploy that cannot arm the watcher must
-    # abort before publish, never pass silently (the ``install`` verb's
-    # best-effort tail is the quiet counterpart of exactly this step).
-    # The import stays function-local: non-deploy invocations keep this
-    # module's stdlib-only import surface.
-    if not os.environ.get(DEPLOY_NO_WATCHER_ENV):
-        try:
-            from magic_hermes.watcher_units import install_watcher_units
-
-            install_watcher_units(
-                console_script, unit_dir=unit_dir, runner=run
+        if version_change:
+            # Dist-info hygiene (c7d63424 root cause 3): ``pip install
+            # --force-reinstall`` does not reliably remove a
+            # differently-versioned residue, and stacked dist-info dirs made
+            # the deployed version ambiguous twice already. Uninstall FIRST;
+            # the failure is tolerated (a target without the package, or a
+            # broken uninstall, falls through) because the post-install
+            # version assert below is the real gate.
+            try:
+                run(str(python), "-m", "pip", "uninstall", "-y", "magic-hermes")
+            except ReleaseError as exc:
+                print(
+                    f"note: pre-install uninstall failed (continuing): {exc}",
+                    file=sys.stderr,
+                )
+            run(
+                str(python),
+                "-m",
+                "pip",
+                "install",
+                "--force-reinstall",
+                "--no-deps",
+                str(wheel),
             )
-        except Exception as exc:
-            raise ReleaseError(
-                f"watcher installation failed during deploy: {exc}"
-            ) from exc
+            installed = deployed_version(target)
+            if installed != version:
+                raise ReleaseError(
+                    f"target venv {target} reports magic-hermes {installed!r} "
+                    f"after installing the wheel; expected {version}"
+                )
 
-    # Verification: run the same doctor maestro probes, default-on, and
-    # require a clean exit before the release may publish. The escape env
-    # is documented for foreign/throwaway targets only; it skips the
-    # verification, never the convergence above.
-    if not os.environ.get(DEPLOY_NO_SMOKE_ENV):
+        console_script = target / "bin" / "magic-hermes"
+        if not console_script.is_file():
+            raise ReleaseError(
+                f"console script missing after deploy: {console_script}"
+            )
+
+        # Convergence (finding c7d63424daa3): the deployed code itself repairs
+        # the operational wiring (context.engine / memory.provider) and records
+        # the lease, so the probe venv cannot end up "new wheel, inert wiring".
+        # Loud on failure — the deploy lane is an explicit operator act, the
+        # opposite context of the gateway's fail-open converge(); a release
+        # that cannot wire the target must abort before publish, never pass
+        # silently. Quiet on success; the chained failure carries the output.
         try:
-            run(str(console_script), "doctor", capture=True)
+            run(str(console_script), "wire", capture=True)
         except ReleaseError as exc:
             raise ReleaseError(
-                "deploy verification failed — doctor is not clean after "
-                f"deploy and wiring convergence: {exc}"
+                f"wiring convergence failed during deploy: {exc}"
             ) from exc
+
+        # Out-of-band healing (c7d63424): the deploy lane leaves the target
+        # SELF-HEALING — install and enable the systemd user timer that runs
+        # ``magic-hermes converge`` every minute (lease-gated, so a
+        # deliberately unwired host stays unwired; see watcher_units). Loud
+        # on failure — an operator deploy that cannot arm the watcher must
+        # abort before publish, never pass silently (the ``install`` verb's
+        # best-effort tail is the quiet counterpart of exactly this step).
+        # takeover=True: the deploy OWNS the shared watcher slot — it
+        # quiesced the previous arming above and re-verifies the new
+        # ExecStart with the post-arm service start, the exact contract
+        # watcher_units.WatcherConflictError demands of a re-point.
+        # The import stays function-local: non-deploy invocations keep this
+        # module's stdlib-only import surface.
+        if not os.environ.get(DEPLOY_NO_WATCHER_ENV):
+            try:
+                from magic_hermes.watcher_units import install_watcher_units
+            except ImportError as exc:
+                # Review finding 14: the watcher step implicitly requires the
+                # DRIVING interpreter to import magic_hermes — a foreign
+                # python would otherwise abort post-wire with a misattributed
+                # "watcher installation failed". Name the real cause.
+                raise ReleaseError(
+                    "watcher arming skipped: the driving interpreter cannot "
+                    f"import magic_hermes.watcher_units ({exc}) — run "
+                    "scripts/release.py from the repository venv, or set "
+                    f"{DEPLOY_NO_WATCHER_ENV}=1 for targets without a "
+                    "systemd user session"
+                ) from exc
+            try:
+                install_watcher_units(
+                    console_script, unit_dir=unit_dir, runner=run, takeover=True
+                )
+            except Exception as exc:
+                raise ReleaseError(
+                    f"watcher installation failed during deploy: {exc}"
+                ) from exc
+
+        # Verification: run the same doctor maestro probes, default-on, and
+        # require a clean exit before the release may publish. The escape env
+        # is documented for foreign/throwaway targets only; it skips the
+        # verification, never the convergence above.
+        if not os.environ.get(DEPLOY_NO_SMOKE_ENV):
+            try:
+                run(str(console_script), "doctor", capture=True)
+            except ReleaseError as exc:
+                raise ReleaseError(
+                    "deploy verification failed — doctor is not clean after "
+                    f"deploy and wiring convergence: {exc}"
+                ) from exc
+    except ReleaseError as exc:
+        if timer_quiesced:
+            # 7e69362a finding 3: every abort path after a successful
+            # quiesce must either restore the timer (safe: the on-disk
+            # unit fires a console that still exists) or say loudly that
+            # the healer is left disabled and how to recover — a
+            # disabled timer journals nothing.
+            raise ReleaseError(
+                f"{exc}\nnote: {_restore_quiesced_timer(unit_dir)}"
+            ) from exc
+        raise
 
 
 def redeploy_release(version: str, tag: str) -> None:
@@ -702,7 +885,8 @@ def main() -> int:
             "wiring through the deployed console script, and require a "
             "clean doctor exit (default "
             f"{DEFAULT_DEPLOY_VENV}; override target with {DEPLOY_VENV_ENV}, "
-            f"skip the doctor step with {DEPLOY_NO_SMOKE_ENV}=1)"
+            f"skip the doctor step with {DEPLOY_NO_SMOKE_ENV}=1, skip the "
+            f"watcher arming with {DEPLOY_NO_WATCHER_ENV}=1)"
         ),
     )
     args = parser.parse_args()

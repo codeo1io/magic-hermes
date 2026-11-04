@@ -42,7 +42,10 @@ import pytest
 
 import scripts.release as release
 from magic_hermes import watcher_units
-from magic_hermes.watcher_units import CONVERGE_TIMER_UNIT
+from magic_hermes.watcher_units import (
+    CONVERGE_SERVICE_UNIT,
+    CONVERGE_TIMER_UNIT,
+)
 
 WHEEL_NAME = "magic_hermes-0.3.4-py3-none-any.whl"
 VERSION = "0.3.4"
@@ -140,12 +143,15 @@ def _watcher_step_isolated(monkeypatch, tmp_path):
     runner is ``release.run`` — faked by every unit test — so systemctl
     never executes; this fixture clears the escape by default and pins
     the unit-file destination to ``tmp_path`` so even a default-unit_dir
-    install stays far from the operator's real
-    ``~/.config/systemd/user``.
+    install stays far from the operator's real user unit dir (resolved
+    by ``watcher_units.default_unit_dir()`` — the XDG-aware successor of
+    the old ``USER_UNIT_DIR`` constant).
     """
     monkeypatch.delenv("MAGIC_HERMES_DEPLOY_NO_WATCHER", raising=False)
     monkeypatch.setattr(
-        watcher_units, "USER_UNIT_DIR", tmp_path / "systemd-user"
+        watcher_units,
+        "default_unit_dir",
+        lambda: tmp_path / "systemd-user",
     )
 
 
@@ -287,7 +293,11 @@ class TestDeployRelease:
         watcher, and verifies — in that order."""
         target = make_target(tmp_path)
         artifacts = make_artifacts(tmp_path)
-        fake = FakeRun()
+        fake = FakeRun(
+            answers={
+                ("systemctl", "--user", "is-enabled", CONVERGE_TIMER_UNIT): "enabled"
+            }
+        )
         monkeypatch.setattr(release, "run", fake)
         monkeypatch.setattr(
             release, "deployed_version", FakeVersion([None, VERSION])
@@ -296,6 +306,14 @@ class TestDeployRelease:
         release.deploy_release(artifacts, VERSION, target)
 
         console = str(target / "bin" / "magic-hermes")
+        probe = ("systemctl", "--user", "is-enabled", CONVERGE_TIMER_UNIT)
+        disable = (
+            "systemctl",
+            "--user",
+            "disable",
+            "--now",
+            CONVERGE_TIMER_UNIT,
+        )
         uninstall = (
             str(target / "bin" / "python"),
             "-m",
@@ -321,12 +339,16 @@ class TestDeployRelease:
             "--now",
             CONVERGE_TIMER_UNIT,
         )
+        start_cmd = ("systemctl", "--user", "start", CONVERGE_SERVICE_UNIT)
         ordered = [
+            fake.calls.index(probe),
+            fake.calls.index(disable),
             fake.calls.index(uninstall),
             fake.calls.index(install),
             fake.calls.index((console, "wire")),
             fake.calls.index(reload_cmd),
             fake.calls.index(enable_cmd),
+            fake.calls.index(start_cmd),
             fake.calls.index((console, "doctor")),
         ]
         assert ordered == sorted(ordered)
@@ -373,7 +395,7 @@ class TestDeployRelease:
         assert timer.is_file()
         console = target / "bin" / "magic-hermes"
         assert (
-            f"ExecStart={console.resolve()} converge"
+            f'ExecStart="{console.resolve()}" converge'
             in service.read_text(encoding="utf-8")
         )
         enable_cmd = (
@@ -383,25 +405,42 @@ class TestDeployRelease:
             "--now",
             CONVERGE_TIMER_UNIT,
         )
+        # Review finding 1: the post-arm start of the service is the
+        # verification that the ExecStart actually runs — it fires after
+        # the timer is enabled, before the doctor smoke.
+        start_cmd = ("systemctl", "--user", "start", CONVERGE_SERVICE_UNIT)
         assert enable_cmd in fake.calls
+        assert start_cmd in fake.calls
         console_s = str(console)
         assert (
             fake.calls.index((console_s, "wire")) < fake.calls.index(enable_cmd)
         )
         assert (
-            fake.calls.index(enable_cmd) < fake.calls.index((console_s, "doctor"))
+            fake.calls.index(enable_cmd) < fake.calls.index(start_cmd)
+        )
+        assert (
+            fake.calls.index(start_cmd) < fake.calls.index((console_s, "doctor"))
         )
 
-    def test_no_watcher_escape_skips_systemctl_but_not_doctor(
+    def test_no_watcher_escape_skips_arming_but_quiesces(
         self, tmp_path, monkeypatch
     ):
         """MAGIC_HERMES_DEPLOY_NO_WATCHER=1 is the documented escape for
-        deploy targets without a systemd user session — it skips ONLY the
-        watcher step; wire and the doctor smoke still run."""
+        deploy targets without a systemd user session — it skips ONLY
+        the watcher ARMING. The pre-uninstall QUIESCE still runs when a
+        timer is actually enabled (7e69362a finding 9: the uninstall
+        deletes the console script under an armed timer either way —
+        the README contract "skips only the watcher installation" is
+        what the code implements); wire and the doctor smoke still run.
+        """
         target = make_target(tmp_path)
         artifacts = make_artifacts(tmp_path)
         monkeypatch.setenv("MAGIC_HERMES_DEPLOY_NO_WATCHER", "1")
-        fake = FakeRun()
+        fake = FakeRun(
+            answers={
+                ("systemctl", "--user", "is-enabled", CONVERGE_TIMER_UNIT): "enabled"
+            }
+        )
         monkeypatch.setattr(release, "run", fake)
         monkeypatch.setattr(
             release, "deployed_version", FakeVersion([None, VERSION])
@@ -409,10 +448,168 @@ class TestDeployRelease:
 
         release.deploy_release(artifacts, VERSION, target)
 
-        assert fake.systemctl_calls() == []
+        systemctl = fake.systemctl_calls()
+        assert (
+            "systemctl",
+            "--user",
+            "is-enabled",
+            CONVERGE_TIMER_UNIT,
+        ) in systemctl
+        assert (
+            "systemctl",
+            "--user",
+            "disable",
+            "--now",
+            CONVERGE_TIMER_UNIT,
+        ) in systemctl
+        # the ARMING is what the escape skips — no enable, no service start
+        assert not any("enable" in call for call in systemctl)
+        assert not any(
+            "start" in call and CONVERGE_SERVICE_UNIT in call
+            for call in systemctl
+        )
         console = str(target / "bin" / "magic-hermes")
         assert fake.wire_calls() == [(console, "wire")]
         assert fake.doctor_calls() == [(console, "doctor")]
+
+    def test_operator_paused_timer_is_never_quiesced_or_re_enabled(
+        self, tmp_path, monkeypatch
+    ):
+        """The quiesce is probe-gated: a timer the OPERATOR deliberately
+        paused (the documented pause semantic) stays untouched — no
+        disable, and nothing to restore on abort."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        fake = FakeRun(
+            answers={
+                ("systemctl", "--user", "is-enabled", CONVERGE_TIMER_UNIT): "disabled"
+            },
+            fail=lambda key: "doctor" in key,
+        )
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+
+        with pytest.raises(
+            release.ReleaseError, match="deploy verification"
+        ) as excinfo:
+            release.deploy_release(artifacts, VERSION, target)
+
+        systemctl = fake.systemctl_calls()
+        assert not any("disable" in call for call in systemctl)
+        # the watcher ARMING still ran (only the quiesce was probe-gated)
+        assert any("enable" in call for call in systemctl)
+        # nothing was quiesced, so the abort owes no stranded-timer note
+        assert "DISABLED" not in str(excinfo.value)
+
+    def test_aborted_deploy_after_quiesce_re_arms_the_timer(
+        self, tmp_path, monkeypatch
+    ):
+        """7e69362a finding 3: an abort AFTER a successful quiesce must
+        not strand the healer silently disabled. Here the deploy arms
+        the new watcher (units point at the freshly deployed console)
+        and then the doctor smoke fails — the recovery re-enables the
+        timer the deploy itself disabled."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        fake = FakeRun(
+            answers={
+                ("systemctl", "--user", "is-enabled", CONVERGE_TIMER_UNIT): "enabled"
+            },
+            fail=lambda key: "doctor" in key,
+        )
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+        unit_dir = tmp_path / "units"
+
+        with pytest.raises(release.ReleaseError) as excinfo:
+            release.deploy_release(artifacts, VERSION, target, unit_dir=unit_dir)
+
+        assert "deploy verification failed" in str(excinfo.value)
+        assert "re-armed" in str(excinfo.value)
+        enables = [
+            call
+            for call in fake.systemctl_calls()
+            if "enable" in call
+        ]
+        # one from the arming step, one from the abort recovery
+        assert len(enables) == 2
+
+    def test_aborted_deploy_with_dead_execstart_notes_instead_of_rearming(
+        self, tmp_path, monkeypatch
+    ):
+        """7e69362a finding 3, dead half: when the abort happens BEFORE
+        the watcher step (version assert here) and the on-disk unit
+        still points at the just-uninstalled venv, re-enabling would
+        arm a 203/EXEC loop — the abort message must instead SAY the
+        healer is left disabled and why."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        fake = FakeRun(
+            answers={
+                ("systemctl", "--user", "is-enabled", CONVERGE_TIMER_UNIT): "enabled"
+            }
+        )
+        monkeypatch.setattr(release, "run", fake)
+        # post-install version assert fails: None -> install -> "wrong"
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, "0.0.0-wrong"])
+        )
+        unit_dir = tmp_path / "units"
+        unit_dir.mkdir()
+        dead_console = tmp_path / "old-venv" / "bin" / "magic-hermes"
+        (unit_dir / CONVERGE_SERVICE_UNIT).write_text(
+            f'[Service]\nExecStart="{dead_console}" converge\n',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(release.ReleaseError) as excinfo:
+            release.deploy_release(artifacts, VERSION, target, unit_dir=unit_dir)
+
+        message = str(excinfo.value)
+        assert "expected" in message  # the version assert is the abort cause
+        assert "left DISABLED" in message
+        assert "no longer exists" in message
+        # the loop-arm is NOT issued
+        assert not any(
+            "enable" in call for call in fake.systemctl_calls()
+        )
+
+    def test_missing_systemctl_binary_is_tolerated(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """7e69362a finding 7: a target without a systemctl BINARY raises
+        FileNotFoundError (an OSError), not ReleaseError — the quiesce
+        probe must tolerate both, or the deploy crashes instead of the
+        documented tolerated fall-through. The arming step still fails
+        loudly without the NO_WATCHER escape (KTD 4), so this target
+        takes the escape — exactly the documented shape for hosts
+        without systemd."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        monkeypatch.setenv("MAGIC_HERMES_DEPLOY_NO_WATCHER", "1")
+
+        class SystemctlMissing(FakeRun):
+            def __call__(self, *args, capture: bool = False, env=None) -> str:
+                if args[:1] == ("systemctl",):
+                    raise FileNotFoundError(2, "No such file or directory: systemctl")
+                return super().__call__(*args, capture=capture, env=env)
+
+        fake = SystemctlMissing()
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+
+        release.deploy_release(artifacts, VERSION, target)
+
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.wire_calls() == [(console, "wire")]  # lane completed
+        assert fake.doctor_calls() == [(console, "doctor")]
+        _ = capsys
 
     def test_watcher_failure_aborts_before_doctor(self, tmp_path, monkeypatch):
         """Loud-half contract (KTD 4): a watcher step that cannot install
@@ -428,6 +625,62 @@ class TestDeployRelease:
 
         with pytest.raises(
             release.ReleaseError, match="watcher installation failed"
+        ):
+            release.deploy_release(artifacts, VERSION, target)
+
+        assert fake.doctor_calls() == []
+
+    def test_quiesce_failure_before_uninstall_is_tolerated(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Review finding 4: the pre-uninstall timer quiesce is
+        best-effort — a target whose systemctl fails (or has no systemd
+        user session) still deploys; the post-install version assert is
+        the real gate."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+
+        def quiesce_fails(key):
+            return "disable" in key
+
+        fake = FakeRun(
+            answers={
+                ("systemctl", "--user", "is-enabled", CONVERGE_TIMER_UNIT): "enabled"
+            },
+            fail=quiesce_fails,
+        )
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+
+        release.deploy_release(artifacts, VERSION, target)
+
+        assert any("disable" in call for call in fake.calls)  # attempted
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.doctor_calls() == [(console, "doctor")]  # lane done
+        assert "quiesce" in capsys.readouterr().err
+
+    def test_foreign_interpreter_cannot_import_watcher_module_loudly(
+        self, tmp_path, monkeypatch
+    ):
+        """Review finding 14: the watcher step needs magic_hermes
+        importable by the DRIVING interpreter — a foreign python gets a
+        precise, attributable error (not a misattributed "watcher
+        installation failed")."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        fake = FakeRun()
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+        monkeypatch.setitem(
+            sys.modules, "magic_hermes.watcher_units", None
+        )
+
+        with pytest.raises(
+            release.ReleaseError, match="driving interpreter"
         ):
             release.deploy_release(artifacts, VERSION, target)
 
@@ -509,7 +762,13 @@ maestro executes — or the release aborts."""
 
         assert fake.wire_calls()  # convergence was attempted ...
         assert fake.doctor_calls() == []  # ... and verification never ran
-        assert fake.systemctl_calls() == []  # watcher never armed either
+        # watcher never ARMED either: the only systemctl command is the
+        # tolerated pre-uninstall quiesce PROBE (which found no enabled
+        # timer here, so not even a disable was issued) — no
+        # daemon-reload, no enable, no post-arm start.
+        assert fake.systemctl_calls() == [
+            ("systemctl", "--user", "is-enabled", CONVERGE_TIMER_UNIT)
+        ]
 
 
 class TestMainDeployWiring:
@@ -844,6 +1103,11 @@ def test_deploy_release_into_throwaway_venv(tmp_path, monkeypatch):
     monkeypatch.setenv("MAGIC_HERMES_DEPLOY_NO_SMOKE", "1")
     monkeypatch.setenv("MAGIC_HERMES_DEPLOY_NO_WATCHER", "1")
     monkeypatch.delenv("MAGIC_HERMES_DEPLOY_SMOKE", raising=False)
+    # 7e69362a findings 3/9: the quiesce probe now runs even under
+    # NO_WATCHER — isolate the systemd unit search path so the probe
+    # resolves nothing on the host and the test can never disable a
+    # REAL armed timer.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     # Isolated Hermes home + data root: the wire step must write config and
     # lease HERE, never in the operator's real home (R6 swim-lane rule).
     hermes_home = tmp_path / "hermes-home"

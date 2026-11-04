@@ -7,6 +7,10 @@ reports installation health in the style of the upstream
 `@cortexkit/magic-context doctor`. `magic-hermes wire` converges the
 Hermes config wiring and records the intent lease — network-free,
 idempotent, and fail-loud (non-zero exit on any failure).
+`magic-hermes converge` runs one lease-gated convergence pass — the
+fail-open, network-free actor the systemd watcher timer fires
+(non-zero exit on any failure: write failure, unexpected crash, or
+unknown status).
 """
 
 from __future__ import annotations
@@ -1460,21 +1464,40 @@ def run_install(
         # adds out-of-band coverage. `--skip-config` never reaches this
         # block, so it arms nothing (same rule as the lease).
         try:
-            from magic_hermes.watcher_units import install_watcher_units
+            from magic_hermes.watcher_units import (
+                WatcherConflictError,
+                install_watcher_units,
+            )
 
             console = Path(sys.executable).with_name("magic-hermes")
-            if console.is_file():
-                install_watcher_units(console)
-                print(
-                    "│  out-of-band watcher installed: "
-                    "magic-hermes-converge.timer"
-                )
-            else:
+            if not console.is_file():
                 print(
                     "│  watcher not installed: no `magic-hermes` console "
                     f"script beside {sys.executable} — re-run install from "
-                    "the target venv to arm it"
+                    "the target venv to arm it",
+                    file=sys.stderr,
                 )
+            else:
+                try:
+                    armed = install_watcher_units(console)
+                except WatcherConflictError as exc:
+                    # 7e69362a P1#2: the user units are ONE shared,
+                    # last-writer-wins slot — a quiet install must never
+                    # steal a watcher armed at another LIVE venv (an
+                    # ephemeral worktree venv re-pointing the host's
+                    # healer at a path that dies at cleanup is exactly
+                    # the c7d63424 recurrence shape). The existing arming
+                    # is left untouched; a deploy owns re-pointing.
+                    print(
+                        f"│  NOTE: out-of-band watcher left alone: {exc}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "│  out-of-band watcher installed: "
+                        "magic-hermes-converge.timer "
+                        f"(armed console: {armed.console})"
+                    )
         except Exception as exc:  # ancillary, never fatal (warn-only)
             print(
                 f"│  NOTE: out-of-band watcher not installed: {exc}",
@@ -1551,13 +1574,31 @@ def run_converge() -> int:
     plan U5 of 2026-10-31), no npm planning, no sidecar boot, no lease
     recording (``wire`` is the arming act — KTD 3: the watcher converges
     under the lease, never arms it). Fail-open like the engine: every
-    disarmed or miss status is a named rc-0 outcome; only a write
-    failure (status ``error``) exits 1, so the timer's journal shows
+    disarmed or miss status is a named rc-0 outcome; a write failure
+    (status ``error``), an unexpected crash (the containment belt
+    below), or an unknown status exits 1, so the timer's journal shows
     real failures without pager noise (KTD 5).
     """
 
     print("┌  magic-hermes converge")
-    result = converge()
+    try:
+        result = converge()
+    except Exception as exc:  # containment belt (review finding 5)
+        # wiring.converge() contains every NAMED miss status, but leaks
+        # outside its own contract exist (e.g. UnicodeDecodeError from a
+        # non-UTF-8 lease file — read_lease excepts only OSError/
+        # JSONDecodeError, a pre-existing wiring.py gap out of this
+        # batch's surfaces). The timer must never see a traceback: an
+        # unexpected crash is an error outcome, same rc-1 + stderr shape
+        # as status ``error``.
+        print(f"└  converge FAILED: unexpected {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        print(
+            "│  the config on disk is unchanged — fix the cause and re-run "
+            "`magic-hermes converge`",
+            file=sys.stderr,
+        )
+        return 1
     if result.status == "error":
         print(f"└  converge FAILED: {result.detail}", file=sys.stderr)
         print(
@@ -1592,6 +1633,22 @@ def run_converge() -> int:
             "│  deliberate override values present — no write (convergence "
             "never overrides operator choices)"
         )
+    else:  # defensive honesty (review finding 6): statuses are a closed
+        # set from ConvergeResult — an unknown one is a programming
+        # error and must NOT render as a clean pass: no "converge
+        # complete" on stdout (a single-channel consumer would read a
+        # failure as success), stderr warning, rc 1 (7e69362a finding
+        # 10 — same non-zero shape as the containment belt above).
+        print(
+            f"│  WARNING: unknown converge status {result.status!r} — "
+            "no action taken",
+            file=sys.stderr,
+        )
+        print(
+            "└  converge FAILED: unknown status — no action taken",
+            file=sys.stderr,
+        )
+        return 1
     print("└  converge complete")
     return 0
 
@@ -1634,7 +1691,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "converge",
         help="one lease-gated wiring convergence pass (network-free, "
-        "fail-open; non-zero exit only on a write failure)",
+        "fail-open; non-zero exit on any failure)",
     )
 
     doctor = sub.add_parser("doctor", help="check installation health")

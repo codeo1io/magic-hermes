@@ -24,6 +24,12 @@ Design pins (plans 2c06dd22 / a39e438e / e1d24534):
   sole intent gate, so a deliberately unwired host (lease deleted) is
   never re-wired by the watcher. Disabling the timer pauses out-of-band
   healing; deleting the lease is the full convergence opt-out.
+- ONE shared slot (7e69362a P1): the systemd user units are a single
+  host-wide last-writer-wins slot. ``install`` must never steal a
+  watcher armed at another LIVE venv — the conflict guard raises
+  ``WatcherConflictError`` unless the armed console is the same one or
+  has died; only a caller that owns the slot (the deploy lane, which
+  quiesces and re-verifies) passes ``takeover=True``.
 
 The module is deliberately stdlib-only and renders the unit TEXTS in code
 (single source of truth — no shipped template files to drift, KTD 6).
@@ -39,6 +45,9 @@ Ref: maestro finding c7d63424daa3 (phase2.magic-context.operational).
 
 from __future__ import annotations
 
+import contextlib
+import os
+import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -55,8 +64,30 @@ RECHECK_INTERVAL_S = 60
 #: First check after boot — early enough to catch a boot-time clobber,
 #: late enough not to race unit activation on a cold user session.
 FIRST_CHECK_DELAY_S = 45
-#: Default destination for the rendered unit files (systemd user units).
-USER_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
+
+
+def default_unit_dir() -> Path:
+    """Where systemd user units are read from on this host.
+
+    Resolved at CALL time (not import time) and honors
+    ``$XDG_CONFIG_HOME`` (systemd.user(5): user units load from
+    ``$XDG_CONFIG_HOME/systemd/user`` when the variable is set, else
+    ``~/.config/systemd/user``) — on hosts that relocate the config
+    home, hard-coding ``~/.config`` would land units where systemd
+    never reads them while ``daemon-reload`` still exits 0 (review
+    finding 11: silently dead watcher). A RELATIVE ``$XDG_CONFIG_HOME``
+    is invalid per the XDG Base Directory spec ("as if unset") and is
+    ignored the same way — systemd would never read a relative unit
+    dir, so honoring it would arm a silently dead watcher (7e69362a
+    finding 8).
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = (
+        Path(xdg).expanduser()
+        if xdg and Path(xdg).is_absolute()
+        else Path.home() / ".config"
+    )
+    return base / "systemd" / "user"
 
 #: Injectable command runner. Mirrors ``scripts.release.run``'s contract:
 #: positional argv, raises on failure. Callers may pass capture/env
@@ -64,14 +95,40 @@ USER_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 Runner = Callable[..., object]
 
 
+def _escape_execstart_argument(path: str) -> str:
+    """Escape a path for one double-quoted ``ExecStart`` argv word.
+
+    systemd.service(5) command-line syntax: inside a quoted word,
+    backslash and double quote must be backslash-escaped (a raw ``"``
+    would close the word early and hand systemd a split argv), ``$``
+    doubled (``$$`` is the literal — a raw ``$`` expands as a variable
+    reference), ``%`` doubled (systemd.unit(5) specifier syntax).
+    Backslash is escaped FIRST so the backslashes introduced here and
+    by the quote escape stay single (7e69362a finding 6).
+    """
+    return (
+        path.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "$$")
+        .replace("%", "%%")
+    )
+
+
 def render_service(console_path: Path) -> str:
     """Render the oneshot service running one ``converge`` pass.
 
     ``ExecStart`` requires an ABSOLUTE path (systemd rejects relative
     paths), so the console script is resolved before embedding — callers
-    may hand over a relative or symlinked path.
+    may hand over a relative or symlinked path. The path is QUOTED and
+    escaped (``\\`` ``"`` ``$`` ``%`` — systemd.unit(5)/systemd.service(5)
+    syntax): an unquoted venv path containing whitespace would split
+    into multiple argv words, a ``%`` would be silently rewritten as a
+    specifier, and a ``$`` would be expanded as a variable — all leave
+    a loadable-but-dead unit whose ``enable`` stays green (review
+    finding 2: healing silently absent).
     """
     executable = Path(console_path).resolve()
+    escaped = _escape_execstart_argument(str(executable))
     return (
         "[Unit]\n"
         "Description=Magic-Hermes lease-gated wiring convergence"
@@ -79,7 +136,7 @@ def render_service(console_path: Path) -> str:
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
-        f"ExecStart={executable} converge\n"
+        f'ExecStart="{escaped}" converge\n'
     )
 
 
@@ -92,6 +149,7 @@ def render_timer() -> str:
         "[Timer]\n"
         f"OnBootSec={FIRST_CHECK_DELAY_S}s\n"
         f"OnUnitActiveSec={RECHECK_INTERVAL_S}s\n"
+        "AccuracySec=1s\n"
         f"Unit={CONVERGE_SERVICE_UNIT}\n"
         "\n"
         "[Install]\n"
@@ -106,6 +164,58 @@ class WatcherInstall:
     service_path: Path
     timer_path: Path
     commands: tuple[tuple[str, ...], ...]
+    #: The console script the rendered service executes — carried so
+    #: callers can print WHICH venv was armed (review finding 1:
+    #: armed-venv visibility on the shared, last-writer-wins unit).
+    console: Path
+
+
+_EXECSTART_RE = re.compile(r'^ExecStart="([^"]+)"\s+converge\s*$', re.MULTILINE)
+
+
+def armed_console_path(unit_dir: Path | None = None) -> Path | None:
+    """The console the INSTALLED service unit currently fires, if any.
+
+    Reads the on-disk service unit (``unit_dir``, or the resolved
+    default unit dir) and extracts the quoted ``ExecStart`` path.
+    Returns ``None`` when the unit is absent or does not match the shape
+    this module renders — a foreign or malformed unit is never treated
+    as a conflict, because overwriting it is a repair (7e69362a P1#2:
+    the conflict guard needs to know WHO is armed, and only a unit we
+    can attribute counts).
+    """
+    destination = Path(unit_dir) if unit_dir is not None else default_unit_dir()
+    try:
+        text = (destination / CONVERGE_SERVICE_UNIT).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = _EXECSTART_RE.search(text)
+    return Path(match.group(1)) if match else None
+
+
+class WatcherConflictError(RuntimeError):
+    """Install refused: a DIFFERENT, still-live console is already armed.
+
+    The systemd user units are ONE shared slot (last-writer-wins): an
+    unconditional overwrite from any venv re-points the host's only
+    healer at whatever venv happened to run ``install`` — live-
+    demonstrated 2026-11-04, the host's timer pointed at an ephemeral
+    conductor worktree ``.venv`` that dies at cleanup, which is exactly
+    the c7d63424 recurrence shape. Callers that OWN the slot pass
+    ``takeover=True`` (the deploy lane: it quiesces the timer first and
+    re-verifies the new ``ExecStart`` with a service start).
+    """
+
+    def __init__(self, existing_console: Path, requested_console: Path) -> None:
+        self.existing_console = existing_console
+        self.requested_console = requested_console
+        super().__init__(
+            f"the converge watcher is already armed at {existing_console} "
+            f"(still present) — refusing to re-point it at "
+            f"{requested_console}; a deploy owns the re-point (it "
+            "re-verifies), or disable the timer first: systemctl --user "
+            f"disable --now {CONVERGE_TIMER_UNIT}"
+        )
 
 
 def _default_runner(*args: str, capture: bool = False, env=None) -> object:
@@ -126,40 +236,99 @@ def _default_runner(*args: str, capture: bool = False, env=None) -> object:
     return completed
 
 
+def _best_effort_disable(runner: Runner) -> None:
+    """Rollback for a failed arming: disarm the timer we enabled.
+
+    A failure after ``enable --now`` means the armed ``ExecStart`` is
+    unverified or dead — an ENABLED timer on a dead console is green
+    enable state failing every 60 s, the exact failure class the
+    post-arm verification exists to prevent (7e69362a finding 5:
+    enable-before-verify with no rollback). Failures of the rollback
+    itself are swallowed — the ORIGINAL exception is the signal the
+    caller needs.
+    """
+    with contextlib.suppress(Exception):
+        runner("systemctl", "--user", "disable", "--now", CONVERGE_TIMER_UNIT)
+
+
 def install_watcher_units(
     console_path: Path,
     unit_dir: Path | None = None,
     runner: Runner = _default_runner,
+    takeover: bool = False,
 ) -> WatcherInstall:
-    """Write, reload, and enable the convergence timer — idempotent.
+    """Write, reload, enable, and VERIFY the convergence timer.
 
     Writes both unit files (mode 0o644) into ``unit_dir`` (default
-    ``USER_UNIT_DIR``), then issues ``systemctl --user daemon-reload`` and
-    ``systemctl --user enable --now`` for the timer through ``runner``.
-    Overwrite + re-enable is safe by design: re-running any deploy
-    rewrites the units with the CURRENT console-script path, so a venv
-    that moved since the last deploy heals on the next one. Raises
-    whatever the runner raises on failure — callers translate (the
-    ``install`` verb warns and continues; the deploy lane aborts loudly).
+    ``default_unit_dir()``), then issues ``systemctl --user
+    daemon-reload``, ``systemctl --user enable --now`` for the timer, and
+    — the post-arm verification (review finding 1) — ``systemctl --user
+    start`` for the SERVICE through ``runner``. ``enable --now`` starts
+    the TIMER, but systemd never executes the service at arm time, so a
+    stale/removed venv or a build without the ``converge`` verb would
+    leave an active-looking timer failing every 60 s and passing the
+    deploy lane silently (live-demonstrated on this host 2026-11-04:
+    a unit rewritten to a venv whose magic-hermes lacked ``converge``
+    failed with ``invalid choice`` while ``enable`` stayed green). The
+    explicit ``start`` runs one converge pass NOW: the oneshot either
+    completes rc 0 or the start job fails and the runner raises —
+    deploy aborts loudly, ``install`` prints its warn-only note. As a
+    bonus the pass fires an immediate heal instead of waiting for the
+    first timer tick. A failure AT ``enable`` or the verification
+    ``start`` first disarms the timer again (``_best_effort_disable``)
+    so no enabled timer is left on an unverified ``ExecStart``.
+
+    Shared-slot conflict guard (7e69362a P1#2): with the default
+    ``takeover=False`` the install is REFUSED — ``WatcherConflictError``
+    — when the on-disk service unit already fires a DIFFERENT console
+    that still EXISTS: the units are one host-wide last-writer-wins
+    slot, and an unconditional overwrite lets any ephemeral venv steal
+    the host's only healer and strand it at a path that dies at cleanup.
+    Re-arming the SAME console stays allowed (idempotent), and a unit
+    pointing at a console that no longer exists is repaired, not
+    protected (a dead ``ExecStart`` is never worth preserving).
+    ``takeover=True`` (deploy lane: it quiesces the timer and
+    re-verifies the new ``ExecStart``) keeps the unconditional
+    overwrite-and-re-enable behavior. Raises whatever the runner raises
+    on failure — callers translate (the ``install`` verb warns and
+    continues; the deploy lane aborts loudly).
     """
-    destination = Path(unit_dir) if unit_dir is not None else USER_UNIT_DIR
+    console = Path(console_path).resolve()
+    destination = Path(unit_dir) if unit_dir is not None else default_unit_dir()
+    if not takeover:
+        existing = armed_console_path(destination)
+        if (
+            existing is not None
+            and existing != console
+            and existing.exists()
+        ):
+            raise WatcherConflictError(existing, console)
     destination.mkdir(parents=True, exist_ok=True)
     service_path = destination / CONVERGE_SERVICE_UNIT
     timer_path = destination / CONVERGE_TIMER_UNIT
-    service_path.write_text(
-        render_service(console_path), encoding="utf-8"
-    )
+    service_path.write_text(render_service(console), encoding="utf-8")
     timer_path.write_text(render_timer(), encoding="utf-8")
     for unit in (service_path, timer_path):
         unit.chmod(0o644)
     commands = (
         ("systemctl", "--user", "daemon-reload"),
         ("systemctl", "--user", "enable", "--now", CONVERGE_TIMER_UNIT),
+        ("systemctl", "--user", "start", CONVERGE_SERVICE_UNIT),
     )
-    for command in commands:
-        runner(*command)
+    runner(*commands[0])
+    try:
+        runner(*commands[1])
+    except Exception:
+        _best_effort_disable(runner)
+        raise
+    try:
+        runner(*commands[2])
+    except Exception:
+        _best_effort_disable(runner)
+        raise
     return WatcherInstall(
         service_path=service_path,
         timer_path=timer_path,
         commands=commands,
+        console=console,
     )
