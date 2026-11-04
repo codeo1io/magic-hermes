@@ -146,9 +146,11 @@ nothing breaks. Three operational caveats:
   `~/.local/share`); `HERMES_HOME`/`XDG_DATA_HOME` override
   environments are out of its reach.
 - Any sanctioned deploy re-runs `wire` and re-arms the lease — after a
-  deliberate unwire, re-delete the lease following the next deploy (or
-  deploy with `MAGIC_HERMES_DEPLOY_NO_WATCHER=1` to skip the watcher
-  step). Disable the timer before uninstalling the package.
+  deliberate unwire, re-delete the lease following the next deploy. Note
+  that `MAGIC_HERMES_DEPLOY_NO_WATCHER=1` does NOT change this: it skips
+  only the watcher installation; the `wire` step (and its lease
+  recording) always runs. Disable the timer before uninstalling the
+  package.
 
 ### 1b. Check installation health
 
@@ -580,9 +582,15 @@ After the release commit is tagged and pushed, and before the GitHub release
 object is created, the script installs the freshly built wheel into the deploy
 target with `<venv>/bin/python -m pip install --force-reinstall --no-deps
 <local wheel>` — a local file (no network) and no dependencies, so a shared
-venv never gains or upgrades unrelated packages. It then verifies the
-deployment *in the target interpreter*: `importlib.metadata.version`
-for `magic-hermes` must equal the release version and the
+venv never gains or upgrades unrelated packages. When the target already
+carries a different magic-hermes version, the deploy first QUIESCES the
+armed convergence timer (a tolerated `systemctl --user disable --now
+magic-hermes-converge.timer` — the uninstall that follows would otherwise
+delete the console script the timer fires every 60 s) and UNINSTALLS the
+old package (`pip uninstall -y`) before the forced reinstall, so stale
+dist-info directories cannot stack. It then verifies the deployment
+*in the target interpreter*: `importlib.metadata.version` for
+`magic-hermes` must equal the release version and the
 `bin/magic-hermes` console script must exist. Deploying before publishing is
 deliberate: the tag already exists when bits land in the venv, and a deploy
 failure aborts the release loudly *before* the GitHub release object is
@@ -601,13 +609,22 @@ checks, `<venv>/bin/magic-hermes wire` must exit 0 (the two config wiring
 keys repaired through the comment-preserving backup path, the wiring
 lease recorded), and then `<venv>/bin/magic-hermes doctor` must exit
 clean — default-on, no opt-in — so the exact interpreter that was just
-deployed proves both its wiring and its own health. A failure at either
-step is a hard release error: the invariant is that a magic-hermes
-release is not published until the probe interpreter is deployed, wired,
-and doctor-verified. `MAGIC_HERMES_DEPLOY_NO_SMOKE=1` is the escape hatch
-for foreign or throwaway deploy targets (a stub console script, a Hermes
-home that does not exist): it skips the doctor step only — the wiring
-convergence always runs. The older `MAGIC_HERMES_DEPLOY_SMOKE=1` is
+deployed proves both its wiring and its own health. Between the two,
+the deploy ARMS the out-of-band healer: it installs the systemd user
+units (resolved for the deployed console script — honored
+`$XDG_CONFIG_HOME` and all) and runs the service once, synchronously,
+as a post-arm verification — a dead `ExecStart` (a stale venv, a build
+without the `converge` verb) fails the lane instead of leaving an
+active-looking timer failing every 60 s. A failure at any of these
+steps is a hard release error: the invariant is that a magic-hermes
+release is not published until the probe interpreter is deployed,
+wired, watcher-armed, and doctor-verified. `MAGIC_HERMES_DEPLOY_NO_SMOKE=1`
+is the escape hatch for foreign or throwaway deploy targets (a stub
+console script, a Hermes home that does not exist): it skips the doctor
+step only — the wiring convergence always runs. For deploy targets
+without a systemd user session, `MAGIC_HERMES_DEPLOY_NO_WATCHER=1` skips
+the watcher arming (and the pre-uninstall timer quiesce) — wire and the
+doctor smoke still run. The older `MAGIC_HERMES_DEPLOY_SMOKE=1` is
 accepted as a no-op; the smoke it used to opt into is now always on.
 
 When the GitHub release already exists, `release.py X.Y.Z --deploy` takes a

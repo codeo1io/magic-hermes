@@ -39,6 +39,7 @@ Ref: maestro finding c7d63424daa3 (phase2.magic-context.operational).
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -55,8 +56,22 @@ RECHECK_INTERVAL_S = 60
 #: First check after boot — early enough to catch a boot-time clobber,
 #: late enough not to race unit activation on a cold user session.
 FIRST_CHECK_DELAY_S = 45
-#: Default destination for the rendered unit files (systemd user units).
-USER_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
+
+
+def default_unit_dir() -> Path:
+    """Where systemd user units are read from on this host.
+
+    Resolved at CALL time (not import time) and honors
+    ``$XDG_CONFIG_HOME`` (systemd.user(5): user units load from
+    ``$XDG_CONFIG_HOME/systemd/user`` when the variable is set, else
+    ``~/.config/systemd/user``) — on hosts that relocate the config
+    home, hard-coding ``~/.config`` would land units where systemd
+    never reads them while ``daemon-reload`` still exits 0 (review
+    finding 11: silently dead watcher).
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
+    return base / "systemd" / "user"
 
 #: Injectable command runner. Mirrors ``scripts.release.run``'s contract:
 #: positional argv, raises on failure. Callers may pass capture/env
@@ -69,9 +84,15 @@ def render_service(console_path: Path) -> str:
 
     ``ExecStart`` requires an ABSOLUTE path (systemd rejects relative
     paths), so the console script is resolved before embedding — callers
-    may hand over a relative or symlinked path.
+    may hand over a relative or symlinked path. The path is QUOTED and
+    ``%``-doubled (systemd.unit(5) specifier syntax): an unquoted venv
+    path containing whitespace would split into multiple argv words and
+    a ``%`` would be silently rewritten as a specifier — both leave a
+    loadable-but-dead unit whose ``enable`` stays green (review finding
+    2: healing silently absent).
     """
     executable = Path(console_path).resolve()
+    escaped = str(executable).replace("%", "%%")
     return (
         "[Unit]\n"
         "Description=Magic-Hermes lease-gated wiring convergence"
@@ -79,7 +100,7 @@ def render_service(console_path: Path) -> str:
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
-        f"ExecStart={executable} converge\n"
+        f'ExecStart="{escaped}" converge\n'
     )
 
 
@@ -92,6 +113,7 @@ def render_timer() -> str:
         "[Timer]\n"
         f"OnBootSec={FIRST_CHECK_DELAY_S}s\n"
         f"OnUnitActiveSec={RECHECK_INTERVAL_S}s\n"
+        "AccuracySec=1s\n"
         f"Unit={CONVERGE_SERVICE_UNIT}\n"
         "\n"
         "[Install]\n"
@@ -106,6 +128,10 @@ class WatcherInstall:
     service_path: Path
     timer_path: Path
     commands: tuple[tuple[str, ...], ...]
+    #: The console script the rendered service executes — carried so
+    #: callers can print WHICH venv was armed (review finding 1:
+    #: armed-venv visibility on the shared, last-writer-wins unit).
+    console: Path
 
 
 def _default_runner(*args: str, capture: bool = False, env=None) -> object:
@@ -131,30 +157,45 @@ def install_watcher_units(
     unit_dir: Path | None = None,
     runner: Runner = _default_runner,
 ) -> WatcherInstall:
-    """Write, reload, and enable the convergence timer — idempotent.
+    """Write, reload, enable, and VERIFY the convergence timer.
 
     Writes both unit files (mode 0o644) into ``unit_dir`` (default
-    ``USER_UNIT_DIR``), then issues ``systemctl --user daemon-reload`` and
-    ``systemctl --user enable --now`` for the timer through ``runner``.
+    ``default_unit_dir()``), then issues ``systemctl --user
+    daemon-reload``, ``systemctl --user enable --now`` for the timer, and
+    — the post-arm verification (review finding 1) — ``systemctl --user
+    start`` for the SERVICE through ``runner``. ``enable --now`` starts
+    the timer, but systemd never executes the service at arm time, so a
+    stale/removed venv or a build without the ``converge`` verb would
+    leave an active-looking timer failing every 60 s and passing the
+    deploy lane silently (live-demonstrated on this host 2026-11-04:
+    a unit rewritten to a venv whose magic-hermes lacked ``converge``
+    failed with ``invalid choice`` while ``enable`` stayed green). The
+    explicit ``start`` runs one converge pass NOW: the oneshot either
+    completes rc 0 or the start job fails and the runner raises —
+    deploy aborts loudly, ``install`` prints its warn-only note. As a
+    bonus the pass fires an immediate heal instead of waiting for the
+    first timer tick.
+
     Overwrite + re-enable is safe by design: re-running any deploy
     rewrites the units with the CURRENT console-script path, so a venv
     that moved since the last deploy heals on the next one. Raises
     whatever the runner raises on failure — callers translate (the
-    ``install`` verb warns and continues; the deploy lane aborts loudly).
+    ``install`` verb warns and continues; the deploy lane aborts
+    loudly).
     """
-    destination = Path(unit_dir) if unit_dir is not None else USER_UNIT_DIR
+    console = Path(console_path).resolve()
+    destination = Path(unit_dir) if unit_dir is not None else default_unit_dir()
     destination.mkdir(parents=True, exist_ok=True)
     service_path = destination / CONVERGE_SERVICE_UNIT
     timer_path = destination / CONVERGE_TIMER_UNIT
-    service_path.write_text(
-        render_service(console_path), encoding="utf-8"
-    )
+    service_path.write_text(render_service(console), encoding="utf-8")
     timer_path.write_text(render_timer(), encoding="utf-8")
     for unit in (service_path, timer_path):
         unit.chmod(0o644)
     commands = (
         ("systemctl", "--user", "daemon-reload"),
         ("systemctl", "--user", "enable", "--now", CONVERGE_TIMER_UNIT),
+        ("systemctl", "--user", "start", CONVERGE_SERVICE_UNIT),
     )
     for command in commands:
         runner(*command)
@@ -162,4 +203,5 @@ def install_watcher_units(
         service_path=service_path,
         timer_path=timer_path,
         commands=commands,
+        console=console,
     )

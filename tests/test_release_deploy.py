@@ -42,7 +42,10 @@ import pytest
 
 import scripts.release as release
 from magic_hermes import watcher_units
-from magic_hermes.watcher_units import CONVERGE_TIMER_UNIT
+from magic_hermes.watcher_units import (
+    CONVERGE_SERVICE_UNIT,
+    CONVERGE_TIMER_UNIT,
+)
 
 WHEEL_NAME = "magic_hermes-0.3.4-py3-none-any.whl"
 VERSION = "0.3.4"
@@ -140,12 +143,15 @@ def _watcher_step_isolated(monkeypatch, tmp_path):
     runner is ``release.run`` — faked by every unit test — so systemctl
     never executes; this fixture clears the escape by default and pins
     the unit-file destination to ``tmp_path`` so even a default-unit_dir
-    install stays far from the operator's real
-    ``~/.config/systemd/user``.
+    install stays far from the operator's real user unit dir (resolved
+    by ``watcher_units.default_unit_dir()`` — the XDG-aware successor of
+    the old ``USER_UNIT_DIR`` constant).
     """
     monkeypatch.delenv("MAGIC_HERMES_DEPLOY_NO_WATCHER", raising=False)
     monkeypatch.setattr(
-        watcher_units, "USER_UNIT_DIR", tmp_path / "systemd-user"
+        watcher_units,
+        "default_unit_dir",
+        lambda: tmp_path / "systemd-user",
     )
 
 
@@ -296,6 +302,13 @@ class TestDeployRelease:
         release.deploy_release(artifacts, VERSION, target)
 
         console = str(target / "bin" / "magic-hermes")
+        disable = (
+            "systemctl",
+            "--user",
+            "disable",
+            "--now",
+            CONVERGE_TIMER_UNIT,
+        )
         uninstall = (
             str(target / "bin" / "python"),
             "-m",
@@ -321,12 +334,15 @@ class TestDeployRelease:
             "--now",
             CONVERGE_TIMER_UNIT,
         )
+        start_cmd = ("systemctl", "--user", "start", CONVERGE_SERVICE_UNIT)
         ordered = [
+            fake.calls.index(disable),
             fake.calls.index(uninstall),
             fake.calls.index(install),
             fake.calls.index((console, "wire")),
             fake.calls.index(reload_cmd),
             fake.calls.index(enable_cmd),
+            fake.calls.index(start_cmd),
             fake.calls.index((console, "doctor")),
         ]
         assert ordered == sorted(ordered)
@@ -373,7 +389,7 @@ class TestDeployRelease:
         assert timer.is_file()
         console = target / "bin" / "magic-hermes"
         assert (
-            f"ExecStart={console.resolve()} converge"
+            f'ExecStart="{console.resolve()}" converge'
             in service.read_text(encoding="utf-8")
         )
         enable_cmd = (
@@ -383,13 +399,21 @@ class TestDeployRelease:
             "--now",
             CONVERGE_TIMER_UNIT,
         )
+        # Review finding 1: the post-arm start of the service is the
+        # verification that the ExecStart actually runs — it fires after
+        # the timer is enabled, before the doctor smoke.
+        start_cmd = ("systemctl", "--user", "start", CONVERGE_SERVICE_UNIT)
         assert enable_cmd in fake.calls
+        assert start_cmd in fake.calls
         console_s = str(console)
         assert (
             fake.calls.index((console_s, "wire")) < fake.calls.index(enable_cmd)
         )
         assert (
-            fake.calls.index(enable_cmd) < fake.calls.index((console_s, "doctor"))
+            fake.calls.index(enable_cmd) < fake.calls.index(start_cmd)
+        )
+        assert (
+            fake.calls.index(start_cmd) < fake.calls.index((console_s, "doctor"))
         )
 
     def test_no_watcher_escape_skips_systemctl_but_not_doctor(
@@ -397,7 +421,9 @@ class TestDeployRelease:
     ):
         """MAGIC_HERMES_DEPLOY_NO_WATCHER=1 is the documented escape for
         deploy targets without a systemd user session — it skips ONLY the
-        watcher step; wire and the doctor smoke still run."""
+        watcher step (including the pre-uninstall timer quiesce — the
+        escape keeps meaning "no systemctl on this target"); wire and
+        the doctor smoke still run."""
         target = make_target(tmp_path)
         artifacts = make_artifacts(tmp_path)
         monkeypatch.setenv("MAGIC_HERMES_DEPLOY_NO_WATCHER", "1")
@@ -428,6 +454,57 @@ class TestDeployRelease:
 
         with pytest.raises(
             release.ReleaseError, match="watcher installation failed"
+        ):
+            release.deploy_release(artifacts, VERSION, target)
+
+        assert fake.doctor_calls() == []
+
+    def test_quiesce_failure_before_uninstall_is_tolerated(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Review finding 4: the pre-uninstall timer quiesce is
+        best-effort — a target whose systemctl fails (or has no systemd
+        user session) still deploys; the post-install version assert is
+        the real gate."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+
+        def quiesce_fails(key):
+            return "disable" in key
+
+        fake = FakeRun(fail=quiesce_fails)
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+
+        release.deploy_release(artifacts, VERSION, target)
+
+        assert any("disable" in call for call in fake.calls)  # attempted
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.doctor_calls() == [(console, "doctor")]  # lane done
+        assert "quiesce" in capsys.readouterr().err
+
+    def test_foreign_interpreter_cannot_import_watcher_module_loudly(
+        self, tmp_path, monkeypatch
+    ):
+        """Review finding 14: the watcher step needs magic_hermes
+        importable by the DRIVING interpreter — a foreign python gets a
+        precise, attributable error (not a misattributed "watcher
+        installation failed")."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        fake = FakeRun()
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+        monkeypatch.setitem(
+            sys.modules, "magic_hermes.watcher_units", None
+        )
+
+        with pytest.raises(
+            release.ReleaseError, match="driving interpreter"
         ):
             release.deploy_release(artifacts, VERSION, target)
 
@@ -509,7 +586,13 @@ maestro executes — or the release aborts."""
 
         assert fake.wire_calls()  # convergence was attempted ...
         assert fake.doctor_calls() == []  # ... and verification never ran
-        assert fake.systemctl_calls() == []  # watcher never armed either
+        # watcher never ARMED either: the only systemctl command allowed
+        # is the tolerated pre-uninstall timer QUIESCE (review finding 4)
+        # — no daemon-reload, no enable, no post-arm start.
+        non_quiesce = [
+            call for call in fake.systemctl_calls() if "disable" not in call
+        ]
+        assert non_quiesce == []
 
 
 class TestMainDeployWiring:

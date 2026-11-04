@@ -406,18 +406,23 @@ def deploy_release(
     ``publish_release`` — the tag exists when bits land in the venv, and a
     deploy failure (install, wiring convergence, watcher installation, or
     doctor verification) aborts the release before the GitHub release
-    object is created. Install hygiene: a version-changing install
-    UNINSTALLS the old package first (stacked dist-info defense — the
-    v0.3.35 wheel arrived by ad-hoc pip over older installs and left three
-    stacked dist-info directories; the post-install version assert remains
-    the real gate). Idempotent: when the target already carries ``version``
-    the pip steps are skipped and convergence + watcher installation +
-    verification still run. The watcher step (systemd user timer running
-    ``converge``) is skipped under ``MAGIC_HERMES_DEPLOY_NO_WATCHER=1`` —
-    the documented escape for targets without a systemd user session;
-    the doctor smoke escape stays ``MAGIC_HERMES_DEPLOY_NO_SMOKE``. A
-    missing venv, missing pip, or a failed verification is a loud error,
-    never a skip.
+    object is created. Install hygiene: a version-changing install first
+    QUIESCES the armed convergence timer (tolerated ``disable --now`` —
+    the uninstall would otherwise delete the console script the timer
+    fires every 60 s) and UNINSTALLS the old package (stacked dist-info
+    defense — the v0.3.35 wheel arrived by ad-hoc pip over older
+    installs and left three stacked dist-info directories; the
+    post-install version assert remains the real gate). Idempotent: when
+    the target already carries ``version`` the pip steps are skipped and
+    convergence + watcher installation + verification still run. The
+    watcher step (systemd user timer running ``converge``) installs the
+    units AND verifies the service actually runs (an explicit ``start``
+    of the oneshot — a dead ExecStart fails the lane instead of leaving
+    an active-looking timer failing every 60 s); it is skipped under
+    ``MAGIC_HERMES_DEPLOY_NO_WATCHER=1`` — the documented escape for
+    targets without a systemd user session; the doctor smoke escape
+    stays ``MAGIC_HERMES_DEPLOY_NO_SMOKE``. A missing venv, missing pip,
+    or a failed verification is a loud error, never a skip.
 
     ``unit_dir`` redirects the watcher unit-file destination (tests); the
     systemctl commands themselves always run through the ``run`` seam, so
@@ -438,6 +443,38 @@ def deploy_release(
     installed = deployed_version(target)
     if installed != version:
         run(str(python), "-m", "pip", "--version")
+        # Quiesce the armed timer before the uninstall below deletes the
+        # console script it fires every 60 s (review finding 4): without
+        # this, every version-changing deploy opens a transient
+        # 203/EXEC failure window, and a deploy aborting after a
+        # successful uninstall strands a ~1440-failures/day loop until
+        # the next successful deploy. Tolerated disable — a target
+        # without the timer (first deploy, NO_WATCHER hosts, no systemd
+        # user session) falls through; the watcher step below re-enables
+        # (--now) on success. Skipped under the same NO_WATCHER escape
+        # as the arming step so the escape keeps meaning "no systemctl
+        # on this target".
+        if not os.environ.get(DEPLOY_NO_WATCHER_ENV):
+            try:
+                from magic_hermes.watcher_units import (
+                    CONVERGE_TIMER_UNIT,
+                )
+            except ImportError:
+                CONVERGE_TIMER_UNIT = "magic-hermes-converge.timer"
+            try:
+                run(
+                    "systemctl",
+                    "--user",
+                    "disable",
+                    "--now",
+                    CONVERGE_TIMER_UNIT,
+                )
+            except ReleaseError as exc:
+                print(
+                    f"note: timer quiesce before uninstall failed "
+                    f"(continuing): {exc}",
+                    file=sys.stderr,
+                )
         # Dist-info hygiene (c7d63424 root cause 3): ``pip install
         # --force-reinstall`` does not reliably remove a
         # differently-versioned residue, and stacked dist-info dirs made
@@ -496,7 +533,19 @@ def deploy_release(
     if not os.environ.get(DEPLOY_NO_WATCHER_ENV):
         try:
             from magic_hermes.watcher_units import install_watcher_units
-
+        except ImportError as exc:
+            # Review finding 14: the watcher step implicitly requires the
+            # DRIVING interpreter to import magic_hermes — a foreign
+            # python would otherwise abort post-wire with a misattributed
+            # "watcher installation failed". Name the real cause.
+            raise ReleaseError(
+                "watcher arming skipped: the driving interpreter cannot "
+                f"import magic_hermes.watcher_units ({exc}) — run "
+                "scripts/release.py from the repository venv, or set "
+                f"{DEPLOY_NO_WATCHER_ENV}=1 for targets without a "
+                "systemd user session"
+            ) from exc
+        try:
             install_watcher_units(
                 console_script, unit_dir=unit_dir, runner=run
             )
@@ -702,7 +751,8 @@ def main() -> int:
             "wiring through the deployed console script, and require a "
             "clean doctor exit (default "
             f"{DEFAULT_DEPLOY_VENV}; override target with {DEPLOY_VENV_ENV}, "
-            f"skip the doctor step with {DEPLOY_NO_SMOKE_ENV}=1)"
+            f"skip the doctor step with {DEPLOY_NO_SMOKE_ENV}=1, skip the "
+            f"watcher arming with {DEPLOY_NO_WATCHER_ENV}=1)"
         ),
     )
     args = parser.parse_args()
