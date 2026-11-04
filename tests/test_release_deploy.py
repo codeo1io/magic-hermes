@@ -5,16 +5,26 @@ The deploy step closes the land→deploy delivery gap: after ``commit_and_tag``
 and before ``publish_release`` the freshly built wheel is installed into the
 interpreter maestro probes (``DEFAULT_DEPLOY_VENV``, overridable through
 ``MAGIC_HERMES_DEPLOY_VENV``) and verified in THAT interpreter — never the
-development one. It then closes the deploy→operate gap: the deployed console
-script converges the host wiring (``magic-hermes wire``) and must pass a
-doctor smoke — DEFAULT-ON, with ``MAGIC_HERMES_DEPLOY_NO_SMOKE=1`` as the
-escape for foreign/throwaway targets — before the release may publish. The
-legacy ``MAGIC_HERMES_DEPLOY_SMOKE`` opt-in is a tolerated no-op.
+development one. It then closes the deploy→operate gap — twice over: the
+deployed console script converges the host wiring (``magic-hermes wire``),
+the lane installs the out-of-band convergence timer (systemd user units
+running ``magic-hermes converge``, default-on with
+``MAGIC_HERMES_DEPLOY_NO_WATCHER=1`` as the escape for targets without a
+systemd user session), and the target must pass a doctor smoke —
+DEFAULT-ON, with ``MAGIC_HERMES_DEPLOY_NO_SMOKE=1`` as the escape for
+foreign/throwaway targets — before the release may publish. A
+version-changing install also UNINSTALLS the old package first (stacked
+dist-info hygiene — c7d63424 root cause 3). The legacy
+``MAGIC_HERMES_DEPLOY_SMOKE`` opt-in is a tolerated no-op.
 
 These tests never touch the real probe venv: every unit test fakes the
 subprocess layer (``release.run``) and ``deployed_version`` while building a
-throwaway target-venv layout under ``tmp_path``. The integration test at the
-bottom is gated behind ``MAGIC_HERMES_DEPLOY_INTEGRATION=1`` and deploys a
+throwaway target-venv layout under ``tmp_path``. The watcher step rides the
+same ``release.run`` fake (systemctl never executes) and its unit-file
+writes are pinned to ``tmp_path`` through the autouse fixture below, so
+nothing here reaches the operator's ``~/.config/systemd/user``. The
+integration test at the bottom is gated behind
+``MAGIC_HERMES_DEPLOY_INTEGRATION=1`` and deploys a
 real built wheel into a throwaway venv (established repo precedent:
 ``TestDeploySmoke`` in tests/test_doctor_contract.py).
 """
@@ -31,6 +41,8 @@ from pathlib import Path
 import pytest
 
 import scripts.release as release
+from magic_hermes import watcher_units
+from magic_hermes.watcher_units import CONVERGE_TIMER_UNIT
 
 WHEEL_NAME = "magic_hermes-0.3.4-py3-none-any.whl"
 VERSION = "0.3.4"
@@ -87,6 +99,9 @@ class FakeRun:
     def doctor_calls(self) -> list[tuple[str, ...]]:
         return [call for call in self.calls if "doctor" in call]
 
+    def systemctl_calls(self) -> list[tuple[str, ...]]:
+        return [call for call in self.calls if call[:1] == ("systemctl",)]
+
 
 class FakeVersion:
     """Stateful deployed_version() fake: yields the sequence, repeats last."""
@@ -114,6 +129,24 @@ def _clean_smoke_env(monkeypatch):
     """
     monkeypatch.delenv("MAGIC_HERMES_DEPLOY_SMOKE", raising=False)
     monkeypatch.delenv("MAGIC_HERMES_DEPLOY_NO_SMOKE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _watcher_step_isolated(monkeypatch, tmp_path):
+    """Keep the watcher step hermetic: env pinned, unit writes in tmp.
+
+    deploy_release arms the systemd user timer between wire and doctor
+    (default-on; ``MAGIC_HERMES_DEPLOY_NO_WATCHER=1`` is the escape). The
+    runner is ``release.run`` — faked by every unit test — so systemctl
+    never executes; this fixture clears the escape by default and pins
+    the unit-file destination to ``tmp_path`` so even a default-unit_dir
+    install stays far from the operator's real
+    ``~/.config/systemd/user``.
+    """
+    monkeypatch.delenv("MAGIC_HERMES_DEPLOY_NO_WATCHER", raising=False)
+    monkeypatch.setattr(
+        watcher_units, "USER_UNIT_DIR", tmp_path / "systemd-user"
+    )
 
 
 class TestDeployRelease:
@@ -161,12 +194,21 @@ class TestDeployRelease:
         release.deploy_release(artifacts, VERSION, target)
 
         assert fake.install_calls() == []
+        assert not any("uninstall" in call for call in fake.calls)
         assert version.calls  # verification consulted the target interpreter
-        # Already-current wheel: the install is skipped, but convergence and
-        # verification still run (idempotent deploy contract).
+        # Already-current wheel: the pip steps are skipped entirely, but
+        # convergence, watcher arming, and verification still run
+        # (idempotent deploy contract).
         console = str(target / "bin" / "magic-hermes")
         assert fake.wire_calls() == [(console, "wire")]
         assert fake.doctor_calls() == [(console, "doctor")]
+        assert (
+            "systemctl",
+            "--user",
+            "enable",
+            "--now",
+            CONVERGE_TIMER_UNIT,
+        ) in fake.calls
 
     def test_missing_target_python_is_a_loud_error(self, tmp_path, monkeypatch):
         target = make_target(tmp_path, python=False)
@@ -238,6 +280,159 @@ class TestDeployRelease:
         with pytest.raises(release.ReleaseError, match="magic-hermes"):
             release.deploy_release(artifacts, VERSION, target)
 
+    def test_version_mismatch_uninstalls_first(self, tmp_path, monkeypatch):
+        """Stacked dist-info hygiene (c7d63424 root cause 3): a
+        version-changing deploy runs ``pip uninstall -y magic-hermes``
+        BEFORE the --force-reinstall install, then wires, arms the
+        watcher, and verifies — in that order."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        fake = FakeRun()
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+
+        release.deploy_release(artifacts, VERSION, target)
+
+        console = str(target / "bin" / "magic-hermes")
+        uninstall = (
+            str(target / "bin" / "python"),
+            "-m",
+            "pip",
+            "uninstall",
+            "-y",
+            "magic-hermes",
+        )
+        install = (
+            str(target / "bin" / "python"),
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            "--no-deps",
+            str(tmp_path / "dist" / WHEEL_NAME),
+        )
+        reload_cmd = ("systemctl", "--user", "daemon-reload")
+        enable_cmd = (
+            "systemctl",
+            "--user",
+            "enable",
+            "--now",
+            CONVERGE_TIMER_UNIT,
+        )
+        ordered = [
+            fake.calls.index(uninstall),
+            fake.calls.index(install),
+            fake.calls.index((console, "wire")),
+            fake.calls.index(reload_cmd),
+            fake.calls.index(enable_cmd),
+            fake.calls.index((console, "doctor")),
+        ]
+        assert ordered == sorted(ordered)
+
+    def test_failed_uninstall_is_tolerated(self, tmp_path, monkeypatch):
+        """Uninstall failure never aborts the lane: a target without the
+        package (or a broken uninstall) falls through — the post-install
+        version assert is the real gate."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        fake = FakeRun(fail=lambda key: "uninstall" in key)
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+
+        release.deploy_release(artifacts, VERSION, target)
+
+        assert any("uninstall" in call for call in fake.calls)  # attempted
+        assert fake.install_calls()  # install still happened
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.doctor_calls() == [(console, "doctor")]  # lane completed
+
+    def test_watcher_units_written_between_wire_and_doctor(
+        self, tmp_path, monkeypatch
+    ):
+        """The deploy lane leaves the target self-healing: the rendered
+        units land on disk carrying the deployed console script's absolute
+        path, and systemctl enable --now rides the faked run seam."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        fake = FakeRun()
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+        unit_dir = tmp_path / "units"
+
+        release.deploy_release(artifacts, VERSION, target, unit_dir=unit_dir)
+
+        service = unit_dir / "magic-hermes-converge.service"
+        timer = unit_dir / CONVERGE_TIMER_UNIT
+        assert service.is_file()
+        assert timer.is_file()
+        console = target / "bin" / "magic-hermes"
+        assert (
+            f"ExecStart={console.resolve()} converge"
+            in service.read_text(encoding="utf-8")
+        )
+        enable_cmd = (
+            "systemctl",
+            "--user",
+            "enable",
+            "--now",
+            CONVERGE_TIMER_UNIT,
+        )
+        assert enable_cmd in fake.calls
+        console_s = str(console)
+        assert (
+            fake.calls.index((console_s, "wire")) < fake.calls.index(enable_cmd)
+        )
+        assert (
+            fake.calls.index(enable_cmd) < fake.calls.index((console_s, "doctor"))
+        )
+
+    def test_no_watcher_escape_skips_systemctl_but_not_doctor(
+        self, tmp_path, monkeypatch
+    ):
+        """MAGIC_HERMES_DEPLOY_NO_WATCHER=1 is the documented escape for
+        deploy targets without a systemd user session — it skips ONLY the
+        watcher step; wire and the doctor smoke still run."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        monkeypatch.setenv("MAGIC_HERMES_DEPLOY_NO_WATCHER", "1")
+        fake = FakeRun()
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+
+        release.deploy_release(artifacts, VERSION, target)
+
+        assert fake.systemctl_calls() == []
+        console = str(target / "bin" / "magic-hermes")
+        assert fake.wire_calls() == [(console, "wire")]
+        assert fake.doctor_calls() == [(console, "doctor")]
+
+    def test_watcher_failure_aborts_before_doctor(self, tmp_path, monkeypatch):
+        """Loud-half contract (KTD 4): a watcher step that cannot install
+        or enable aborts the release before verification — the install
+        verb warns where deploy fails loudly."""
+        target = make_target(tmp_path)
+        artifacts = make_artifacts(tmp_path)
+        fake = FakeRun(fail=lambda key: key[:1] == ("systemctl",))
+        monkeypatch.setattr(release, "run", fake)
+        monkeypatch.setattr(
+            release, "deployed_version", FakeVersion([None, VERSION])
+        )
+
+        with pytest.raises(
+            release.ReleaseError, match="watcher installation failed"
+        ):
+            release.deploy_release(artifacts, VERSION, target)
+
+        assert fake.doctor_calls() == []
+
     def test_doctor_smoke_runs_by_default_and_requires_success(
         self, tmp_path, monkeypatch
     ):
@@ -277,6 +472,7 @@ maestro executes — or the release aborts."""
         console = str(target / "bin" / "magic-hermes")
         assert fake.wire_calls() == [(console, "wire")]
         assert fake.doctor_calls() == []
+        assert fake.systemctl_calls()  # watcher arming is NOT escaped here
 
     def test_legacy_smoke_env_is_a_tolerated_no_op(self, tmp_path, monkeypatch):
         """MAGIC_HERMES_DEPLOY_SMOKE (the pre-c7d63424 opt-in) no longer
@@ -313,6 +509,7 @@ maestro executes — or the release aborts."""
 
         assert fake.wire_calls()  # convergence was attempted ...
         assert fake.doctor_calls() == []  # ... and verification never ran
+        assert fake.systemctl_calls() == []  # watcher never armed either
 
 
 class TestMainDeployWiring:
@@ -439,6 +636,13 @@ class TestMainDeployWiring:
         console = str(target / "bin" / "magic-hermes")
         assert fake_git.wire_calls() == [(console, "wire")]
         assert fake_git.doctor_calls() == [(console, "doctor")]
+        assert (
+            "systemctl",
+            "--user",
+            "enable",
+            "--now",
+            CONVERGE_TIMER_UNIT,
+        ) in fake_git.calls  # watcher tail inherited through deploy_release
 
     def test_deploy_target_defaults_to_constant_when_env_unset(
         self, tmp_path, monkeypatch
@@ -633,10 +837,12 @@ class TestEnsureDefaultBranchFFRecovery:
     ),
 )
 def test_deploy_release_into_throwaway_venv(tmp_path, monkeypatch):
-    # Throwaway target: take the documented escape so the default-on doctor
-    # step is skipped — this battery asserts the convergence artifacts on
-    # disk (wire writes them), not the smoke (unit tests pin that contract).
+    # Throwaway target: take the documented escapes so the default-on
+    # doctor step is skipped AND the watcher step does not arm real
+    # systemd user units on the host — host operational state (config,
+    # lease, units) is the deploy phase's sanctioned act, never a test's.
     monkeypatch.setenv("MAGIC_HERMES_DEPLOY_NO_SMOKE", "1")
+    monkeypatch.setenv("MAGIC_HERMES_DEPLOY_NO_WATCHER", "1")
     monkeypatch.delenv("MAGIC_HERMES_DEPLOY_SMOKE", raising=False)
     # Isolated Hermes home + data root: the wire step must write config and
     # lease HERE, never in the operator's real home (R6 swim-lane rule).

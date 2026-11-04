@@ -2,10 +2,12 @@
 """Build, validate, tag, push, and publish a Magic-Hermes GitHub release.
 
 Lane invariant (finding c7d63424daa3): a Magic-Hermes release is not
-published until the probe interpreter is deployed, wired, and
-doctor-verified — the deploy step converges the operational wiring through
-the deployed console script (``magic-hermes wire``) and requires a clean
-doctor exit (the same probe maestro runs) before ``publish_release``.
+published until the probe interpreter is deployed, wired, watcher-armed,
+and doctor-verified — the deploy step converges the operational wiring
+through the deployed console script (``magic-hermes wire``), installs the
+out-of-band convergence timer (systemd user units running
+``magic-hermes converge``), and requires a clean doctor exit (the same
+probe maestro runs) before ``publish_release``.
 """
 
 from __future__ import annotations
@@ -51,6 +53,12 @@ DEPLOY_SMOKE_ENV = "MAGIC_HERMES_DEPLOY_SMOKE"
 #: support a doctor run. Convergence (``wire``) still runs — only the
 #: verification step is skipped.
 DEPLOY_NO_SMOKE_ENV = "MAGIC_HERMES_DEPLOY_NO_SMOKE"
+#: Documented escape from the deploy-lane watcher installation, for
+#: deploy targets without a systemd user session (CI containers,
+#: ephemeral venvs): the out-of-band convergence timer is not installed
+#: there. Convergence (``wire``) and the doctor smoke still run — only
+#: the watcher step is skipped (mirrors DEPLOY_NO_SMOKE_ENV).
+DEPLOY_NO_WATCHER_ENV = "MAGIC_HERMES_DEPLOY_NO_WATCHER"
 
 
 class ReleaseError(RuntimeError):
@@ -385,16 +393,36 @@ def deployed_version(target: Path) -> str | None:
     return probe.stdout.strip() or None
 
 
-def deploy_release(artifacts: list[Path], version: str, target: Path) -> None:
-    """Install, converge, and verify the freshly built wheel in the probe venv.
+def deploy_release(
+    artifacts: list[Path],
+    version: str,
+    target: Path,
+    *,
+    unit_dir: Path | None = None,
+) -> None:
+    """Install, converge, arm, and verify the wheel in the probe venv.
 
     Ordering (callers): after ``commit_and_tag`` and before
     ``publish_release`` — the tag exists when bits land in the venv, and a
-    deploy failure (install, wiring convergence, or doctor verification)
-    aborts the release before the GitHub release object is created.
-    Idempotent: when the target already carries ``version`` the install is
-    skipped and convergence + verification still run. A missing venv,
-    missing pip, or a failed verification is a loud error, never a skip.
+    deploy failure (install, wiring convergence, watcher installation, or
+    doctor verification) aborts the release before the GitHub release
+    object is created. Install hygiene: a version-changing install
+    UNINSTALLS the old package first (stacked dist-info defense — the
+    v0.3.35 wheel arrived by ad-hoc pip over older installs and left three
+    stacked dist-info directories; the post-install version assert remains
+    the real gate). Idempotent: when the target already carries ``version``
+    the pip steps are skipped and convergence + watcher installation +
+    verification still run. The watcher step (systemd user timer running
+    ``converge``) is skipped under ``MAGIC_HERMES_DEPLOY_NO_WATCHER=1`` —
+    the documented escape for targets without a systemd user session;
+    the doctor smoke escape stays ``MAGIC_HERMES_DEPLOY_NO_SMOKE``. A
+    missing venv, missing pip, or a failed verification is a loud error,
+    never a skip.
+
+    ``unit_dir`` redirects the watcher unit-file destination (tests); the
+    systemctl commands themselves always run through the ``run`` seam, so
+    faking ``release.run`` keeps real systemctl unreachable from the
+    battery.
     """
     python = target / "bin" / "python"
     if not python.is_file():
@@ -410,6 +438,20 @@ def deploy_release(artifacts: list[Path], version: str, target: Path) -> None:
     installed = deployed_version(target)
     if installed != version:
         run(str(python), "-m", "pip", "--version")
+        # Dist-info hygiene (c7d63424 root cause 3): ``pip install
+        # --force-reinstall`` does not reliably remove a
+        # differently-versioned residue, and stacked dist-info dirs made
+        # the deployed version ambiguous twice already. Uninstall FIRST;
+        # the failure is tolerated (a target without the package, or a
+        # broken uninstall, falls through) because the post-install
+        # version assert below is the real gate.
+        try:
+            run(str(python), "-m", "pip", "uninstall", "-y", "magic-hermes")
+        except ReleaseError as exc:
+            print(
+                f"note: pre-install uninstall failed (continuing): {exc}",
+                file=sys.stderr,
+            )
         run(
             str(python),
             "-m",
@@ -442,6 +484,27 @@ def deploy_release(artifacts: list[Path], version: str, target: Path) -> None:
     except ReleaseError as exc:
         raise ReleaseError(f"wiring convergence failed during deploy: {exc}") from exc
 
+    # Out-of-band healing (c7d63424): the deploy lane leaves the target
+    # SELF-HEALING — install and enable the systemd user timer that runs
+    # ``magic-hermes converge`` every minute (lease-gated, so a
+    # deliberately unwired host stays unwired; see watcher_units). Loud
+    # on failure — an operator deploy that cannot arm the watcher must
+    # abort before publish, never pass silently (the ``install`` verb's
+    # best-effort tail is the quiet counterpart of exactly this step).
+    # The import stays function-local: non-deploy invocations keep this
+    # module's stdlib-only import surface.
+    if not os.environ.get(DEPLOY_NO_WATCHER_ENV):
+        try:
+            from magic_hermes.watcher_units import install_watcher_units
+
+            install_watcher_units(
+                console_script, unit_dir=unit_dir, runner=run
+            )
+        except Exception as exc:
+            raise ReleaseError(
+                f"watcher installation failed during deploy: {exc}"
+            ) from exc
+
     # Verification: run the same doctor maestro probes, default-on, and
     # require a clean exit before the release may publish. The escape env
     # is documented for foreign/throwaway targets only; it skips the
@@ -463,9 +526,9 @@ def redeploy_release(version: str, tag: str) -> None:
     the tag must exist and point at current HEAD, so the wheel is rebuilt
     from exactly the released tree; commit and publish are skipped (both
     already happened for this version). Routes through ``deploy_release``,
-    so the re-entry path carries the same convergence + doctor-verification
-    tail as a fresh release and cannot reintroduce the deploy-without-
-    converging hole.
+    so the re-entry path carries the same uninstall-first install,
+    convergence, watcher-arming, and doctor-verification tail as a fresh
+    release and cannot reintroduce the deploy-without-converging hole.
     """
     if not tag_exists(tag):
         raise ReleaseError(
