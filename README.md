@@ -123,6 +123,33 @@ upstream package itself may need updating; use `wire` when only the
 operational wiring is in question (the release lane's deploy step uses
 it for exactly that).
 
+`install` and the deploy step also install a systemd user timer
+(`magic-hermes-converge.timer`) that runs `magic-hermes converge` — one
+lease-gated convergence pass, exactly the repair `converge` performs on
+demand, without re-arming anything — every 60 seconds. This closes the
+incident class where a long-running host process rewrites the config to
+factory defaults out-of-band (the 2026-10-30 gateway clobber, maestro
+finding c7d63424): the drift heals within a minute regardless of
+gateway uptime or plugin code age, and the lease keeps the watcher to
+the same authorization as the in-process convergence. Inspect it with
+`systemctl --user list-timers magic-hermes-converge.timer`; each pass
+lands in the `magic-hermes-converge.service` journal (exit 0 on every
+no-op status, non-zero only on a write failure). On hosts without a
+systemd user session, `install` prints a note and skips the watcher —
+nothing breaks. Three operational caveats:
+
+- **Pause vs. opt out.** Disabling the timer (`systemctl --user
+  disable --now magic-hermes-converge.timer`) pauses out-of-band
+  healing; deleting the wiring lease is the full convergence opt-out,
+  plugin-side and watcher-side alike.
+- The watcher covers default-path homes (`~/.hermes`, default
+  `~/.local/share`); `HERMES_HOME`/`XDG_DATA_HOME` override
+  environments are out of its reach.
+- Any sanctioned deploy re-runs `wire` and re-arms the lease — after a
+  deliberate unwire, re-delete the lease following the next deploy (or
+  deploy with `MAGIC_HERMES_DEPLOY_NO_WATCHER=1` to skip the watcher
+  step). Disable the timer before uninstalling the package.
+
 ### 1b. Check installation health
 
 ```bash

@@ -54,6 +54,7 @@ from .runtime import (
 from .wiring import (
     PLUGIN_NAME,
     configure_hermes,
+    converge,
     hermes_config_path,
     lease_path,
     load_yaml,
@@ -1448,6 +1449,43 @@ def run_install(
         else:
             print(f"│  wiring lease recorded: {lease}")
 
+        # Unit 3 (plan 2c06dd22, finding c7d63424): install also tries to
+        # arm the out-of-band healer — the systemd user timer that runs
+        # `magic-hermes converge` periodically. Best-effort, warn-only
+        # (KTD 4: install warns where deploy fails loudly): a host
+        # without a systemd user session, a python without the console
+        # script beside it, or a tree without the watcher_units module
+        # (fold-split landing) degrades to a printed note — the in-flow
+        # wiring + lease above are already done, and the watcher only
+        # adds out-of-band coverage. `--skip-config` never reaches this
+        # block, so it arms nothing (same rule as the lease).
+        try:
+            from magic_hermes.watcher_units import install_watcher_units
+
+            console = Path(sys.executable).with_name("magic-hermes")
+            if console.is_file():
+                install_watcher_units(console)
+                print(
+                    "│  out-of-band watcher installed: "
+                    "magic-hermes-converge.timer"
+                )
+            else:
+                print(
+                    "│  watcher not installed: no `magic-hermes` console "
+                    f"script beside {sys.executable} — re-run install from "
+                    "the target venv to arm it"
+                )
+        except Exception as exc:  # ancillary, never fatal (warn-only)
+            print(
+                f"│  NOTE: out-of-band watcher not installed: {exc}",
+                file=sys.stderr,
+            )
+            print(
+                "│  wiring convergence stays in-process only; re-run "
+                "`magic-hermes install` on a systemd user session to retry",
+                file=sys.stderr,
+            )
+
     # End-to-end verification: the sidecar must boot and open the shared DB.
     try:
         with RuntimeClient(timeout=90) as client:
@@ -1504,6 +1542,60 @@ def run_wire() -> int:
     return 0
 
 
+def run_converge() -> int:
+    """One lease-gated wiring convergence pass, out-of-band and fail-open.
+
+    Unit 1 (plan 2c06dd22, finding c7d63424): the actor the systemd
+    watcher timer (and operators) run — exactly one ``wiring.converge()``
+    call: no rate limit (that is the in-process ``recheck``'s concern,
+    plan U5 of 2026-10-31), no npm planning, no sidecar boot, no lease
+    recording (``wire`` is the arming act — KTD 3: the watcher converges
+    under the lease, never arms it). Fail-open like the engine: every
+    disarmed or miss status is a named rc-0 outcome; only a write
+    failure (status ``error``) exits 1, so the timer's journal shows
+    real failures without pager noise (KTD 5).
+    """
+
+    print("┌  magic-hermes converge")
+    result = converge()
+    if result.status == "error":
+        print(f"└  converge FAILED: {result.detail}", file=sys.stderr)
+        print(
+            "│  the config on disk is unchanged — fix the cause and re-run "
+            "`magic-hermes converge`",
+            file=sys.stderr,
+        )
+        return 1
+    if result.status == "repaired":
+        print(
+            f"│  Hermes config repaired: {', '.join(result.changed)} "
+            "(backup written)"
+        )
+    elif result.status == "converged":
+        print("│  Hermes config already wired")
+    elif result.status == "no-lease":
+        print(
+            f"│  no wiring lease at {lease_path()} — convergence disarmed "
+            "(delete-the-lease opt-out honored)"
+        )
+    elif result.status == "no-config":
+        print(
+            f"│  no Hermes config at {hermes_config_path()} — nothing to "
+            "converge"
+        )
+    elif result.status == "no-yaml-lib":
+        print("│  no YAML library importable — nothing to converge")
+    elif result.status == "unparseable":
+        print(f"│  Hermes config unreadable: {result.detail or 'unparseable'}")
+    elif result.status == "deliberate":
+        print(
+            "│  deliberate override values present — no write (convergence "
+            "never overrides operator choices)"
+        )
+    print("└  converge complete")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="magic-hermes",
@@ -1537,6 +1629,12 @@ def build_parser() -> argparse.ArgumentParser:
         "wire",
         help="converge Hermes config wiring and record the intent lease "
         "(network-free, idempotent; non-zero exit on any failure)",
+    )
+
+    sub.add_parser(
+        "converge",
+        help="one lease-gated wiring convergence pass (network-free, "
+        "fail-open; non-zero exit only on a write failure)",
     )
 
     doctor = sub.add_parser("doctor", help="check installation health")
@@ -1631,6 +1729,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "wire":
         return run_wire()
+    if args.command == "converge":
+        return run_converge()
     if args.command == "guard":
         return run_guard(action=args.action)
     if args.command == "db":
