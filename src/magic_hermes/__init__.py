@@ -1,3 +1,3 @@
 """Thin Hermes connector for the official Magic Context runtime."""
 
-__version__ = "0.3.39"
+__version__ = "0.3.40"
