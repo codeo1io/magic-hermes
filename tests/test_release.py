@@ -38,6 +38,136 @@ def test_set_version_rejects_non_release_version():
         release.set_version("0.2.0.dev0")
 
 
+def _seed_release_tree(tmp_path, readme_text):
+    """Seed a monkeypatched-ROOT release tree at 0.3.54: the metadata trio
+    plus an optional README, mirroring the real checkout shape."""
+    (tmp_path / "src" / "magic_hermes").mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text(
+        'version = "0.3.54"\n', encoding="utf-8"
+    )
+    (tmp_path / "plugin.yaml").write_text("version: 0.3.54\n", encoding="utf-8")
+    (tmp_path / "src" / "magic_hermes" / "__init__.py").write_text(
+        '__version__ = "0.3.54"\n', encoding="utf-8"
+    )
+    if readme_text is not None:
+        (tmp_path / "README.md").write_text(readme_text, encoding="utf-8")
+
+
+def _example_readme(current):
+    """README fixture carrying the install-example shapes plus unrelated
+    version claims that must survive a bump verbatim."""
+    wheel_url = (
+        "https://github.com/codeo1io/magic-hermes/releases/download/"
+        f"v{current}/magic_hermes-{current}-py3-none-any.whl"
+    )
+    return (
+        "# magic-hermes\n"
+        "\n"
+        f"Install the wheel (shown for v{current}; newer versions follow the same\n"
+        "URL pattern on the Releases page):\n"
+        "\n"
+        "```bash\n"
+        "uv pip install --python /path/to/hermes/venv/bin/python --no-deps \\\n"
+        f"  {wheel_url}\n"
+        "```\n"
+        "\n"
+        "```bash\n"
+        "/path/to/hermes/venv/bin/python -m pip install --no-deps \\\n"
+        f"  {wheel_url}\n"
+        "```\n"
+        "\n"
+        "Validated through 0.49.54. Older artifacts keep their names, e.g.\n"
+        "`magic_hermes-0.3.20-py3-none-any.whl` and `magic_hermes-0.3.20.tar.gz`.\n"
+    )
+
+
+def test_set_version_carries_readme_install_example_forward(monkeypatch, tmp_path):
+    """Every package-version bump moves the README install example with it:
+    both wheel-URL slots and the '(shown for vX.Y.Z; ...)' prose land on the
+    new version."""
+    _seed_release_tree(tmp_path, _example_readme("0.3.54"))
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+
+    release.set_version("0.3.55")
+    release.assert_versions("0.3.55")
+
+    readme = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert (
+        readme.count(
+            "releases/download/v0.3.55/magic_hermes-0.3.55-py3-none-any.whl"
+        )
+        == 2
+    )
+    assert "shown for v0.3.55" in readme
+    assert "releases/download/v0.3.54" not in readme
+    assert "shown for v0.3.54" not in readme
+
+
+def test_set_version_heals_stale_readme_example(monkeypatch, tmp_path):
+    """Self-healing: an exogenous release can leave the example behind the
+    package version; the bump rewrites whatever version the example cites —
+    both URL slots and the prose — with no previous-version guard to wedge
+    on."""
+    _seed_release_tree(tmp_path, _example_readme("0.3.20"))
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+
+    release.set_version("0.3.55")
+    release.assert_versions("0.3.55")
+
+    readme = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert (
+        readme.count(
+            "releases/download/v0.3.55/magic_hermes-0.3.55-py3-none-any.whl"
+        )
+        == 2
+    )
+    assert "shown for v0.3.55" in readme
+    assert "releases/download/v0.3.20" not in readme
+    assert "shown for v0.3.20" not in readme
+
+
+def test_set_version_touches_only_the_install_example_shapes(monkeypatch, tmp_path):
+    """Guard: version strings outside the two example shapes survive a bump
+    verbatim — the upstream 'through X.Y.Z' claim and bare wheel-filename
+    mentions belong to nobody here."""
+    _seed_release_tree(tmp_path, _example_readme("0.3.54"))
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+
+    release.set_version("0.3.55")
+
+    readme = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "Validated through 0.49.54." in readme
+    assert "`magic_hermes-0.3.20-py3-none-any.whl`" in readme
+    assert "`magic_hermes-0.3.20.tar.gz`" in readme
+
+
+def test_set_version_without_readme_still_bumps_metadata(monkeypatch, tmp_path):
+    """Edge: a seeded tree without README.md bumps cleanly (tolerant no-op),
+    metadata trio included."""
+    _seed_release_tree(tmp_path, None)
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+
+    release.set_version("0.3.55")
+    release.assert_versions("0.3.55")
+
+
+def test_set_version_readme_without_example_shapes_is_untouched(
+    monkeypatch, tmp_path
+):
+    """Edge: a README with no example shapes is left byte-identical — no
+    invented lines, no error; the docs-consistency fence is the authority
+    that makes a missing example loud."""
+    _seed_release_tree(tmp_path, "# magic-hermes\n\nNo install example here.\n")
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+
+    release.set_version("0.3.55")
+    release.assert_versions("0.3.55")
+
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == (
+        "# magic-hermes\n\nNo install example here.\n"
+    )
+
+
 def test_release_semver_only_accepts_three_numeric_components():
     assert release.SEMVER.fullmatch("0.2.0")
     assert release.SEMVER.fullmatch("12.34.56")

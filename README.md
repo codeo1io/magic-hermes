@@ -39,6 +39,14 @@ maintainer merges it.
 - Pi, OpenCode, and Hermes use the same Magic Context SQLite store and JSONC
   configuration.
 
+Parallel harnesses — Pi, OpenCode, and concurrent Hermes agents — share the one
+SQLite store. The bridge takes its bind mutex beside that durable database, not
+under scratch storage: it grants a bounded PID-publication grace window, never
+evicts a live holder merely because its bindlock is old, and releases the mutex
+before retry cooldown, so concurrent binders no longer surface `database is
+locked` or `bindlock/pid` write races; see
+[docs/v0.3.29-bindlock-release.md](docs/v0.3.29-bindlock-release.md).
+
 There is no magic-hermes daemon, socket protocol, alternate database, or copied
 Magic Context core.
 
@@ -365,19 +373,19 @@ export MAGIC_CONTEXT_PACKAGE_ROOT=/path/to/node_modules/@cortexkit/pi-magic-cont
 
 Install the latest published wheel into the Python environment used by Hermes. This
 repository is public, so install the release wheel directly from its GitHub Release
-URL (shown for v0.3.20; newer versions follow the same URL pattern on the
+URL (shown for v0.3.54; newer versions follow the same URL pattern on the
 [Releases](https://github.com/codeo1io/magic-hermes/releases) page):
 
 ```bash
 uv pip install --python /path/to/hermes/venv/bin/python --no-deps \
-  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.20/magic_hermes-0.3.20-py3-none-any.whl
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.54/magic_hermes-0.3.54-py3-none-any.whl
 ```
 
 If `uv` is not installed, use the Hermes environment's `pip` instead:
 
 ```bash
 /path/to/hermes/venv/bin/python -m pip install --no-deps \
-  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.20/magic_hermes-0.3.20-py3-none-any.whl
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.54/magic_hermes-0.3.54-py3-none-any.whl
 ```
 
 For development from a local checkout, install the repository directly instead:
@@ -493,6 +501,11 @@ mural generation, real OpenAI-compatible embedding production/model rotation,
 and upstream Git indexing. Separate host E2Es exercise normal `hermes chat`,
 optimized `hermes -z`, gateway-style agent construction, background historian
 execution, and real Hermes Dreamer child delegation.
+
+In CI, the `private-leak-sentinel` workflow additionally scans the full
+repository history for leaked credentials — every push to `master`, every pull
+request, and a daily off-peak rescan — via the fleet's reusable gitleaks
+workflow in `codeo1io/.github`.
 
 ## Compatibility and failure behavior
 
