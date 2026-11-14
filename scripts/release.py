@@ -100,6 +100,45 @@ def replace_once(path: Path, pattern: str, replacement: str) -> None:
     path.write_text(updated, encoding="utf-8")
 
 
+#: README install-example shapes that must track the package version: the
+#: GitHub-release wheel URLs (tag and filename slots) and the "(shown for
+#: vX.Y.Z; ...)" prose marker. They are the only README version claim with
+#: no upstream counterpart, so the release lane itself carries them forward
+#: (the v0.3.20 example survived 35 releases before this surgery; fourth
+#: recorded rot, see docs/ROADMAP-RECONCILIATION-2026-10.md sections 2/8).
+README_WHEEL_URL_PATTERN = re.compile(
+    r"releases/download/v(\d+\.\d+\.\d+)/"
+    r"magic_hermes-(\d+\.\d+\.\d+)-py3-none-any\.whl"
+)
+README_EXAMPLE_PROSE_PATTERN = re.compile(r"shown for v(\d+\.\d+\.\d+)")
+
+
+def _update_readme_install_example(version: str) -> None:
+    """Carry the README install example forward to ``version``.
+
+    Rewrites every example wheel URL (both version slots) and every
+    "(shown for vX.Y.Z; ...)" marker to ``version`` — whatever version they
+    currently cite — so an exogenous release that lands mid-sequence is
+    healed by the next bump rather than wedging the lane. Tolerant by
+    design, mirroring the sync script's README surgery: a missing README or
+    a README without example shapes is a silent no-op, and version strings
+    outside the two example shapes are never touched. Loudness is the
+    docs-consistency fence's job — it runs inside ``validate_and_build``
+    before any commit exists.
+    """
+    readme = ROOT / "README.md"
+    if not readme.is_file():
+        return
+    text = readme.read_text(encoding="utf-8")
+    updated = README_WHEEL_URL_PATTERN.sub(
+        f"releases/download/v{version}/magic_hermes-{version}-py3-none-any.whl",
+        text,
+    )
+    updated = README_EXAMPLE_PROSE_PATTERN.sub(f"shown for v{version}", updated)
+    if updated != text:
+        readme.write_text(updated, encoding="utf-8")
+
+
 def set_version(version: str) -> None:
     if not SEMVER.fullmatch(version):
         raise ReleaseError(f"release version must be X.Y.Z, got {version!r}")
@@ -118,6 +157,7 @@ def set_version(version: str) -> None:
         r'^__version__ = "[^"]+"$',
         f'__version__ = "{version}"',
     )
+    _update_readme_install_example(version)
 
 
 def assert_versions(version: str) -> None:

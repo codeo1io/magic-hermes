@@ -113,6 +113,68 @@ def test_readme_pin_claim_when_present_matches_manifest():
         )
 
 
+def _package_version() -> str:
+    """The package's own version, from the pyproject ``version`` line.
+
+    Same regex shape as ``scripts/release.py::current_version`` so the
+    fence and the release lane can never disagree about the source of
+    truth.
+    """
+    match = re.search(
+        r'^version = "([^"]+)"$',
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert match is not None, (
+        "pyproject.toml must declare the package version on a "
+        "'version = \"X.Y.Z\"' line"
+    )
+    return match.group(1)
+
+
+def test_readme_install_example_matches_package_version():
+    """The install example's wheel URLs and prose must cite the package version.
+
+    The example is the only README version claim that had no fence: it
+    rotted twice on master (2026-10 record §2 R4 and §8) and again through
+    v0.3.53-v0.3.55 while this test was in flight.
+    ``scripts/release.py::set_version`` now rewrites the example on every
+    bump (``_update_readme_install_example``); this test is the authority
+    that makes a stale example impossible to ship silently.
+    """
+    version = _package_version()
+    readme = README.read_text(encoding="utf-8")
+    urls = re.findall(
+        r"releases/download/v(\d+\.\d+\.\d+)/"
+        r"magic_hermes-(\d+\.\d+\.\d+)-py3-none-any\.whl",
+        readme,
+    )
+    assert urls, (
+        "README install example lost its wheel-URL lines "
+        "(releases/download/vX.Y.Z/magic_hermes-X.Y.Z-py3-none-any.whl); "
+        "restore the example block in §Install step 3"
+    )
+    for tag, wheel in urls:
+        assert tag == wheel == version, (
+            f"README install example cites wheel {wheel} at tag v{tag} but "
+            f"the package version is {version}; scripts/release.py "
+            "set_version carries the example forward on every bump — if "
+            "this fires after an exogenous release, re-sync the example "
+            "to the current pyproject version"
+        )
+    prose = re.findall(r"shown for v(\d+\.\d+\.\d+)", readme)
+    assert prose, (
+        "README install example lost its '(shown for vX.Y.Z; …)' prose; "
+        "restore the example block in §Install step 3"
+    )
+    for cited in prose:
+        assert cited == version, (
+            f"README install example prose says 'shown for v{cited}' but "
+            f"the package version is {version}; scripts/release.py "
+            "set_version carries the example prose forward on every bump"
+        )
+
+
 def test_readme_adoption_policy_matches_resolver():
     """README's sync-adoption claim must match the resolver's actual policy.
 
