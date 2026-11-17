@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +31,40 @@ def _tested_version() -> str:
         )
     )
     return manifest["tested_version"]
+
+
+def _pyproject_version() -> str:
+    match = re.search(
+        r'^version = "([^"]+)"$',
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert match is not None, "pyproject.toml must declare a version"
+    return match.group(1)
+
+
+def _latest_release_tag() -> str | None:
+    """Highest ``vX.Y.Z`` tag, or ``None`` when git/tags are unavailable.
+
+    Shallow CI checkouts (``actions/checkout`` with the default fetch-depth)
+    carry no tags; callers must treat ``None`` as "tag anchor absent", not
+    as an error.
+    """
+    probe = subprocess.run(
+        ["git", "tag", "-l", "v*", "--sort=v:refname"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        return None
+    versions = [
+        line.removeprefix("v")
+        for line in probe.stdout.splitlines()
+        if re.fullmatch(r"v\d+\.\d+\.\d+", line)
+    ]
+    return versions[-1] if versions else None
 
 
 def _sync_crons() -> list[str]:
@@ -110,6 +145,60 @@ def test_readme_pin_claim_when_present_matches_manifest():
         assert claim == _tested_version(), (
             f"README claims upstream {claim} but the manifest pins "
             f"{_tested_version()}"
+        )
+
+
+def test_readme_install_example_matches_shipped_version():
+    """README's install example must name a shipped version of this package.
+
+    Two anchors are accepted on purpose: the pyproject version (exact on
+    master and inside the release transaction, where the release-lane
+    updater rewrites the example in the same commit that bumps the
+    metadata) and the newest ``v*`` tag (covers a landing whose example
+    targets a release newer than the local tree's base). A stale, partial,
+    or absent example matches neither anchor and fails here — update the
+    README example (or the release-lane updater in scripts/release.py) and
+    this test together.
+    """
+    anchors = {_pyproject_version()}
+    latest_tag = _latest_release_tag()
+    if latest_tag is not None:
+        anchors.add(latest_tag)
+
+    readme = README.read_text(encoding="utf-8")
+    urls = re.findall(
+        r"releases/download/v(\d+\.\d+\.\d+)/magic_hermes-(\d+\.\d+\.\d+)-py3",
+        readme,
+    )
+    assert len(urls) == 2, (
+        f"README install example must carry exactly 2 wheel URLs (uv and "
+        f"pip forms), found {len(urls)}; absence or duplication is drift — "
+        "update the README example (or the release-lane updater) and this "
+        "test together"
+    )
+    for tag_version, file_version in urls:
+        assert tag_version == file_version, (
+            f"README wheel URL mixes tag v{tag_version} with filename "
+            f"magic_hermes-{file_version}; both must name the same release"
+        )
+        assert tag_version in anchors, (
+            f"README install example pins v{tag_version}, which is neither "
+            "the pyproject version nor the newest v* tag (accepted: "
+            f"{sorted(anchors)}); update the README example (or the "
+            "release-lane updater) and this test together"
+        )
+    prose = re.findall(r"shown for v(\d+\.\d+\.\d+)", readme)
+    assert prose, (
+        "README install example lost its '(shown for vX.Y.Z; ...)' prose "
+        "note; update the README example (or the release-lane updater) and "
+        "this test together"
+    )
+    for version in prose:
+        assert version in anchors, (
+            f"README '(shown for vX.Y.Z)' prose pins v{version}, which is "
+            "neither the pyproject version nor the newest v* tag (accepted: "
+            f"{sorted(anchors)}); update the README example (or the "
+            "release-lane updater) and this test together"
         )
 
 
