@@ -1210,3 +1210,392 @@ class TestDeploySmoke:
             f"deployed interpreter has magic-hermes {installed} but the "
             f"newest tag is {newest}"
         )
+
+
+def _boot_transient_store(
+    tmp_path, *, historian_age_h, historian_status="success", source_fresh_h=None
+):
+    """Build a tmp shared store for boot-transient lane tests.
+
+    Mirrors the production shape the corroboration gate probes: a
+    readable schema lane, a historian_runs row at the requested age,
+    optionally a fresher ``source_contents`` write (the live observed
+    shape where the historian idles while sessions keep writing), and
+    the classification guard applied.
+    """
+    import sqlite3
+
+    from magic_hermes import historian_guard as hg
+
+    db = tmp_path / "context.db"
+    hg.make_fixture_db(db)
+    con = sqlite3.connect(db)
+    con.execute("create table schema_migrations (version integer primary key)")
+    con.execute("insert into schema_migrations values (95)")
+    now_ms = int(time.time() * 1000)
+    hg.insert_run(
+        con,
+        status=historian_status,
+        created_at=now_ms - int(historian_age_h * 3_600_000),
+    )
+    if source_fresh_h is not None:
+        con.execute(
+            "create table source_contents "
+            "(id integer primary key, created_at integer)"
+        )
+        con.execute(
+            "insert into source_contents values (1, ?)",
+            (now_ms - int(source_fresh_h * 3_600_000),),
+        )
+    con.commit()
+    con.close()
+    hg.apply_guard(db)
+    return db
+
+
+class TestBootTransientClassifier:
+    """Unit 1 (finding d59758598379): the boot-transient classifier.
+
+    Exact-substring recognition of the boot-window resource-exhaustion
+    family across both observed shapes, with negative controls pinning
+    the scope guard (hello-only, negative statuses only).
+    """
+
+    @staticmethod
+    def _wrap(text):
+        return f"Magic Context sidecar failed: {text}"
+
+    @pytest.mark.parametrize(
+        "text,label",
+        [
+            (
+                "Runtime exited during hello with status -6; request was "
+                "not replayed; stderr: ... uv_thread_create ...",
+                "hello-signal-death",
+            ),
+            (
+                "Runtime timed out after 60.0s during hello; "
+                "request was not replayed",
+                "hello-timeout",
+            ),
+            ("can't start new thread", "thread-starvation"),
+            (
+                "Could not start Magic Context runtime: "
+                "[Errno 11] Resource temporarily unavailable",
+                "spawn-eagain",
+            ),
+        ],
+    )
+    def test_pinned_shapes_match(self, text, label):
+        assert cli._sidecar_boot_transient([self._wrap(text)]) == label
+
+    def test_pair_join_matches_split_sentence(self):
+        # the real stderr-tail-cut shape: the first attempt's text cut at
+        # a sentence boundary, the retry completing the sentence — the
+        # wrapper-stripped space join re-types it (mirrors the skew
+        # classifier's join; a mid-word cut is not a claimed shape)
+        first = self._wrap("Runtime exited during")
+        second = self._wrap(
+            "hello with status -6; request was not replayed"
+        )
+        assert cli._sidecar_boot_transient([first, second]) == (
+            "hello-signal-death"
+        )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # positive exit at hello is a clean refusal, not starvation
+            "Runtime exited during hello with status 1; "
+            "request was not replayed",
+            # fence refusal / lane skew keeps its own typed FAIL
+            "Runtime exited during hello (status 1); stderr: "
+            "[magic-context] storage fatal: refusing to open context.db; "
+            "upstream migration lane v95 is newer than this binary "
+            "supports (max v94). A pinned or stale plugin is likely "
+            "sharing this database",
+            # non-hello methods never match
+            "Runtime exited during bind with status -6; "
+            "request was not replayed",
+            "Runtime timed out after 60.0s during scan; "
+            "request was not replayed",
+            # protocol errors stay generic
+            "Runtime returned invalid JSON during hello",
+            # DB-health texts belong to other lanes
+            "error:database is locked",
+        ],
+    )
+    def test_negative_controls_stay_negative(self, text):
+        assert cli._sidecar_boot_transient([self._wrap(text)]) is None
+
+
+class TestBootTransientVerdictMatrix:
+    """Unit 3 (finding d59758598379): WARN only when corroborated.
+
+    The verdict flip — a classified boot transient with a corroborated
+    store renders one WARN (rc 0, "FAIL 0" for maestro's evaluator);
+    every other combination renders today's generic FAIL verbatim.
+    """
+
+    SHAPE_1 = RuntimeError(
+        "Runtime exited during hello with status -6; request was not "
+        "replayed; stderr: ... uv_thread_create ..."
+    )
+    SHAPE_2 = RuntimeError("can't start new thread")
+
+    def _run(self, tmp_path, monkeypatch, isolated_home, capsys, error):
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            sidecar_error=error,
+        )
+        return rc, capsys.readouterr().out
+
+    def test_shape1_corroborated_is_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _boot_transient_store(tmp_path, historian_age_h=0.1)
+        rc, out = self._run(tmp_path, monkeypatch, isolated_home, capsys, self.SHAPE_1)
+        assert rc == 0
+        assert "FAIL 0" in out
+        assert out.count("WARN") >= 1
+        assert "boot transient (hello-signal-death)" in out
+        assert "guard active" in out
+
+    def test_shape2_pair_corroborated_is_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _boot_transient_store(tmp_path, historian_age_h=0.1)
+        rc, out = self._run(tmp_path, monkeypatch, isolated_home, capsys, self.SHAPE_2)
+        assert rc == 0
+        assert "FAIL 0" in out
+        assert "boot transient (thread-starvation)" in out
+        assert "(fast-fail retry)" in out
+
+    def test_historian_idle_source_fresh_corroborates(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # the live observed shape: historian idle 40 h while sessions
+        # keep writing source_contents minutes ago
+        _boot_transient_store(
+            tmp_path, historian_age_h=40.0, source_fresh_h=0.05
+        )
+        rc, out = self._run(tmp_path, monkeypatch, isolated_home, capsys, self.SHAPE_2)
+        assert rc == 0
+        assert "boot transient (thread-starvation)" in out
+        assert "source_contents" in out
+
+    def test_stale_store_keeps_fail_verbatim(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _boot_transient_store(tmp_path, historian_age_h=48.0)
+        rc, out = self._run(tmp_path, monkeypatch, isolated_home, capsys, self.SHAPE_2)
+        wrapped = "Magic Context sidecar failed: can't start new thread"
+        expected = f"{wrapped} (fast-fail retry) {wrapped}"
+        assert rc == 1
+        assert expected in out
+        assert "boot transient" not in out
+
+    def test_failed_historian_row_keeps_fail(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        import sqlite3
+
+        from magic_hermes import historian_guard as hg
+
+        db = _boot_transient_store(tmp_path, historian_age_h=0.1)
+        con = sqlite3.connect(db)
+        hg.insert_run(
+            con,
+            status="failed",
+            failure_reason="boom",
+            created_at=int(time.time() * 1000) - 3_600_000,
+        )
+        con.close()
+        rc, out = self._run(tmp_path, monkeypatch, isolated_home, capsys, self.SHAPE_2)
+        assert rc == 1
+        assert "boot transient" not in out
+
+    def test_skew_wins_over_transient(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _boot_transient_store(tmp_path, historian_age_h=0.1)
+        error = RuntimeError(
+            "can't start new thread; stderr: [magic-context] storage "
+            "fatal: refusing to open context.db; upstream migration lane "
+            "v95 is newer than this binary supports (max v94). A pinned "
+            "or stale plugin is likely sharing this database"
+        )
+        rc, out = self._run(tmp_path, monkeypatch, isolated_home, capsys, error)
+        assert rc == 1
+        assert "shared-store lane skew" in out
+        assert "boot transient" not in out
+
+    def test_healthy_run_has_no_new_rows(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        rc, out = self._run(tmp_path, monkeypatch, isolated_home, capsys, None)
+        assert rc == 0
+        assert "boot transient" not in out
+
+
+class TestBootTransientCorroboration:
+    """Unit 2 (finding d59758598379): the fail-closed liveness gate.
+
+    Helper-level contract of ``_boot_transient_corroboration``: every
+    component read-only, every probe error meaning "not corroborated"
+    (a gate that cannot see must not absolve), and the evidence string
+    naming each component for the WARN row's audit trail.
+    """
+
+    def test_no_store_fails_closed(self):
+        ok, evidence = cli._boot_transient_corroboration(None)
+        assert ok is False
+        assert evidence == "no shared store"
+
+    def test_absent_store_file_fails_closed(self, tmp_path):
+        ok, evidence = cli._boot_transient_corroboration(
+            tmp_path / "absent.db"
+        )
+        assert ok is False
+        assert evidence.startswith("store unreadable")
+
+    def test_corrupt_store_fails_closed(self, tmp_path):
+        # a file that opens but is not a database: the first probe
+        # raises DatabaseError inside the gate's read block
+        corrupt = tmp_path / "context.db"
+        corrupt.write_bytes(b"definitely not a sqlite database")
+        ok, evidence = cli._boot_transient_corroboration(corrupt)
+        assert ok is False
+        assert evidence.startswith("store unreadable")
+
+    def test_fresh_historian_row_corroborates(self, tmp_path):
+        # the lower-lane shape: historian_runs is the only activity
+        # table and it wrote minutes ago
+        db = _boot_transient_store(tmp_path, historian_age_h=0.1)
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert ok is True
+        assert "historian_runs.created_at 0.1h ago" in evidence
+        assert "migration lane v95, pending 0" in evidence
+        assert "guard active" in evidence
+
+    def test_historian_idle_source_fresh_corroborates(self, tmp_path):
+        # the live observed shape: historian idle 40 h while sessions
+        # keep writing source_contents minutes ago
+        db = _boot_transient_store(
+            tmp_path, historian_age_h=40.0, source_fresh_h=0.05
+        )
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert ok is True
+        assert "source_contents.created_at" in evidence
+
+    def test_updated_at_column_is_consulted(self, tmp_path):
+        import sqlite3
+
+        db = _boot_transient_store(tmp_path, historian_age_h=30.0)
+        con = sqlite3.connect(db)
+        # notes with only an updated_at timestamp, written 0.2 h ago
+        con.execute(
+            "create table notes (id integer primary key, updated_at integer)"
+        )
+        con.execute(
+            "insert into notes values (1, ?)",
+            (int(time.time() * 1000) - int(0.2 * 3_600_000),),
+        )
+        con.commit()
+        con.close()
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert ok is True
+        assert "notes.updated_at 0.2h ago" in evidence
+
+    def test_all_activity_stale_fails_closed(self, tmp_path):
+        db = _boot_transient_store(tmp_path, historian_age_h=48.0)
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert ok is False
+        assert evidence.startswith("stale liveness")
+
+    def test_fresh_failed_historian_row_fails_closed(self, tmp_path):
+        import sqlite3
+
+        from magic_hermes import historian_guard as hg
+
+        db = _boot_transient_store(tmp_path, historian_age_h=0.1)
+        con = sqlite3.connect(db)
+        hg.insert_run(
+            con,
+            status="failed",
+            failure_reason="boom",
+            created_at=int(time.time() * 1000) - 3_600_000,
+        )
+        con.close()
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert ok is False
+        assert "failed historian row(s) in window" in evidence
+
+    def test_guard_absent_fails_closed(self, tmp_path):
+        import sqlite3
+
+        db = tmp_path / "context.db"
+        from magic_hermes import historian_guard as hg
+
+        hg.make_fixture_db(db)
+        con = sqlite3.connect(db)
+        con.execute(
+            "create table schema_migrations (version integer primary key)"
+        )
+        con.execute("insert into schema_migrations values (95)")
+        hg.insert_run(
+            con,
+            status="success",
+            created_at=int(time.time() * 1000),
+        )
+        con.commit()
+        con.close()
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert ok is False
+        assert evidence == "guard absent or drifted"
+
+    def test_guard_drift_fails_closed(self, tmp_path):
+        import sqlite3
+
+        from magic_hermes import historian_guard as hg
+
+        db = _boot_transient_store(tmp_path, historian_age_h=0.1)
+        con = sqlite3.connect(db)
+        con.execute(f"drop trigger {hg.TRIGGER_NAME}")
+        con.execute(
+            f"create trigger {hg.TRIGGER_NAME} after update on "
+            "historian_runs begin select 1; end"
+        )
+        con.commit()
+        con.close()
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert ok is False
+        assert evidence == "guard absent or drifted"
+
+    def test_migration_pending_is_evidence_not_a_gate(self, tmp_path):
+        # the banked spec makes component 2 *queryability*: an absent
+        # table counts as pending 0, and rows present are named in the
+        # evidence without flipping the gate (the skew lane owns
+        # migration-mismatch failures)
+        import sqlite3
+
+        db = _boot_transient_store(tmp_path, historian_age_h=0.1)
+        con = sqlite3.connect(db)
+        con.execute(
+            "create table migration_pending "
+            "(ordinal integer primary key, source text)"
+        )
+        con.execute("insert into migration_pending values (1, 'a')")
+        con.commit()
+        con.close()
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert ok is True
+        assert "pending 1" in evidence
+
+    def test_evidence_names_failed_row_window(self, tmp_path):
+        db = _boot_transient_store(tmp_path, historian_age_h=0.1)
+        _, evidence = cli._boot_transient_corroboration(db)
+        assert "no failed historian rows in 72h" in evidence

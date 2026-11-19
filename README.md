@@ -341,6 +341,28 @@ discovered copy is newer than the build-validated pin, not just the
 primary, because the shared store migrates with the newest copy on
 the machine. Here too the doctor never writes.
 
+The doctor's fresh sidecar boot gets the same honest-degradation
+treatment (finding d59758598379: under host memory/swap pressure
+the boot itself can die at thread creation — a Node-side signal
+death at hello (`status -6`, `uv_thread_create`) or a Python-side
+spawn `[Errno 11] Resource temporarily unavailable` — while the
+shared store it would serve stays perfectly healthy, and maestro's
+evaluator reads any doctor FAIL as a subsystem outage). When the
+failure text matches that boot-window resource-exhaustion family
+and a read-only corroboration gate confirms the subsystem is alive
+— freshest write across the store's activity tables inside 24 h
+(the historian legitimately idles for days; sessions do not), no
+failed historian row inside 72 h, migration lane readable, and
+the classification guard present and matching — `doctor` renders
+a typed **WARN** naming the matched shape and the corroboration
+evidence instead of the generic FAIL, keeping `rc==0` and
+`FAIL 0` for the evaluator exactly like the wall-budget and
+bind-contention lanes. Anything else — an unrecognized crash
+shape, a stale store, a fresh failed historian row, a guard
+problem, or a gate that cannot read the store at all — falls
+through to the generic FAIL unchanged: classify then corroborate,
+never classify alone.
+
 ### 2. Manual install (fallback)
 
 Magic-Hermes delegates its context-management implementation to the official Magic
