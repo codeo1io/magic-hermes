@@ -33,6 +33,18 @@ MAGIC_CONTEXT_SYNC_FILES = {
     "README.md",
 }
 
+#: Install-example patterns the release transaction keeps current in
+#: README.md. The wheel URL carries the version twice (release tag +
+#: wheel filename); the prose anchor is the "(shown for vX.Y.Z; ...)" note
+#: above the URL block. Both are count-tolerant by design: a release must
+#: never stall on a benign future README refactor — the strict fence in
+#: tests/test_docs_consistency.py fails the gate if the example drifts,
+#: goes partial, or disappears.
+README_WHEEL_URL_PATTERN = re.compile(
+    r"releases/download/v\d+\.\d+\.\d+/magic_hermes-\d+\.\d+\.\d+-py3"
+)
+README_EXAMPLE_PROSE_PATTERN = re.compile(r"shown for v\d+\.\d+\.\d+")
+
 #: The interpreter operational probes resolve through PATH — the maestro
 #: phase-2 observer runs ``magic-hermes doctor`` from this venv, so landing
 #: a release on master does nothing for the finding until the wheel is
@@ -118,6 +130,32 @@ def set_version(version: str) -> None:
         r'^__version__ = "[^"]+"$',
         f'__version__ = "{version}"',
     )
+    _update_readme_install_example(version)
+
+
+def _update_readme_install_example(version: str) -> None:
+    """Rewrite README's install-example version mentions to ``version``.
+
+    Tolerant by design: replaces whatever matches (zero or more
+    occurrences of either pattern) and never raises. It no-ops when
+    README.md is absent (scenario-test fixtures and fresh checkouts) so
+    ``set_version`` keeps its existing contract, and it no-ops when the
+    example is absent — drift detection is the fence's job
+    (tests/test_docs_consistency.py), not this one's. Runs inside the
+    release transaction, where ``ensure_clean_or_release_version``
+    already allowlists README.md and ``commit_and_tag`` already stages
+    it, so no transaction plumbing changes.
+    """
+    readme = ROOT / "README.md"
+    if not readme.is_file():
+        return
+    text = readme.read_text(encoding="utf-8")
+    updated = README_WHEEL_URL_PATTERN.sub(
+        f"releases/download/v{version}/magic_hermes-{version}-py3", text
+    )
+    updated = README_EXAMPLE_PROSE_PATTERN.sub(f"shown for v{version}", updated)
+    if updated != text:
+        readme.write_text(updated, encoding="utf-8")
 
 
 def assert_versions(version: str) -> None:

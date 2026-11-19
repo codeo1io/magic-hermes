@@ -39,6 +39,16 @@ maintainer merges it.
 - Pi, OpenCode, and Hermes use the same Magic Context SQLite store and JSONC
   configuration.
 
+Concurrent Hermes, Pi, and OpenCode processes share one SQLite store, so the
+bridge guards its startup bind with a lock that lives beside the durable
+database (never under scratch storage): a live holder is never evicted for
+age alone, a freshly started owner gets a bounded grace window to publish
+its PID, the mutex is released before any retry cooldown, and the doctor's
+sidecar defers the shared-store bind entirely so diagnostics never contend
+with live sessions. This shipped in v0.3.29 — see
+[docs/v0.3.29-bindlock-release.md](docs/v0.3.29-bindlock-release.md) for
+the concurrency failures it removed.
+
 There is no magic-hermes daemon, socket protocol, alternate database, or copied
 Magic Context core.
 
@@ -365,19 +375,19 @@ export MAGIC_CONTEXT_PACKAGE_ROOT=/path/to/node_modules/@cortexkit/pi-magic-cont
 
 Install the latest published wheel into the Python environment used by Hermes. This
 repository is public, so install the release wheel directly from its GitHub Release
-URL (shown for v0.3.20; newer versions follow the same URL pattern on the
+URL (shown for v0.3.61; newer versions follow the same URL pattern on the
 [Releases](https://github.com/codeo1io/magic-hermes/releases) page):
 
 ```bash
 uv pip install --python /path/to/hermes/venv/bin/python --no-deps \
-  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.20/magic_hermes-0.3.20-py3-none-any.whl
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.61/magic_hermes-0.3.61-py3-none-any.whl
 ```
 
 If `uv` is not installed, use the Hermes environment's `pip` instead:
 
 ```bash
 /path/to/hermes/venv/bin/python -m pip install --no-deps \
-  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.20/magic_hermes-0.3.20-py3-none-any.whl
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.61/magic_hermes-0.3.61-py3-none-any.whl
 ```
 
 For development from a local checkout, install the repository directly instead:
@@ -493,6 +503,10 @@ mural generation, real OpenAI-compatible embedding production/model rotation,
 and upstream Git indexing. Separate host E2Es exercise normal `hermes chat`,
 optimized `hermes -z`, gateway-style agent construction, background historian
 execution, and real Hermes Dreamer child delegation.
+Beyond the local battery, the `private-leak-sentinel` workflow scans the full
+repository history for leaked credentials (gitleaks, via the fleet-wide reusable
+workflow in `codeo1io/.github`) on every push and pull request, with a daily
+off-peak rescan keeping the guarantee current.
 
 ## Compatibility and failure behavior
 
@@ -509,7 +523,7 @@ review condition and the documented rollback); an explicitly requested series
 jump additionally requires the `allow_series_jump` repository-dispatch
 confirmation before the sync resolves it at all. Each validated upstream release
 updates the dependency pin and compatibility manifest,
-increments the Magic-Hermes patch version (for example `0.2.0` to `0.2.1`), runs the
+increments the Magic-Hermes patch version (for example `0.3.60` to `0.3.61`), runs the
 full Python/Node/build gate, commits and tags the release, and publishes the wheel,
 sdist, and checksums as a GitHub release. A missing dependency or unvalidated series
 is reported before the adapter starts. Runtime and host-LLM failures during
