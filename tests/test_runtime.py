@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+import errno
 import io
 import json
 import signal
@@ -511,3 +512,162 @@ class TestDiscoveryWidening:
 
         assert candidates[0] == override.resolve()
         assert runtime.find_magic_context_package() == override.resolve()
+
+
+class TestRuntimeFailureTaxonomy:
+    """U1 (finding c7d63424): structured facts ride alongside the rendered
+    messages so the doctor can classify boot-capacity failures without
+    parsing strings. Every assertion pins BOTH the typed fact and the
+    byte-identical message today's doctor rows render."""
+
+    def test_hello_timeout_carries_typed_kind(self, monkeypatch):
+        client = runtime.RuntimeClient()
+        process = _FakeProcess("")
+        monkeypatch.setattr(client, "_ensure_process", lambda: process)
+        monkeypatch.setattr(
+            runtime.select,
+            "select",
+            lambda readable, _writable, _errors, _timeout: ([], [], []),
+        )
+
+        with pytest.raises(runtime.RuntimeProtocolError) as exc_info:
+            client.call("hello", timeout=0.5)
+
+        assert str(exc_info.value) == (
+            "Runtime timed out after 0.5s during hello; "
+            "request was not replayed"
+        )
+        assert exc_info.value.kind == "hello_timeout"
+        assert exc_info.value.method == "hello"
+
+    def test_non_hello_timeout_carries_call_timeout_kind(self, monkeypatch):
+        client = runtime.RuntimeClient()
+        process = _FakeProcess("")
+        monkeypatch.setattr(client, "_ensure_process", lambda: process)
+        monkeypatch.setattr(
+            runtime.select,
+            "select",
+            lambda readable, _writable, _errors, _timeout: ([], [], []),
+        )
+
+        with pytest.raises(runtime.RuntimeProtocolError) as exc_info:
+            client.call("doctor", timeout=0.5)
+
+        assert str(exc_info.value) == (
+            "Runtime timed out after 0.5s during doctor; "
+            "request was not replayed"
+        )
+        assert exc_info.value.kind == "call_timeout"
+        assert exc_info.value.method == "doctor"
+
+    def test_runtime_exit_carries_status_and_stderr_tail(self, monkeypatch):
+        class _AbortedProcess(_FakeProcess):
+            def poll(self):
+                return -6
+
+        client = runtime.RuntimeClient()
+        process = _AbortedProcess("")
+        monkeypatch.setattr(client, "_ensure_process", lambda: process)
+        monkeypatch.setattr(
+            runtime.select,
+            "select",
+            lambda readable, _writable, _errors, _timeout: (readable, [], []),
+        )
+        client._stderr_tail.append("  # node[4242]: uv_thread_create native assert")
+
+        with pytest.raises(runtime.RuntimeProtocolError) as exc_info:
+            client.call("hello")
+
+        message = str(exc_info.value)
+        assert message.startswith(
+            "Runtime exited during hello with status -6; "
+            "request was not replayed; stderr: "
+        )
+        assert "uv_thread_create" in message
+        assert exc_info.value.kind == "runtime_exit"
+        assert exc_info.value.method == "hello"
+        assert exc_info.value.exit_status == -6
+        assert "uv_thread_create" in (exc_info.value.stderr_tail or "")
+
+    def test_spawn_eagain_is_typed_spawn_eagain(self, monkeypatch, tmp_path):
+        package_root = _local_runtime(
+            monkeypatch, tmp_path, runtime.tested_magic_context_version()
+        )
+        (package_root / "dist").mkdir(exist_ok=True)
+        (package_root / "dist" / "index.js").write_text("", encoding="utf-8")
+
+        def _refuse(*_args, **_kwargs):
+            raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+
+        monkeypatch.setattr(runtime.subprocess, "Popen", _refuse)
+        client = runtime.RuntimeClient(package_root=package_root)
+
+        with pytest.raises(runtime.RuntimeUnavailable) as exc_info:
+            client.call("hello")
+
+        assert str(exc_info.value) == (
+            "Could not start Magic Context runtime: "
+            "[Errno 11] Resource temporarily unavailable"
+        )
+        assert exc_info.value.kind == "spawn_eagain"
+
+    def test_spawn_permission_error_is_typed_spawn_error(
+        self, monkeypatch, tmp_path
+    ):
+        package_root = _local_runtime(
+            monkeypatch, tmp_path, runtime.tested_magic_context_version()
+        )
+        (package_root / "dist").mkdir(exist_ok=True)
+        (package_root / "dist" / "index.js").write_text("", encoding="utf-8")
+
+        def _refuse(*_args, **_kwargs):
+            raise OSError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(runtime.subprocess, "Popen", _refuse)
+        client = runtime.RuntimeClient(package_root=package_root)
+
+        with pytest.raises(runtime.RuntimeUnavailable) as exc_info:
+            client.call("hello")
+
+        assert str(exc_info.value).startswith(
+            "Could not start Magic Context runtime: [Errno 13]"
+        )
+        assert exc_info.value.kind == "spawn_error"
+
+    def test_stderr_thread_failure_is_typed_thread_unavailable(
+        self, monkeypatch, tmp_path
+    ):
+        package_root = _local_runtime(
+            monkeypatch, tmp_path, runtime.tested_magic_context_version()
+        )
+        (package_root / "dist").mkdir(exist_ok=True)
+        (package_root / "dist" / "index.js").write_text("", encoding="utf-8")
+
+        class _SpawnedProcess(_FakeProcess):
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        spawned = _SpawnedProcess("")
+        monkeypatch.setattr(
+            runtime.subprocess, "Popen", lambda *_a, **_k: spawned
+        )
+        real_thread = runtime.threading.Thread
+
+        class _FailingThread(real_thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(runtime.threading, "Thread", _FailingThread)
+        client = runtime.RuntimeClient(package_root=package_root)
+
+        with pytest.raises(runtime.RuntimeUnavailable) as exc_info:
+            client.call("hello")
+
+        assert str(exc_info.value) == "can't start new thread"
+        assert exc_info.value.kind == "thread_unavailable"
