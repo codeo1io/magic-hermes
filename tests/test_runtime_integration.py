@@ -2206,7 +2206,17 @@ def test_upstream_historian_trigger_and_compartment_lease(monkeypatch, tmp_path)
     db_path = tmp_path / "lease.db"
     messages = conversation(30)
     for message in messages[1:]:
-        message["content"] += " " + ("trigger-payload " * 80)
+        # Historian-trigger admission changed upstream in 0.49.65: the
+        # message-count lane (>=12 messages) that let this 30-message
+        # fixture fire on <=0.49.64 was removed, and admission is now
+        # token-only (>= MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE = 6000). The
+        # eligible window is budget-capped by the session context
+        # (deriveTriggerBudget floors at 5000 for small context_limit),
+        # so small-context fixtures can never reach the 6000-token gate and are
+        # refused as "below meaningfulness". 48k context + 33.6k usage (70%,
+        # above the 65% threshold) lifts the per-run head cap past the gate
+        # on both old and new admission shapes.
+        message["content"] += " " + ("trigger-payload " * 200)
 
     with RuntimeClient(db_path=db_path, timeout=60) as first:
         first.call(
@@ -2220,12 +2230,12 @@ def test_upstream_historian_trigger_and_compartment_lease(monkeypatch, tmp_path)
                 "session_id": "lease",
                 "model": "gpt-5",
                 "provider": "openai",
-                "context_length": 10_000,
+                "context_length": 48_000,
             },
         )
         first.call(
             "usage_update",
-            {"session_id": "lease", "input_tokens": 7_000, "context_length": 10_000},
+            {"session_id": "lease", "input_tokens": 33_600, "context_length": 48_000},
         )
         decision = first.call(
             "historian_decide",
@@ -2402,7 +2412,13 @@ def test_historian_lease_conflict_records_noop_and_abort_rows(
     db_path = tmp_path / "telemetry-lease.db"
     messages = conversation(30)
     for message in messages[1:]:
-        message["content"] += " " + ("trigger-payload " * 80)
+        # Same context scaling as test_upstream_historian_trigger_and_
+        # compartment_lease: 0.49.65 made admission token-only (>=6000
+        # estimated tail tokens), and the window is capped by context
+        # size, so 48k context + 33.6k usage (70%, above the 65%
+        # execute threshold) is required for the trigger to fire on
+        # both core admission shapes.
+        message["content"] += " " + ("trigger-payload " * 200)
 
     with RuntimeClient(db_path=db_path, timeout=60) as first:
         first.call(
@@ -2416,15 +2432,15 @@ def test_historian_lease_conflict_records_noop_and_abort_rows(
                 "session_id": "telemetry-lease",
                 "model": "gpt-5",
                 "provider": "openai",
-                "context_length": 10_000,
+                "context_length": 48_000,
             },
         )
         first.call(
             "usage_update",
             {
                 "session_id": "telemetry-lease",
-                "input_tokens": 7_000,
-                "context_length": 10_000,
+                "input_tokens": 33_600,
+                "context_length": 48_000,
             },
         )
         decision = first.call(
