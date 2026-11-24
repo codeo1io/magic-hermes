@@ -145,11 +145,14 @@ landing as one atomic change (its Unit 1):
   the example forward in the same commit as the version bump — the durable
   proof the class is closed.
 - Operational note for the merge that lands this change: this branch's
-  example reads v0.3.58 (green here: the newest local tag is v0.3.58). If
-  master is at v0.3.59+ at landing, the example matches neither of master's
-  anchors until the next release commit — re-sync the three sites (§2 R1) in
-  the merge, or accept push-CI red until the next train's updater self-heals
-  it. PR CI note: `actions/checkout`'s default `fetch-depth: 1` carries no
+  example was re-synced to v0.3.64 at targeted_tests time (2026-11-24)
+  by running the ported updater itself (`_update_readme_install_example`),
+  after master's exogenous trains advanced past the implement-time v0.3.58
+  (green here: the newest local tag is v0.3.64, equal to master's
+  pyproject). If master ships further releases before landing, the example
+  matches neither of master's anchors until the next release commit —
+  re-sync the three sites (§2 R1) in the merge again, or accept push-CI red
+  until the next train's updater self-heals it. PR CI note: `actions/checkout`'s default `fetch-depth: 1` carries no
   tags, so `_latest_release_tag` returns `None` there and the fence anchors
   on pyproject alone.
 
