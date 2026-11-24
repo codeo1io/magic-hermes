@@ -2415,8 +2415,9 @@ def test_historian_lease_conflict_records_noop_and_abort_rows(
         # Same context scaling as test_upstream_historian_trigger_and_
         # compartment_lease: 0.49.65 made admission token-only (>=6000
         # estimated tail tokens), and the window is capped by context
-        # size, so 30k context + 21k usage is required for the trigger
-        # to fire on both core admission shapes.
+        # size, so 48k context + 33.6k usage (70%, above the 65%
+        # execute threshold) is required for the trigger to fire on
+        # both core admission shapes.
         message["content"] += " " + ("trigger-payload " * 200)
 
     with RuntimeClient(db_path=db_path, timeout=60) as first:
@@ -2431,7 +2432,7 @@ def test_historian_lease_conflict_records_noop_and_abort_rows(
                 "session_id": "telemetry-lease",
                 "model": "gpt-5",
                 "provider": "openai",
-                "context_length": 30_000,
+                "context_length": 48_000,
             },
         )
         first.call(
