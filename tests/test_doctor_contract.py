@@ -1210,3 +1210,289 @@ class TestDeploySmoke:
             f"deployed interpreter has magic-hermes {installed} but the "
             f"newest tag is {newest}"
         )
+
+
+class TestBootCapacitySeverityPolicy:
+    """U3 (finding c7d63424, plan A+A2) — the boot/hello-phase
+    thread-capacity family renders one WARN row with evidence and remedy
+    (rc 0, "FAIL 0" survives the maestro gate) when the kind is strong or
+    a host-pressure corroborator holds, bounded by a consecutive-streak
+    escalation budget. Everything else renders exactly as before: the
+    generic pair/first-failure FAIL wording, the lane-skew typed row,
+    and post-hello failures are pinned byte-for-byte here.
+
+    Corroborators are pinned deterministic per-test (autouse fixture);
+    the host this suite runs on may or may not be oversubscribed, so no
+    weak-kind test may depend on live load.
+    """
+
+    TIMEOUT_ERROR = (
+        "Runtime timed out after 60.0s during hello; request was not replayed"
+    )
+    THREAD_ERROR = "can't start new thread"
+    INTERNAL_WORKER_STDERR = (
+        "    at new InternalWorker (node:internal/worker:560:5) | "
+        "code: 'ERR_WORKER_INIT_FAILED' | Node.js v22.22.0"
+    )
+
+    @pytest.fixture(autouse=True)
+    def _deterministic_corroborators(self, monkeypatch):
+        monkeypatch.setattr(cli, "_host_pressure_evidence", lambda: None)
+        monkeypatch.setattr(cli, "_thread_self_probe", lambda: False)
+
+    @staticmethod
+    def _pressure(high=True):
+        return {
+            "load": 26.24 if high else 10.0,
+            "cpus": 14,
+            "ratio": 1.87 if high else 0.71,
+            "high": high,
+        }
+
+    # -- helpers that build the typed errors the runtime now emits --
+
+    @staticmethod
+    def _runtime_unavailable(message, **facts):
+        from magic_hermes.runtime import RuntimeUnavailable
+
+        exc = RuntimeUnavailable(message)
+        for key, value in facts.items():
+            setattr(exc, key, value)
+        return exc
+
+    @staticmethod
+    def _protocol_error(message, **facts):
+        from magic_hermes.runtime import RuntimeProtocolError
+
+        exc = RuntimeProtocolError(message)
+        for key, value in facts.items():
+            setattr(exc, key, value)
+        return exc
+
+    @classmethod
+    def _seed_streak(cls, tmp_path, monkeypatch, count):
+        path = tmp_path / "boot-capacity-streak.json"
+        path.write_text(
+            json.dumps({"schema": 1, "consecutive": count}), encoding="utf-8"
+        )
+        monkeypatch.setattr(cli, "_boot_capacity_streak_path", lambda: path)
+        return path
+
+    def test_strong_thread_error_renders_warn_and_keeps_gate(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        exc = self._runtime_unavailable(self.THREAD_ERROR, kind="thread_unavailable")
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "WARN" in out
+        assert "thread-capacity pressure" in out
+        assert "strong thread-capacity signature" in out
+        assert "PRAGMA quick_check" in out
+        assert "1 of 8" in out
+        summary = next(line for line in out.splitlines() if "Summary:" in line)
+        assert "FAIL 0" in summary
+        assert "FAIL 1" not in summary
+
+    def test_weak_timeout_warns_only_under_load_corroboration(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        monkeypatch.setattr(
+            cli, "_host_pressure_evidence", lambda: self._pressure(high=True)
+        )
+        exc = self._protocol_error(
+            self.TIMEOUT_ERROR, kind="hello_timeout", method="hello"
+        )
+        rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "load 26.24 on 14 CPUs (1.87x)" in out
+        summary = next(line for line in out.splitlines() if "Summary:" in line)
+        assert "FAIL 0" in summary
+
+    def test_weak_timeout_uncorroborated_keeps_generic_fail(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        exc = self._protocol_error(
+            self.TIMEOUT_ERROR, kind="hello_timeout", method="hello"
+        )
+        rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc)
+        out = capsys.readouterr().out
+        assert rc == 1
+        expected_pair = (
+            f"Magic Context sidecar failed: {self.TIMEOUT_ERROR} (fast-fail retry) "
+            f"Magic Context sidecar failed: {self.TIMEOUT_ERROR}"
+        )
+        assert expected_pair in out
+        summary = next(line for line in out.splitlines() if "Summary:" in line)
+        assert "FAIL 1" in summary
+
+    def test_exit_without_thread_signature_is_weak_and_needs_corroboration(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        exit_message = (
+            "Runtime exited during hello with status 1; request was not "
+            "replayed; stderr: Error: Cannot find module './loader.mjs'"
+        )
+        exc = self._protocol_error(
+            exit_message,
+            kind="runtime_exit",
+            method="hello",
+            exit_status=1,
+            stderr_tail="Error: Cannot find module './loader.mjs'",
+        )
+        # uncorroborated -> today's FAIL
+        rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc)
+        assert rc == 1
+        capsys.readouterr()
+        # corroborated -> WARN
+        monkeypatch.setattr(
+            cli, "_host_pressure_evidence", lambda: self._pressure(high=True)
+        )
+        rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "thread-capacity pressure" in out
+
+    def test_exit_with_internal_worker_signature_is_strong(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        exit_message = (
+            "Runtime exited during hello with status 1; request was not "
+            f"replayed; stderr: {self.INTERNAL_WORKER_STDERR}"
+        )
+        exc = self._protocol_error(
+            exit_message,
+            kind="runtime_exit",
+            method="hello",
+            exit_status=1,
+            stderr_tail=self.INTERNAL_WORKER_STDERR,
+        )
+        rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "WARN" in out
+        assert "strong thread-capacity signature" in out
+
+    def test_post_hello_doctor_failure_stays_fail(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        exc = self._protocol_error(
+            "Runtime timed out after 60.0s during doctor; request was not replayed",
+            kind="call_timeout",
+            method="doctor",
+        )
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, doctor_error=exc
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        summary = next(line for line in out.splitlines() if "Summary:" in line)
+        assert "FAIL 1" in summary
+
+    def test_non_family_mixed_failure_stays_fail(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # first attempt strong, second attempt a protocol error outside
+        # the family (the "Runtime failed while" wrapper) — mixed set
+        # must never classify
+        exc = self._runtime_unavailable(self.THREAD_ERROR, kind="thread_unavailable")
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc
+        )
+        capsys.readouterr()
+        assert rc == 0  # sanity: strong pair renders WARN today
+        fence_exc = RuntimeError(
+            "Runtime exited during hello (status 1); stderr: [magic-context] "
+            "storage fatal: refusing to open context.db; upstream migration "
+            "lane v95 is newer than this binary supports (max v94)."
+        )
+        monkeypatch.setattr(
+            cli, "_host_pressure_evidence", lambda: self._pressure(high=True)
+        )
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, sidecar_error=fence_exc
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "shared-store lane skew" in out  # typed row still wins under load
+
+    def test_escalation_after_budget_renders_fail(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        path = self._seed_streak(tmp_path, monkeypatch, 8)
+        exc = self._runtime_unavailable(self.THREAD_ERROR, kind="thread_unavailable")
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "8 consecutive" in out
+        assert "escalating to a real failure" in out
+        assert json.loads(path.read_text())["consecutive"] == 9
+
+    def test_healthy_verdict_resets_streak(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        path = self._seed_streak(tmp_path, monkeypatch, 5)
+        rc, _ = _run_doctor(tmp_path, monkeypatch, isolated_home, {})
+        capsys.readouterr()
+        assert rc == 0
+        assert json.loads(path.read_text())["consecutive"] == 0
+
+    def test_warn_streak_increments(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        path = self._seed_streak(tmp_path, monkeypatch, 2)
+        exc = self._runtime_unavailable(self.THREAD_ERROR, kind="thread_unavailable")
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "3 of 8" in out
+        assert json.loads(path.read_text())["consecutive"] == 3
+
+    def test_json_mode_carries_the_warn_row(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        exc = self._runtime_unavailable(self.THREAD_ERROR, kind="thread_unavailable")
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            json_output=True,
+            sidecar_error=exc,
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        warns = [c for c in payload["checks"] if c["status"] == "WARN"]
+        assert any("thread-capacity pressure" in c["message"] for c in warns)
+        assert payload["summary"]["fail"] == 0
+
+    def test_corrupt_streak_file_reads_as_zero(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        path = tmp_path / "boot-capacity-streak.json"
+        path.write_text("{not json", encoding="utf-8")
+        monkeypatch.setattr(cli, "_boot_capacity_streak_path", lambda: path)
+        assert cli._read_boot_capacity_streak() == 0
+        path.write_text("[1, 2, 3]", encoding="utf-8")
+        assert cli._read_boot_capacity_streak() == 0
+
+    def test_streak_write_is_best_effort(self, tmp_path, monkeypatch):
+        # a failing atomic replace must never raise (advisory state)
+        path = tmp_path / "boot-capacity-streak.json"
+        monkeypatch.setattr(cli, "_boot_capacity_streak_path", lambda: path)
+
+        def _denied(_src, _dst):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(cli.os, "replace", _denied)
+        cli._write_boot_capacity_streak(3)  # must not raise
+        leftover = list(tmp_path.glob("*.tmp"))
+        assert len(leftover) == 1  # the pre-replace temp file remains
+        assert not path.exists()

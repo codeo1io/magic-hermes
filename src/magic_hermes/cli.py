@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -486,6 +487,155 @@ def _shared_store_lane_skew(failures: list[str]) -> tuple[int, int] | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# boot-capacity severity policy (finding c7d63424)
+
+# Host thread-creation exhaustion during the doctor's sidecar boot is an
+# environment-capacity signal, not a Magic Context defect: sessions with
+# live sidecars stay healthy while FRESH boots fail under load (140
+# sidecar FAIL observations since 2026-11-18, every one boot/hello-phase;
+# thread/pid limits verified two orders from saturation — it is memory
+# pressure). maestro's verdict requires rc==0 and "FAIL 0" in stdout; a
+# WARN keeps both, so the corroborated boot-capacity family renders WARN
+# with evidence + remedy instead of a false FAIL that re-opens a CRITICAL
+# finding and dispatches repair runs that add load (48+ runs, 0 landed).
+_BOOT_CAPACITY_LOAD_RATIO = 1.25
+# The soft verdict is bounded: after this many consecutive boot-capacity
+# verdicts the next occurrence escalates back to FAIL — a genuine boot
+# regression on a permanently-loaded host re-escalates within minutes
+# instead of being masked forever.
+_BOOT_CAPACITY_WARN_BUDGET = 8
+_BOOT_CAPACITY_STATE_NAME = "doctor-boot-capacity-streak.json"
+# stderr signatures that self-evidence thread-capacity failure inside a
+# Node exit (strong family membership); every other hello-phase shape is
+# weak and needs a host-pressure corroborator before it may render WARN.
+_THREAD_SIGNATURES = (
+    "uv_thread_create",
+    "InternalWorker",
+    "ERR_WORKER_INIT_FAILED",
+    "ERR_WORKER_OUT_OF_MEMORY",
+    "can't start new thread",
+)
+
+
+def _host_pressure_evidence() -> dict[str, Any] | None:
+    """Read-only host oversubscription evidence; never raises."""
+
+    try:
+        cpus = os.cpu_count() or 1
+        load = os.getloadavg()[0]
+    except (OSError, ValueError):
+        return None
+    ratio = load / cpus
+    return {
+        "load": round(load, 2),
+        "cpus": cpus,
+        "ratio": round(ratio, 2),
+        "high": ratio >= _BOOT_CAPACITY_LOAD_RATIO,
+    }
+
+
+def _thread_self_probe() -> bool:
+    """True when THIS process also cannot start a thread (EAGAIN).
+
+    Strong when positive (host-wide exhaustion proven in-process),
+    neutral when negative — a passing probe does not disprove pressure
+    on another resource zone.
+    """
+
+    try:
+        probe = threading.Thread(target=lambda: None, daemon=True)
+        probe.start()
+        probe.join(timeout=5.0)
+    except (RuntimeError, OSError):
+        return True
+    return False
+
+
+def _boot_capacity_error_class(exc: BaseException) -> str | None:
+    """Classify one sidecar error: "strong" | "weak" | None (not family).
+
+    Strong kinds self-evidence thread-capacity failure (the rendered
+    text cannot mean anything else); weak kinds are ambiguous — a 60 s
+    hello timeout or a bare exit looks identical whether the cause is
+    capacity or a genuine wedge — and WARN only under a corroborator.
+    Post-hello failures never classify (KTD: the sidecar booted).
+    """
+
+    kind = getattr(exc, "kind", None)
+    if kind in ("thread_unavailable", "spawn_eagain"):
+        return "strong"
+    if kind == "hello_timeout":
+        return "weak"
+    if kind == "runtime_exit" and getattr(exc, "method", None) == "hello":
+        stderr = getattr(exc, "stderr_tail", None) or ""
+        if any(sig in stderr for sig in _THREAD_SIGNATURES):
+            return "strong"
+        return "weak"
+    return None
+
+
+def _boot_capacity_family(
+    errors: list[BaseException],
+) -> str | None:
+    """Family verdict for a whole failure set: strong, weak, or None.
+
+    The fast-fail retry records BOTH attempts; every error must be in
+    the family for the policy to claim the verdict.
+    """
+
+    if not errors:
+        return None
+    classes = [_boot_capacity_error_class(exc) for exc in errors]
+    if any(item is None for item in classes):
+        return None
+    if all(item == "strong" for item in classes):
+        return "strong"
+    return "weak"
+
+
+def _boot_capacity_streak_path() -> Path:
+    """State file beside the wiring lease (same XDG data home)."""
+
+    return lease_path().parent / _BOOT_CAPACITY_STATE_NAME
+
+
+def _read_boot_capacity_streak() -> int:
+    """Consecutive boot-capacity verdicts so far; unreadable means zero.
+
+    A corrupt or foreign-schema file is treated like a missing one —
+    the streak is advisory, never authoritative, and must never fail
+    the doctor.
+    """
+
+    try:
+        payload = json.loads(
+            _boot_capacity_streak_path().read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return 0
+    value = payload.get("consecutive") if isinstance(payload, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value if value >= 0 else 0
+
+
+def _write_boot_capacity_streak(count: int) -> None:
+    """Best-effort atomic write; concurrent doctors race last-write-wins."""
+
+    path = _boot_capacity_streak_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(
+            json.dumps({"schema": 1, "consecutive": count}),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def _doctor_wall_budget_s() -> float:
     """Resolve the doctor's total wall budget (U15, finding c7d63424).
 
@@ -789,6 +939,7 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
         # it cannot fit. A retry that succeeds is healthy — the transient
         # failure does not degrade the verdict's truth.
         sidecar_failures: list[str] = []
+        sidecar_errors: list[BaseException] = []
         sidecar_healthy = False
         wall_exhausted = False
         retried = False
@@ -861,11 +1012,15 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                     wall_exhausted = True
                     break
                 sidecar_failures.append(f"Magic Context sidecar failed: {exc}")
+                sidecar_errors.append(exc)
                 elapsed = time.monotonic() - attempt_started
                 if retried or elapsed > _SIDECAR_FAST_FAIL_S:
                     break
                 retried = True
                 time.sleep(_SIDECAR_RETRY_BACKOFF_S)
+        if sidecar_healthy and _read_boot_capacity_streak() != 0:
+            # a healthy verdict ends any prior boot-capacity streak
+            _write_boot_capacity_streak(0)
         if wall_exhausted:
             spent = time.monotonic() - wall_started
             where = str(db_path) if db_path else "<shared-store>"
@@ -887,8 +1042,16 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
             # the fence's own numbers, and names the sanctioned adoption
             # path — never a write: repair is an explicit operator act.
             # The underlying refusal text stays quoted for evidence.
+            # The boot-capacity policy runs AFTER this check (KTD5) so a
+            # fence refusal keeps its typed FAIL even under host load.
             skew = _shared_store_lane_skew(sidecar_failures)
+            family = _boot_capacity_family(sidecar_errors)
+            pressure = _host_pressure_evidence()
+            corroborated = bool(
+                (pressure or {}).get("high") or _thread_self_probe()
+            )
             if skew is not None:
+                _write_boot_capacity_streak(0)
                 store_lane, supported_max = skew
                 if len(sidecar_failures) == 2:
                     underlying = (
@@ -910,13 +1073,61 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                     "are PR-gated), release, then run `magic-hermes "
                     f"install`. Underlying failure: {underlying}",
                 )
+            elif family is not None and (family == "strong" or corroborated):
+                # Boot/hello-phase thread-capacity family (KTD2): strong
+                # kinds self-evidence; weak kinds needed a corroborator.
+                # WARN keeps rc==0 and "FAIL 0" — the honest verdict for
+                # an environment-capacity event — and the streak bounds
+                # how long the soft verdict can run (KTD4).
+                prior = _read_boot_capacity_streak()
+                _write_boot_capacity_streak(prior + 1)
+                underlying = (
+                    f"{sidecar_failures[0]} (fast-fail retry) "
+                    f"{sidecar_failures[1]}"
+                    if len(sidecar_failures) == 2
+                    else sidecar_failures[0]
+                )
+                where = str(db_path) if db_path else "<shared-store>"
+                if prior >= _BOOT_CAPACITY_WARN_BUDGET:
+                    report.add(
+                        "FAIL",
+                        "Magic Context sidecar boot has failed "
+                        f"{prior} consecutive doctor verdicts under the "
+                        "boot-capacity policy — escalating to a real "
+                        f"failure; underlying: {underlying}",
+                    )
+                else:
+                    if pressure is not None and pressure["high"]:
+                        evidence = (
+                            f"load {pressure['load']} on "
+                            f"{pressure['cpus']} CPUs "
+                            f"({pressure['ratio']}x)"
+                        )
+                    elif corroborated:
+                        evidence = "thread self-probe also failed"
+                    else:
+                        evidence = "strong thread-capacity signature"
+                    report.add(
+                        "WARN",
+                        "Magic Context sidecar boot failed under host "
+                        f"thread-capacity pressure ({evidence}); existing "
+                        "sessions are unaffected — this is a host capacity "
+                        "signal, not a store or session defect. "
+                        f"Boot-capacity streak: {prior + 1} of "
+                        f"{_BOOT_CAPACITY_WARN_BUDGET} consecutive verdicts "
+                        "before escalation. Remedy: re-run `magic-hermes "
+                        "doctor` when host load subsides; offline audit: "
+                        f"sqlite3 {where} 'PRAGMA quick_check;'",
+                    )
             elif len(sidecar_failures) == 2:
+                _write_boot_capacity_streak(0)
                 report.add(
                     "FAIL",
                     f"{sidecar_failures[0]} (fast-fail retry) "
                     f"{sidecar_failures[1]}",
                 )
             else:
+                _write_boot_capacity_streak(0)
                 report.add("FAIL", sidecar_failures[0])
         if isinstance(bridge, dict):
             health = str(bridge.get("database_health", "unknown"))
