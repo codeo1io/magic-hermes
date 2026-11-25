@@ -53,6 +53,26 @@ BUSY_TIMEOUT_MS = 10_000
 #: is epoch-milliseconds in the live store).
 MARKER_WINDOW_MS = 24 * 60 * 60 * 1000
 
+#: Default trailing window for doctor liveness corroboration (seconds;
+#: ``created_at`` is converted at query time). The doctor's boot-transient
+#: severity lane (finding d59758598379) corroborates a WARN only with
+#: positive evidence of live traffic: sessions mint historian rows at
+#: minute cadence during episodes, so a fresh success/noop row proves the
+#: subsystem is serving traffic even while a fresh doctor boot dies. 6 h
+#: bridges busy-day quiet stretches without letting day-old rows
+#: corroborate a genuine outage (the live quiet-estate store runs ~45 h
+#: stale and correctly does NOT corroborate).
+LIVENESS_WINDOW_S = 6 * 60 * 60
+
+#: Honesty ceiling for any operator-supplied window override: at 24 h the
+#: store can hold day-old rows minted in an entirely dead era, so
+#: corroboration would stop being evidence of *current* liveness.
+LIVENESS_WINDOW_MAX_S = 24 * 60 * 60
+
+#: Env override knob for the corroboration window, mirroring the doctor
+#: wall-budget env precedent. Consumed by the doctor (cli.py), never here.
+LIVENESS_WINDOW_ENV = "MAGIC_HERMES_DOCTOR_LIVENESS_WINDOW_S"
+
 #: The exact trigger DDL this module owns. Single source of truth: used for
 #: CREATE, for drift comparison, and (normalized) by ``guard_status``.
 GUARD_DDL = f"""\
@@ -263,6 +283,72 @@ def guard_status(db_path: Path) -> GuardStatus:
             con.close()
     except sqlite3.Error as exc:
         return GuardStatus(present=False, error=str(exc))
+
+
+@dataclass(frozen=True)
+class LivenessStatus:
+    """Read-only liveness evidence for the doctor (never writes).
+
+    ``ok`` is positive-liveness corroboration: at least one healthy-status
+    row inside the trailing window. Anything else — stale rows, an empty
+    store, a failed-only store, an unreadable or missing store — is NOT
+    corroboration, so the doctor keeps its FAIL verdict there.
+    """
+
+    recent_rows: int = 0
+    latest_status: str | None = None
+    latest_row_age_s: float | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.recent_rows > 0
+
+
+def liveness_status(
+    db_path: Path, window_s: float = LIVENESS_WINDOW_S
+) -> LivenessStatus:
+    """Read the store's recent liveness evidence without writing anything.
+
+    Positive-liveness corroboration for the doctor's boot-transient WARN
+    lane (finding d59758598379): counts trailing-window rows carrying
+    upstream's healthy vocabulary ('success'/'noop') and reports the newest
+    row's status and age. Unreadable or missing stores are fail-visible —
+    ``error`` set, never a silent corroborated verdict — so an outage can
+    never be white-washed by a dead or unreadable store.
+    """
+
+    db_path = Path(db_path)
+    if not db_path.is_file():
+        return LivenessStatus(error=f"store not found: {db_path}")
+    try:
+        con = _connect_ro(db_path)
+        try:
+            now_ms = int(time.time() * 1000)
+            cutoff = now_ms - int(window_s * 1000)
+            recent = con.execute(
+                "select count(*) from historian_runs "
+                "where status in ('success', 'noop') and created_at >= ?",
+                (cutoff,),
+            ).fetchone()
+            latest = con.execute(
+                "select status, created_at from historian_runs "
+                "order by created_at desc, id desc limit 1"
+            ).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return LivenessStatus(error=str(exc))
+    latest_status: str | None = None
+    latest_row_age_s: float | None = None
+    if latest is not None:
+        latest_status = str(latest[0])
+        latest_row_age_s = (now_ms - int(latest[1])) / 1000.0
+    return LivenessStatus(
+        recent_rows=int(recent[0]) if recent else 0,
+        latest_status=latest_status,
+        latest_row_age_s=latest_row_age_s,
+    )
 
 
 def make_fixture_db(db_path: Path) -> Path:

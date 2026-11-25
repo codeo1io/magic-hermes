@@ -36,6 +36,7 @@ from unittest import mock
 import pytest
 
 from magic_hermes import cli
+from magic_hermes import historian_guard as hg
 
 
 def make_package(root: Path, version: str) -> Path:
@@ -449,6 +450,21 @@ class TestRetryBudget:
         assert isinstance(fast, float) and fast > 0
         assert isinstance(backoff, float) and backoff > 0
         assert fast + backoff <= 20.0
+
+    def test_liveness_window_constants_are_bounded(self):
+        # U1/U3 (plan 2026-11-24-001, finding d59758598379): the doctor's
+        # boot-transient corroboration window must be positive and
+        # honesty-bounded — large enough to bridge busy-day quiet
+        # stretches, strictly under the 24 h ceiling so day-old rows can
+        # never corroborate an outage, and the env knob must be named so
+        # operators can only trade within that bound at the doctor side.
+        window = hg.LIVENESS_WINDOW_S
+        ceiling = hg.LIVENESS_WINDOW_MAX_S
+        assert isinstance(window, int) and window > 0
+        assert isinstance(ceiling, int) and ceiling > window
+        assert window < 24 * 60 * 60
+        assert ceiling == 24 * 60 * 60
+        assert hg.LIVENESS_WINDOW_ENV == "MAGIC_HERMES_DOCTOR_LIVENESS_WINDOW_S"
 
     def test_wall_budget_fits_observer_shot(self):
         # U15/U17 (plan 0d118f58): every attempt timeout derives from the
