@@ -445,6 +445,117 @@ def partial_coverage_success_rows_24h(db_path: Path) -> int | None:
     return int(row[0]) if row else 0
 
 
+# Corroboration windows for the boot-transient WARN lane (finding
+# d59758598379), pinned from live store data 2026-11-24: the historian
+# legitimately idles for days (observed 14-day inter-row gap p95 3.17 h,
+# max 63.4 h) while sessions keep writing other tables, so liveness is a
+# multi-table composite with a 24 h window — a host dormant on *every*
+# activity table for a day is functionally down and the verdict's teeth
+# return. A failed historian row is a real health signal: none has been
+# observed in 694 h, so anything fresher than 72 h keeps the verdict
+# FAIL.
+_DOCTOR_BOOT_TRANSIENT_LIVENESS_S = 24.0 * 60.0 * 60.0
+_DOCTOR_BOOT_TRANSIENT_FAILED_ROW_S = 72.0 * 60.0 * 60.0
+_DOCTOR_BOOT_TRANSIENT_ACTIVITY_TABLES = (
+    "historian_runs",
+    "source_contents",
+    "message_history_index",
+    "session_projects",
+    "memories",
+    "notes",
+    "compartments",
+)
+
+
+def _boot_transient_corroboration(db_path) -> tuple[bool, str]:
+    """Fail-closed, read-only evidence that the subsystem is healthy.
+
+    Returns ``(ok, evidence)``. A classified boot-transient sidecar
+    failure may flip its FAIL to a WARN only when every component
+    corroborates health: the store opens read-only with a readable
+    schema lane, no failed historian row inside the failed-row window,
+    some activity-table write inside the liveness window, and the
+    classification guard present and matching. Unlike the INFO-lane
+    helpers' fail-open None, any probe error here means "not
+    corroborated" — a gate that cannot see must not absolve (finding
+    d59758598379). All connections are ``mode=ro``; the doctor never
+    writes.
+    """
+    if db_path is None:
+        return False, "no shared store"
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        return False, f"store unreadable: {exc}"
+    try:
+        now_ms = int(time.time() * 1000)
+        lane = con.execute(
+            "select max(version) from schema_migrations"
+        ).fetchone()
+        try:
+            pending = int(
+                con.execute(
+                    "select count(*) from migration_pending"
+                ).fetchone()[0]
+            )
+        except sqlite3.Error:
+            pending = 0  # absent table == nothing pending (INFO-lane parity)
+        freshest_table = ""
+        freshest_ms: int | None = None
+        for table in _DOCTOR_BOOT_TRANSIENT_ACTIVITY_TABLES:
+            for column in ("created_at", "updated_at"):
+                try:
+                    value = con.execute(
+                        f"select max({column}) from {table}"
+                    ).fetchone()[0]
+                except sqlite3.Error:
+                    # feature-dependent table/column: skip defensively —
+                    # a lower-lane store omits tables it never used
+                    continue
+                if value is not None and (
+                    freshest_ms is None or int(value) > freshest_ms
+                ):
+                    freshest_ms = int(value)
+                    freshest_table = f"{table}.{column}"
+        try:
+            failed_rows = int(
+                con.execute(
+                    "select count(*) from historian_runs "
+                    "where status = 'failed' and created_at >= ?",
+                    (
+                        now_ms
+                        - int(_DOCTOR_BOOT_TRANSIENT_FAILED_ROW_S * 1000),
+                    ),
+                ).fetchone()[0]
+            )
+        except sqlite3.Error as exc:
+            return False, f"historian_runs unreadable: {exc}"
+    except sqlite3.Error as exc:
+        return False, f"store unreadable: {exc}"
+    finally:
+        con.close()
+    if lane is None or lane[0] is None:
+        return False, "schema lane unreadable"
+    if freshest_ms is None:
+        return False, "no activity-table writes"
+    age_h = (now_ms - freshest_ms) / 3_600_000.0
+    if not 0.0 <= age_h * 3600.0 <= _DOCTOR_BOOT_TRANSIENT_LIVENESS_S:
+        return False, f"stale liveness ({freshest_table} {age_h:.1f}h old)"
+    if failed_rows:
+        return False, f"{failed_rows} failed historian row(s) in window"
+    guard = guard_status(Path(db_path))
+    if guard.error is not None:
+        return False, f"guard unreadable: {guard.error}"
+    if not guard.present or not guard.matches:
+        return False, "guard absent or drifted"
+    evidence = (
+        f"liveness: {freshest_table} {age_h:.1f}h ago; migration lane "
+        f"v{int(lane[0])}, pending {pending}; no failed historian rows "
+        f"in {_DOCTOR_BOOT_TRANSIENT_FAILED_ROW_S / 3600.0:g}h; guard active"
+    )
+    return True, evidence
+
+
 # Upstream's storage-fence refusal sentence (finding c7d63424): the
 # stable user-facing form @cortexkit/pi-magic-context prints when the
 # shared store's migration lane exceeds what the running binary
@@ -484,6 +595,55 @@ def _shared_store_lane_skew(failures: list[str]) -> tuple[int, int] | None:
     if match is not None:
         return int(match.group(1)), int(match.group(2))
     return None
+
+
+# Boot-window resource-exhaustion family (finding d59758598379): the
+# sidecar's first boot dies at thread creation under host memory/swap
+# pressure before any response is served. Two verified shapes with the
+# runtime's own wording, pinned from src/magic_hermes/runtime.py:
+# signal death at hello (":659" — a negative status means killed by a
+# signal, the uv_thread_create SIGABRT shape), hello timeout before the
+# first response (":647"), raw Python thread-start starvation, and the
+# spawn OSError EAGAIN (":458"). The substrings are the scope guard:
+# only `during hello` exit/timeout shapes match (bind/scan/post-hello
+# deaths never do) and a negative status only for the exit shape (a
+# positive exit at hello is a clean refusal, not starvation).
+_DOCTOR_BOOT_TRANSIENT_SHAPES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("hello-signal-death", ("during hello with status -",)),
+    ("hello-timeout", ("during hello; request was not replayed",)),
+    ("thread-starvation", ("can't start new thread",)),
+    ("spawn-eagain", ("Resource temporarily unavailable", "Errno 11")),
+)
+
+
+def _match_boot_transient_shape(text: str) -> str | None:
+    for label, needles in _DOCTOR_BOOT_TRANSIENT_SHAPES:
+        if all(needle in text for needle in needles):
+            return label
+    return None
+
+
+def _sidecar_boot_transient(failures: list[str]) -> str | None:
+    """Return the boot-transient shape label for a sidecar failure set.
+
+    Searches every accumulated sidecar failure text, then the
+    wrapper-stripped joined retry pair (a sentence split across the
+    fast-fail pair still types), mirroring ``_shared_store_lane_skew``.
+    No match returns None and the caller keeps today's generic
+    sidecar-failure FAIL (fail-open: an unknown future crash shape
+    degrades to the old verdict, never a masked one). Classifying alone
+    never changes a verdict — the WARN lane additionally requires the
+    fail-closed corroboration gate.
+    """
+    for text in failures:
+        label = _match_boot_transient_shape(text)
+        if label is not None:
+            return label
+    joined = " ".join(
+        failure.removeprefix("Magic Context sidecar failed: ")
+        for failure in failures
+    )
+    return _match_boot_transient_shape(joined)
 
 
 def _doctor_wall_budget_s() -> float:
@@ -910,14 +1070,48 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                     "are PR-gated), release, then run `magic-hermes "
                     f"install`. Underlying failure: {underlying}",
                 )
-            elif len(sidecar_failures) == 2:
-                report.add(
-                    "FAIL",
-                    f"{sidecar_failures[0]} (fast-fail retry) "
-                    f"{sidecar_failures[1]}",
-                )
             else:
-                report.add("FAIL", sidecar_failures[0])
+                # Boot-transient severity lane (finding d59758598379): a
+                # classified boot-window resource-exhaustion crash whose
+                # store corroborates health renders one auditable WARN —
+                # the fresh probe boot died, not the subsystem — keeping
+                # rc==0 and "FAIL 0" for maestro's verdict, exactly like
+                # the wall-budget and bind-contention lanes. Anything
+                # else (unclassified shape, gate miss, probe error) falls
+                # through to today's generic FAIL verbatim: classify
+                # then corroborate, never classify alone.
+                transient = _sidecar_boot_transient(sidecar_failures)
+                corroborated, evidence = (
+                    _boot_transient_corroboration(db_path)
+                    if transient is not None
+                    else (False, "")
+                )
+                if transient is not None and corroborated:
+                    if len(sidecar_failures) == 2:
+                        underlying = (
+                            f"{sidecar_failures[0]} (fast-fail retry) "
+                            f"{sidecar_failures[1]}"
+                        )
+                    else:
+                        underlying = sidecar_failures[0]
+                    report.add(
+                        "WARN",
+                        "Magic Context sidecar boot transient "
+                        f"({transient}) corroborated healthy ({evidence}) "
+                        "— the fresh sidecar boot died at thread creation "
+                        "under host resource pressure before its first "
+                        "response while the shared store stayed live; "
+                        "re-run the doctor once pressure relents. "
+                        f"Underlying failure: {underlying}",
+                    )
+                elif len(sidecar_failures) == 2:
+                    report.add(
+                        "FAIL",
+                        f"{sidecar_failures[0]} (fast-fail retry) "
+                        f"{sidecar_failures[1]}",
+                    )
+                else:
+                    report.add("FAIL", sidecar_failures[0])
         if isinstance(bridge, dict):
             health = str(bridge.get("database_health", "unknown"))
             if health == "ok":
