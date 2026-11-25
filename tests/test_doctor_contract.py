@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -36,6 +37,7 @@ from unittest import mock
 import pytest
 
 from magic_hermes import cli
+from magic_hermes import historian_guard as hg
 
 
 def make_package(root: Path, version: str) -> Path:
@@ -1210,3 +1212,416 @@ class TestDeploySmoke:
             f"deployed interpreter has magic-hermes {installed} but the "
             f"newest tag is {newest}"
         )
+
+
+def _corroborated_store(db: Path) -> Path:
+    """A store that passes every corroboration-gate component.
+
+    The plain ``make_fixture_db`` store deliberately fails the gate
+    (no schema_migrations lane readable): the non-corroborated verdict
+    tests use it as-is. This helper adds the components the gate
+    requires — a schema lane, the classification guard, and a fresh
+    historian activity row.
+    """
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "create table schema_migrations ("
+            "version integer primary key, name text)"
+        )
+        con.execute(
+            "insert into schema_migrations (version, name) values (94, 'pin')"
+        )
+        con.commit()
+    finally:
+        con.close()
+    hg.make_fixture_db(db)
+    hg.apply_guard(db)
+    con = sqlite3.connect(db)
+    try:
+        hg.insert_run(con, status="success")
+    finally:
+        con.close()
+    return db
+
+
+class TestBootTransientClassifier:
+    """U1 (finding d59758598379) — the boot-window resource-exhaustion
+    family classifies by exact substrings, both observed shapes plus the
+    retry shape, and nothing else does: classification alone never
+    changes a verdict."""
+
+    def test_node_signal_death_shape_classifies(self):
+        # the 2026-11-19 observed shape: uv_thread_create assert -> SIGABRT
+        failures = [
+            "Magic Context sidecar failed: Runtime exited during hello "
+            "with status -6; request was not replayed; stderr: "
+            "uv_thread_create failed"
+        ]
+        assert cli._sidecar_boot_transient(failures) == "hello-signal-death"
+
+    def test_python_eagain_pair_classifies(self):
+        # the 2026-11-20 observed pair: thread starvation, then spawn EAGAIN
+        failures = [
+            "Magic Context sidecar failed: can't start new thread",
+            "Magic Context sidecar failed: Could not start Magic Context "
+            "runtime: [Errno 11] Resource temporarily unavailable",
+        ]
+        assert cli._sidecar_boot_transient(failures) == "thread-start-starvation"
+
+    def test_spawn_eagain_alone_classifies(self):
+        failures = [
+            "Magic Context sidecar failed: Could not start Magic Context "
+            "runtime: [Errno 11] Resource temporarily unavailable"
+        ]
+        assert cli._sidecar_boot_transient(failures) == "spawn-eagain"
+
+    def test_hello_timeout_retry_shape_classifies(self):
+        failures = [
+            "Magic Context sidecar failed: Runtime timed out after 60.0s "
+            "during hello; request was not replayed"
+        ]
+        assert cli._sidecar_boot_transient(failures) == "hello-timeout"
+
+    def test_sentence_split_across_retry_pair_still_types(self):
+        # a stderr-tail cut at a word boundary: the wrapper-stripped pair
+        # join reconstructs the sentence, mirroring the lane-skew helper
+        failures = [
+            "Magic Context sidecar failed: Runtime exited during hello "
+            "with status",
+            "Magic Context sidecar failed: -6; request was not replayed",
+        ]
+        assert cli._sidecar_boot_transient(failures) == "hello-signal-death"
+
+    def test_positive_exit_code_at_hello_does_not_classify(self):
+        failures = [
+            "Magic Context sidecar failed: Runtime exited during hello "
+            "with status 1; request was not replayed"
+        ]
+        assert cli._sidecar_boot_transient(failures) is None
+
+    def test_bind_failures_do_not_classify(self):
+        failures = [
+            "Magic Context sidecar failed: Runtime exited during bind "
+            "with status 1; request was not replayed"
+        ]
+        assert cli._sidecar_boot_transient(failures) is None
+
+    def test_fence_refusal_does_not_classify(self):
+        # lane-skew keeps ownership: a storage-fence refusal at hello is
+        # a typed FAIL, never a boot transient
+        failures = [
+            "Magic Context sidecar failed: Runtime exited during hello "
+            "(status 1); stderr: [magic-context] storage fatal: refusing "
+            "to open context.db; upstream migration lane v95 is newer "
+            "than this binary supports (max v94)"
+        ]
+        assert cli._sidecar_boot_transient(failures) is None
+
+    def test_protocol_corruption_at_hello_does_not_classify(self):
+        failures = [
+            "Magic Context sidecar failed: Runtime returned invalid JSON "
+            "during hello"
+        ]
+        assert cli._sidecar_boot_transient(failures) is None
+
+    def test_non_eagain_spawn_error_does_not_classify(self):
+        # a missing binary is a broken install, not starvation: the
+        # spawn wrapper must co-occur with the EAGAIN text
+        failures = [
+            "Magic Context sidecar failed: Could not start Magic Context "
+            "runtime: [Errno 2] No such file or directory"
+        ]
+        assert cli._sidecar_boot_transient(failures) is None
+
+    def test_unrelated_failure_text_does_not_classify(self):
+        failures = ["Magic Context sidecar failed: Shared DB health: error: x"]
+        assert cli._sidecar_boot_transient(failures) is None
+
+
+class TestBootTransientCorroboration:
+    """U2 — the read-only liveness gate is fail-closed: every component
+    must hold, and anything the gate cannot read does not corroborate."""
+
+    def test_healthy_store_corroborates_with_evidence(self, tmp_path):
+        db = _corroborated_store(tmp_path / "context.db")
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert ok
+        assert "liveness historian_runs" in evidence
+        assert "guard active" in evidence
+        assert "migration_pending 0" in evidence
+
+    def test_historian_idle_but_other_tables_fresh_corroborates(
+        self, tmp_path
+    ):
+        # the live 2026-11-24 shape: historian idle for days while
+        # sessions keep writing other tables
+        db = _corroborated_store(tmp_path / "context.db")
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "update historian_runs set created_at = created_at - ?",
+                (48 * 3600 * 1000,),
+            )
+            con.execute(
+                "create table source_contents "
+                "(id integer primary key, created_at integer)"
+            )
+            con.execute(
+                "insert into source_contents (created_at) values (?)",
+                (int(time.time() * 1000),),
+            )
+            con.commit()
+        finally:
+            con.close()
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert ok
+        assert "source_contents" in evidence
+
+    def test_stale_activity_everywhere_does_not_corroborate(self, tmp_path):
+        db = _corroborated_store(tmp_path / "context.db")
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "update historian_runs set created_at = created_at - ?",
+                (48 * 3600 * 1000,),
+            )
+            con.commit()
+        finally:
+            con.close()
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert not ok
+        assert "stale liveness" in evidence
+
+    def test_fresh_failed_historian_row_does_not_corroborate(self, tmp_path):
+        db = _corroborated_store(tmp_path / "context.db")
+        con = sqlite3.connect(db)
+        try:
+            # a real failure carries a reason, so the classification
+            # guard trigger (failed + NULL reason -> noop) lets it stand
+            hg.insert_run(con, status="failed", failure_reason="boom")
+        finally:
+            con.close()
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert not ok
+        assert "failed" in evidence
+
+    def test_missing_guard_does_not_corroborate(self, tmp_path):
+        db = _corroborated_store(tmp_path / "context.db")
+        con = sqlite3.connect(db)
+        try:
+            con.execute(f"drop trigger {hg.TRIGGER_NAME}")
+            con.commit()
+        finally:
+            con.close()
+        ok, evidence = cli._boot_transient_corroboration(db)
+        assert not ok
+        assert "guard" in evidence
+
+    def test_no_store_does_not_corroborate(self):
+        ok, evidence = cli._boot_transient_corroboration(None)
+        assert not ok
+        assert "no shared store" in evidence
+
+    def test_absent_store_file_does_not_corroborate(self, tmp_path):
+        ok, evidence = cli._boot_transient_corroboration(
+            tmp_path / "missing.db"
+        )
+        assert not ok
+        assert "unreadable" in evidence
+
+    def test_non_database_file_fails_closed(self, tmp_path):
+        db = tmp_path / "context.db"
+        db.write_text("not a database", encoding="utf-8")
+        ok, _ = cli._boot_transient_corroboration(db)
+        assert not ok
+
+    def test_store_without_schema_lane_does_not_corroborate(self, tmp_path):
+        # the plain make_fixture_db store: no schema_migrations readable
+        db = hg.make_fixture_db(tmp_path / "context.db")
+        ok, _ = cli._boot_transient_corroboration(db)
+        assert not ok
+
+    def test_window_constants_stay_ordered(self):
+        # teeth horizon: liveness goes stale well inside the failed-row
+        # window, and both are positive
+        liveness = cli._DOCTOR_BOOT_TRANSIENT_LIVENESS_S
+        failed_row = cli._DOCTOR_BOOT_TRANSIENT_FAILED_ROW_S
+        assert liveness > 0 and failed_row > 0
+        assert liveness < failed_row
+
+
+class TestBootTransientVerdict:
+    """U3 — the verdict flip: WARN only when classified AND corroborated;
+    every other path renders today's FAIL byte-for-byte (teeth)."""
+
+    def test_eagain_pair_corroborated_renders_warn_verdict(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _corroborated_store(tmp_path / "context.db")
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            sidecar_error=RuntimeError("can't start new thread"),
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert out.count("boot-transient") == 1
+        summary_line = next(
+            line for line in out.splitlines() if "Summary:" in line
+        )
+        # the boot-transient row is a WARN and no FAIL row exists: the
+        # evaluator contract (rc==0 + "FAIL 0") survives the downgrade.
+        # The exact WARN count is environment-dependent (the mocked
+        # installation set renders its own drift row) — pin FAIL 0 only.
+        assert "FAIL 0" in summary_line
+        assert "FAIL 1" not in summary_line
+        assert "/ WARN" in summary_line
+
+    def test_node_death_corroborated_renders_warn_verdict(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _corroborated_store(tmp_path / "context.db")
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            sidecar_error=RuntimeError(
+                "Runtime exited during hello with status -6; "
+                "request was not replayed; stderr: uv_thread_create failed"
+            ),
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "boot-transient" in out
+        assert "shape: hello-signal-death" in out
+        assert "FAIL 0" in out
+
+    def test_json_carries_warn_row_with_evidence(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _corroborated_store(tmp_path / "context.db")
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            json_output=True,
+            sidecar_error=RuntimeError("can't start new thread"),
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["summary"]["fail"] == 0
+        warns = [c for c in payload["checks"] if c["status"] == "WARN"]
+        boot_rows = [c for c in warns if "boot-transient" in c["message"]]
+        assert len(boot_rows) == 1
+        message = boot_rows[0]["message"]
+        assert "shape: thread-start-starvation" in message
+        assert "liveness historian_runs" in message
+        # the underlying failure stays quoted for evidence
+        assert "can't start new thread" in message
+
+    def test_uncorroborated_transient_keeps_todays_fail_verdict(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # plain fixture store: no schema lane, no guard — the gate
+        # cannot corroborate, so the verdict stays today's FAIL pair
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            sidecar_error=RuntimeError("can't start new thread"),
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "boot-transient" not in out
+        assert "can't start new thread (fast-fail retry)" in out
+        summary_line = next(
+            line for line in out.splitlines() if "Summary:" in line
+        )
+        assert "FAIL 1" in summary_line
+
+    def test_stale_liveness_keeps_fail_verdict(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        db = _corroborated_store(tmp_path / "context.db")
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "update historian_runs set created_at = created_at - ?",
+                (48 * 3600 * 1000,),
+            )
+            con.commit()
+        finally:
+            con.close()
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            sidecar_error=RuntimeError("can't start new thread"),
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "boot-transient" not in out
+
+    def test_failed_historian_row_keeps_fail_verdict(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        db = _corroborated_store(tmp_path / "context.db")
+        con = sqlite3.connect(db)
+        try:
+            hg.insert_run(con, status="failed", failure_reason="boom")
+        finally:
+            con.close()
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            sidecar_error=RuntimeError("can't start new thread"),
+        )
+        assert rc == 1
+
+    def test_fence_beats_transient_when_both_present(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # lane ownership: a storage-fence refusal in the same failure
+        # text renders the typed skew FAIL, never the boot-transient WARN
+        _corroborated_store(tmp_path / "context.db")
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+            sidecar_error=RuntimeError(
+                "Runtime exited during hello with status -6; "
+                "request was not replayed; stderr: [magic-context] "
+                "storage fatal: refusing to open context.db; upstream "
+                "migration lane v95 is newer than this binary supports "
+                "(max v94). A pinned or stale plugin is likely sharing "
+                "this database"
+            ),
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert out.count("shared-store lane skew") == 1
+        assert "boot-transient" not in out
+
+    def test_healthy_run_adds_no_boot_transient_row(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        _corroborated_store(tmp_path / "context.db")
+        rc, _ = _run_doctor(
+            tmp_path,
+            monkeypatch,
+            isolated_home,
+            {},
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "boot-transient" not in out

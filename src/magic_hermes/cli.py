@@ -93,6 +93,20 @@ _DOCTOR_WALL_RENDER_RESERVE_S = 0.25
 # belts with the bridge-side deadline derivation (U1): the deferred
 # bind can never outrun the verdict budget.
 _DOCTOR_BIND_WAIT_MARGIN_S = 2.0
+# Boot-transient severity lane (finding d59758598379): how fresh a
+# read-only store write must be for the liveness corroboration that
+# downgrades a classified boot-window EAGAIN failure from FAIL to WARN.
+# Pinned from live data 2026-11-24: the activity-table composite writes
+# near-continuously on any active host (freshest 0.00-1.4h), while
+# historian-only recency would need >=63.4h to survive observed idle
+# gaps — so the composite carries the liveness signal and 24h is the
+# teeth horizon: a host dormant on every activity table for a day is
+# functionally down and boot failures return to FAIL.
+_DOCTOR_BOOT_TRANSIENT_LIVENESS_S = 24.0 * 3600.0
+# A failed historian row inside this window is real degradation the
+# boot-transient WARN must not absorb (last live failed row was 694h
+# old — fresh failures are signal, not noise).
+_DOCTOR_BOOT_TRANSIENT_FAILED_ROW_S = 72.0 * 3600.0
 SHARED_DB_RELPATH = (
     Path(".local") / "share" / "cortexkit" / "magic-context" / "context.db"
 )
@@ -484,6 +498,173 @@ def _shared_store_lane_skew(failures: list[str]) -> tuple[int, int] | None:
     if match is not None:
         return int(match.group(1)), int(match.group(2))
     return None
+
+
+# Boot-window resource-exhaustion family (finding d59758598379): the
+# two crash shapes observed live (2026-11-19 Node-side SIGABRT,
+# 2026-11-20 Python-side EAGAIN pair) plus their retry shape. Each entry
+# is (shape label, needles) where EVERY needle must appear in one
+# failure text — AND semantics keep wrappers like the spawn OSError
+# lane (runtime.py:458) from matching non-EAGAIN spawn errors such as a
+# missing binary. Scope guard lives in the strings themselves: only
+# ``during hello`` pre-first-response deaths classify; bind/scan/
+# post-hello/protocol failures never do (positive exit codes are not
+# signal deaths; ``invalid JSON during hello`` is corruption, not
+# starvation). A predicate that matches nothing fails open to today's
+# generic FAIL — an unknown future shape keeps the verdict honest.
+_BOOT_TRANSIENT_SHAPES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("hello-signal-death", ("Runtime exited during hello with status -",)),
+    ("hello-timeout", ("during hello; request was not replayed",)),
+    ("thread-start-starvation", ("can't start new thread",)),
+    (
+        "spawn-eagain",
+        (
+            "Could not start Magic Context runtime:",
+            "Resource temporarily unavailable",
+        ),
+    ),
+)
+
+
+def _sidecar_boot_transient(failures: list[str]) -> str | None:
+    """Return the boot-transient shape label when a failure matches.
+
+    Searches every accumulated sidecar failure text, then the retry-pair
+    joined text with the per-text wrapper stripped (a sentence cut at
+    the stderr-tail boundary still types, mirroring the lane-skew
+    classifier). No match returns None and the caller keeps today's
+    generic sidecar-failure verdict: classification alone never changes
+    a verdict — only the corroborated WARN lane does.
+    """
+
+    def _shape_of(text: str) -> str | None:
+        for label, needles in _BOOT_TRANSIENT_SHAPES:
+            if all(needle in text for needle in needles):
+                return label
+        return None
+
+    for text in failures:
+        shape = _shape_of(text)
+        if shape is not None:
+            return shape
+    joined = " ".join(
+        failure.removeprefix("Magic Context sidecar failed: ")
+        for failure in failures
+    )
+    return _shape_of(joined)
+
+
+# Activity-table composite for liveness corroboration (read-only): the
+# freshest write across these tables is the store's live pulse. A host
+# may legitimately idle the historian for days (observed max gap
+# 63.4h) while sessions keep writing these tables — so liveness is
+# multi-table, historian folded in, never historian-only. Defensive per
+# table: a store below the table's schema lane skips it silently.
+_DOCTOR_BOOT_TRANSIENT_ACTIVITY_TABLES: tuple[tuple[str, str], ...] = (
+    ("historian_runs", "created_at"),
+    ("source_contents", "created_at"),
+    ("message_history_index", "updated_at"),
+    ("session_projects", "updated_at"),
+    ("memories", "created_at"),
+    ("notes", "created_at"),
+)
+
+
+def _boot_transient_corroboration(
+    db_path: Path | None,
+) -> tuple[bool, str]:
+    """Read-only, fail-closed liveness evidence for the WARN downgrade.
+
+    Returns ``(corroborated, evidence)``. Every component must hold:
+    the store opens read-only with a readable schema lane,
+    ``migration_pending`` is queryable and empty, the freshest activity
+    write is within ``_DOCTOR_BOOT_TRANSIENT_LIVENESS_S``, no historian
+    row failed inside ``_DOCTOR_BOOT_TRANSIENT_FAILED_ROW_S``, and the
+    classification guard is installed and canonical. Unlike the INFO
+    probe helpers this gate is fail-closed — a component that cannot be
+    read does not corroborate, so an unseen store keeps today's FAIL
+    verdict (teeth). The evidence string names each component with its
+    ages so the rendered WARN row is an auditable trail.
+    """
+    if db_path is None:
+        return False, "no shared store"
+    now_ms = int(time.time() * 1000)
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        return False, f"store unreadable: {exc}"
+    try:
+        row = con.execute(
+            "select max(version) from schema_migrations"
+        ).fetchone()
+        if row is None or row[0] is None:
+            return False, "schema lane unreadable"
+        try:
+            pending = con.execute(
+                "select count(*) from migration_pending"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                pending = (0,)  # store predates the table: nothing pending
+            else:
+                return False, f"migration_pending unreadable: {exc}"
+        if pending and pending[0]:
+            return False, f"migration_pending rows: {pending[0]}"
+        freshest_table: str | None = None
+        freshest_age_h: float | None = None
+        for table, column in _DOCTOR_BOOT_TRANSIENT_ACTIVITY_TABLES:
+            try:
+                hit = con.execute(
+                    f"select max({column}) from {table}"
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc):
+                    continue
+                return False, f"{table} unreadable: {exc}"
+            except sqlite3.Error as exc:
+                return False, f"{table} unreadable: {exc}"
+            if hit and hit[0]:
+                age_h = (now_ms - hit[0]) / 3_600_000.0
+                if freshest_age_h is None or age_h < freshest_age_h:
+                    freshest_age_h = age_h
+                    freshest_table = f"{table}.{column}"
+        if freshest_table is None or freshest_age_h is None:
+            return False, "no activity rows readable"
+        if freshest_age_h * 3600.0 > _DOCTOR_BOOT_TRANSIENT_LIVENESS_S:
+            return False, (
+                f"stale liveness: freshest {freshest_table} "
+                f"{freshest_age_h:.1f}h ago"
+            )
+        try:
+            failed = con.execute(
+                "select count(*) from historian_runs "
+                "where status = 'failed' and created_at >= ?",
+                (now_ms - int(_DOCTOR_BOOT_TRANSIENT_FAILED_ROW_S * 1000),),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                failed = (0,)
+            else:
+                return False, f"historian_runs unreadable: {exc}"
+        if failed and failed[0]:
+            return False, f"historian failed rows in window: {failed[0]}"
+    except sqlite3.Error as exc:
+        return False, f"store probe failed: {exc}"
+    finally:
+        con.close()
+    guard = guard_status(db_path)
+    if guard.error is not None:
+        return False, f"guard unreadable: {guard.error}"
+    if not guard.present:
+        return False, "classification guard not installed"
+    if not guard.matches:
+        return False, "classification guard drifted"
+    evidence = (
+        f"liveness {freshest_table} {freshest_age_h:.1f}h ago; "
+        "no failed historian rows in 72h; migration_pending 0; "
+        f"guard active (marker rows 24h: {guard.marker_rows_24h})"
+    )
+    return True, evidence
 
 
 def _doctor_wall_budget_s() -> float:
@@ -888,6 +1069,7 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
             # path — never a write: repair is an explicit operator act.
             # The underlying refusal text stays quoted for evidence.
             skew = _shared_store_lane_skew(sidecar_failures)
+            boot_shape = _sidecar_boot_transient(sidecar_failures)
             if skew is not None:
                 store_lane, supported_max = skew
                 if len(sidecar_failures) == 2:
@@ -910,6 +1092,47 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                     "are PR-gated), release, then run `magic-hermes "
                     f"install`. Underlying failure: {underlying}",
                 )
+            elif boot_shape is not None:
+                # Boot-transient severity lane (finding d59758598379):
+                # the fresh sidecar boot died in the resource-exhaustion
+                # family under host pressure while the shared store may
+                # still be demonstrably healthy. WARN only when the
+                # read-only liveness gate corroborates health — the
+                # evaluator contract (rc==0 + "FAIL 0") survives a WARN,
+                # same doctrine as the wall-budget and bind-contention
+                # lanes. Any gate miss falls through to today's FAIL
+                # rendering byte-for-byte: teeth preserved.
+                corroborated, evidence = _boot_transient_corroboration(
+                    db_path
+                )
+                if corroborated:
+                    if len(sidecar_failures) == 2:
+                        underlying = (
+                            f"{sidecar_failures[0]} (fast-fail retry) "
+                            f"{sidecar_failures[1]}"
+                        )
+                    else:
+                        underlying = sidecar_failures[0]
+                    report.add(
+                        "WARN",
+                        "Magic Context sidecar boot-transient "
+                        f"(shape: {boot_shape}) — the fresh doctor boot died "
+                        "in the host resource-exhaustion family, but "
+                        "read-only store liveness corroborates a healthy "
+                        f"subsystem: {evidence}. The next evaluation "
+                        "re-probes within minutes; if the subsystem is "
+                        "genuinely down, liveness ages out and the verdict "
+                        "returns to FAIL. Underlying failure: "
+                        f"{underlying}",
+                    )
+                elif len(sidecar_failures) == 2:
+                    report.add(
+                        "FAIL",
+                        f"{sidecar_failures[0]} (fast-fail retry) "
+                        f"{sidecar_failures[1]}",
+                    )
+                else:
+                    report.add("FAIL", sidecar_failures[0])
             elif len(sidecar_failures) == 2:
                 report.add(
                     "FAIL",
