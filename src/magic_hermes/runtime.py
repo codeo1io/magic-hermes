@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import errno
 import importlib.resources
 import json
 import logging
@@ -128,7 +129,18 @@ def _is_supported_version(version: str | None) -> bool:
 
 
 class RuntimeErrorBase(RuntimeError):
-    """Base error raised by the Magic Context runtime client."""
+    """Base error raised by the Magic Context runtime client.
+
+    Doctor-facing classification (finding c7d63424) reads structured
+    facts off these exceptions. Every fact is optional and defaults to
+    None, so untagged raise sites — and every existing consumer of the
+    rendered message — behave exactly as before: str() never changes.
+    """
+
+    kind: str | None = None
+    method: str | None = None
+    exit_status: int | str | None = None
+    stderr_tail: str | None = None
 
 
 class RuntimeUnavailable(RuntimeErrorBase):
@@ -137,6 +149,20 @@ class RuntimeUnavailable(RuntimeErrorBase):
 
 class RuntimeProtocolError(RuntimeErrorBase):
     """The runtime returned an invalid or failed response."""
+
+
+def _typed_failure(exc: RuntimeErrorBase, **facts: Any) -> RuntimeErrorBase:
+    """Attach structured classification facts to a runtime exception.
+
+    The rendered message stays the single source of truth for every
+    existing consumer (doctor rows, the lane-skew fence regex, tests);
+    the facts ride alongside for the doctor's severity policy without
+    ever altering str(exc).
+    """
+
+    for key, value in facts.items():
+        setattr(exc, key, value)
+    return exc
 
 
 def runtime_script_path() -> Path:
@@ -456,7 +482,14 @@ class RuntimeClient:
             )
         except OSError as exc:
             message = f"Could not start Magic Context runtime: {exc}"
-            raise RuntimeUnavailable(message) from exc
+            kind = (
+                "spawn_eagain"
+                if exc.errno in (errno.EAGAIN, errno.ENOMEM)
+                else "spawn_error"
+            )
+            raise _typed_failure(
+                RuntimeUnavailable(message), kind=kind
+            ) from exc
 
         self._process = process
         self._stderr_thread = threading.Thread(
@@ -465,7 +498,17 @@ class RuntimeClient:
             name="magic-hermes-runtime-stderr",
             daemon=True,
         )
-        self._stderr_thread.start()
+        try:
+            self._stderr_thread.start()
+        except (RuntimeError, OSError) as exc:
+            # Host thread-creation exhaustion (finding c7d63424): the
+            # bare message bytes are preserved exactly; only the typed
+            # facts are added for the doctor's severity policy. The
+            # half-booted process is disposed so no sidecar leaks.
+            self._dispose(process)
+            raise _typed_failure(
+                RuntimeUnavailable(str(exc)), kind="thread_unavailable"
+            ) from exc
         return process
 
     def _drain_stderr(self, process: subprocess.Popen[str]) -> None:
@@ -601,7 +644,18 @@ class RuntimeClient:
         )
         with self._callback_threads_lock:
             self._callback_threads.add(worker)
-        worker.start()
+        try:
+            worker.start()
+        except (RuntimeError, OSError) as exc:
+            with self._callback_threads_lock:
+                self._callback_threads.discard(worker)
+            # Mid-call thread exhaustion (post-boot): typed distinctly so
+            # the doctor's boot-phase policy never claims it — the sidecar
+            # booted and answered hello; this is a callback-dispatch
+            # capacity failure, not a boot failure.
+            raise _typed_failure(
+                RuntimeUnavailable(str(exc)), kind="callback_thread_unavailable"
+            ) from exc
 
     def call(
         self,
@@ -643,9 +697,13 @@ class RuntimeClient:
                     self._failure_cooldown_until = (
                         time.monotonic() + _DEFAULT_FAILURE_COOLDOWN_S
                     )
-                    raise RuntimeProtocolError(
-                        f"Runtime timed out after {wait_for:.1f}s during {method}; "
-                        "request was not replayed"
+                    raise _typed_failure(
+                        RuntimeProtocolError(
+                            f"Runtime timed out after {wait_for:.1f}s during "
+                            f"{method}; request was not replayed"
+                        ),
+                        kind=("hello_timeout" if method == "hello" else "call_timeout"),
+                        method=method,
                     )
 
                 line = process.stdout.readline()
@@ -655,9 +713,16 @@ class RuntimeClient:
                     self._failure_cooldown_until = (
                         time.monotonic() + _DEFAULT_FAILURE_COOLDOWN_S
                     )
-                    raise RuntimeProtocolError(
-                        f"Runtime exited during {method} with status {code}; "
-                        f"request was not replayed; stderr: {self._stderr_detail()}"
+                    stderr_detail = self._stderr_detail()
+                    raise _typed_failure(
+                        RuntimeProtocolError(
+                            f"Runtime exited during {method} with status {code}; "
+                            f"request was not replayed; stderr: {stderr_detail}"
+                        ),
+                        kind="runtime_exit",
+                        method=method,
+                        exit_status=code,
+                        stderr_tail=stderr_detail,
                     )
 
                 try:

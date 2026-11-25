@@ -341,6 +341,29 @@ discovered copy is newer than the build-validated pin, not just the
 primary, because the shared store migrates with the newest copy on
 the machine. Here too the doctor never writes.
 
+Sidecar **boot capacity** joins the row vocabulary as the WARN-severity
+family (finding c7d63424, lane remediation 2026-11-24): fresh sidecar
+boots dying at thread creation while live sessions stay healthy is a
+host capacity episode — memory/swap pressure on a loaded host — not a
+store or session defect, and FAILing the doctor for it re-opens a
+CRITICAL finding and dispatches repair runs that add load mid-episode.
+When a boot-phase failure carries a strong thread-capacity signature
+(`uv_thread_create`, `can't start new thread`, `[Errno 11]`, or the
+Node-side worker/exit shapes at hello) or is corroborated by in-process
+host pressure (load at or above 1.25× the CPU count, or the doctor's
+own thread self-probe failing), `doctor` renders one WARN row with its
+evidence, keeps the maestro contract green (`rc==0`, `FAIL 0`), and
+names the remedy: re-run when host load subsides, offline audit with
+`sqlite3 <store> 'PRAGMA quick_check;'`. A persisted streak bounds the
+soft verdict — after 8 consecutive WARN verdicts the next occurrence
+escalates back to a real FAIL (a host that is *permanently* at capacity
+is a real finding); any healthy or non-family verdict resets the
+streak. Uncorroborated weak shapes, failures after a healthy hello
+(callback threads, doctor RPC), and the shared-store lane skew above
+stay strict FAILs — lane-skew keeps precedence. Typed failure facts
+(kind, method, exit status, stderr tail) travel on the exceptions
+without changing any rendered message.
+
 ### 2. Manual install (fallback)
 
 Magic-Hermes delegates its context-management implementation to the official Magic
