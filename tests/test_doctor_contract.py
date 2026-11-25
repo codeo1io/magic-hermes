@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -36,6 +37,7 @@ from unittest import mock
 import pytest
 
 from magic_hermes import cli
+from magic_hermes import historian_guard as hg
 
 
 def make_package(root: Path, version: str) -> Path:
@@ -449,6 +451,21 @@ class TestRetryBudget:
         assert isinstance(fast, float) and fast > 0
         assert isinstance(backoff, float) and backoff > 0
         assert fast + backoff <= 20.0
+
+    def test_liveness_window_constants_are_bounded(self):
+        # U1/U3 (plan 2026-11-24-001, finding d59758598379): the doctor's
+        # boot-transient corroboration window must be positive and
+        # honesty-bounded — large enough to bridge busy-day quiet
+        # stretches, strictly under the 24 h ceiling so day-old rows can
+        # never corroborate an outage, and the env knob must be named so
+        # operators can only trade within that bound at the doctor side.
+        window = hg.LIVENESS_WINDOW_S
+        ceiling = hg.LIVENESS_WINDOW_MAX_S
+        assert isinstance(window, int) and window > 0
+        assert isinstance(ceiling, int) and ceiling > window
+        assert window < 24 * 60 * 60
+        assert ceiling == 24 * 60 * 60
+        assert hg.LIVENESS_WINDOW_ENV == "MAGIC_HERMES_DOCTOR_LIVENESS_WINDOW_S"
 
     def test_wall_budget_fits_observer_shot(self):
         # U15/U17 (plan 0d118f58): every attempt timeout derives from the
@@ -1210,3 +1227,223 @@ class TestDeploySmoke:
             f"deployed interpreter has magic-hermes {installed} but the "
             f"newest tag is {newest}"
         )
+
+
+class TestBootTransientSeverityLane:
+    """U2 (plan 2026-11-24-001, finding d59758598379) — corroborated
+    boot-window sidecar transients degrade honestly to WARN (rc==0 plus
+    literal "FAIL 0" preserved, exactly like the wall-budget and
+    bind-contention lanes); everything else keeps the FAIL verdict:
+    no corroboration, stale corroboration, post-hello failures, and
+    lane skew (its own tests, unchanged)."""
+
+    def _seed_corroboration(self, tmp_path, age_s=60.0):
+        from magic_hermes import historian_guard as hg
+
+        db = tmp_path / "context.db"
+        if not db.exists():
+            hg.make_fixture_db(db)
+        con = sqlite3.connect(db)
+        try:
+            now_ms = int(time.time() * 1000)
+            hg.insert_run(
+                con,
+                session_id="s-boot-transient",
+                status="success",
+                created_at=now_ms - int(age_s * 1000),
+            )
+        finally:
+            con.close()
+        return db
+
+    def test_corroborated_hello_timeout_pair_renders_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        from magic_hermes.runtime import RuntimeProtocolError
+
+        self._seed_corroboration(tmp_path)
+        exc = RuntimeProtocolError(
+            "Runtime timed out after 60.0s during hello; "
+            "request was not replayed"
+        )
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc
+        )
+        out = capsys.readouterr().out
+        # maestro contract: rc==0 and "FAIL 0" in stdout
+        assert rc == 0
+        assert "FAIL 0" in out
+        # exactly one WARN row: typed boot-transient lane, quotes the
+        # (fast-fail retry) pair, names corroboration + remedy
+        assert out.count("sidecar boot transient") == 1
+        warn_line = next(
+            line for line in out.splitlines() if "boot transient" in line
+        )
+        # D5: the generic sidecar FAIL row is REPLACED by the WARN row —
+        # the underlying pair is quoted exactly once (inside the WARN row)
+        # and never rendered as its own FAIL-severity row (rc==0 proves no
+        # FAIL row exists at all)
+        assert out.count("Magic Context sidecar failed") == 2
+        assert "(fast-fail retry)" in warn_line
+        assert "memory/swap pressure" in warn_line
+        assert "historian row(s)" in warn_line
+        assert "--full-integrity" in warn_line
+
+    def test_corroborated_native_crash_pair_renders_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        from magic_hermes.runtime import RuntimeProtocolError
+
+        self._seed_corroboration(tmp_path, age_s=30.0)
+        exc = RuntimeProtocolError(
+            "Runtime exited during hello with status -6; "
+            "request was not replayed; stderr: node: ../src/thread_pool."
+            "cc:123: uv_thread_create: Resource temporarily unavailable"
+        )
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "FAIL 0" in out
+        assert out.count("sidecar boot transient") == 1
+        assert "status -6" in out
+        assert "uv_thread_create" in out
+
+    def test_uncorroborated_boot_transient_stays_fail(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # fixture db with zero rows: no positive liveness evidence
+        from magic_hermes import historian_guard as hg
+        from magic_hermes.runtime import RuntimeProtocolError
+
+        db = tmp_path / "context.db"
+        hg.make_fixture_db(db)
+        exc = RuntimeProtocolError(
+            "Runtime timed out after 60.0s during hello; "
+            "request was not replayed"
+        )
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "FAIL 0" not in out
+        assert "sidecar boot transient" not in out
+        assert "Magic Context sidecar failed" in out
+
+    def test_stale_corroboration_stays_fail(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        from magic_hermes.runtime import RuntimeProtocolError
+
+        # fresh boots dying with only day-old evidence: a stale row must
+        # never white-wash what may be a genuine outage
+        self._seed_corroboration(tmp_path, age_s=7 * 60 * 60.0)
+        exc = RuntimeProtocolError(
+            "Runtime timed out after 60.0s during hello; "
+            "request was not replayed"
+        )
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, sidecar_error=exc
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "sidecar boot transient" not in out
+
+    def test_post_hello_failure_never_warns(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        from magic_hermes.runtime import RuntimeProtocolError
+
+        # hello healthy, the doctor RPC itself fails: the runtime BOOTED,
+        # so this is not a boot transient even with live corroboration
+        self._seed_corroboration(tmp_path)
+        exc = RuntimeProtocolError(
+            "Runtime exited during doctor with status 1; "
+            "request was not replayed; stderr: oops"
+        )
+        rc, _ = _run_doctor(
+            tmp_path, monkeypatch, isolated_home, {}, doctor_error=exc
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "sidecar boot transient" not in out
+        assert "Magic Context sidecar failed" in out
+
+    def test_mixed_crash_then_timeout_episode_pair_renders_warn(
+        self, tmp_path, monkeypatch, isolated_home, capsys
+    ):
+        # the verified episode shape: native crash first, fast-fail retry
+        # then times out still during hello
+        from magic_hermes.runtime import RuntimeProtocolError
+
+        self._seed_corroboration(tmp_path)
+        db = tmp_path / "context.db"
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        _wire_config()
+        tested = cli.tested_magic_context_version()
+        package = make_package(tmp_path / "pkg", tested)
+
+        pair = [
+            RuntimeProtocolError(
+                "Runtime exited during hello with status -6; "
+                "request was not replayed; stderr: uv_thread_create "
+                "Resource temporarily unavailable"
+            ),
+            RuntimeProtocolError(
+                "Runtime timed out after 60.0s during hello; "
+                "request was not replayed"
+            ),
+        ]
+        calls = {"n": 0}
+        sidecar = mock.MagicMock()
+
+        def _call(method, params=None, timeout=60):
+            calls["n"] += 1
+            raise pair[min(calls["n"] - 1, 1)]
+
+        sidecar.call.side_effect = _call
+        client = mock.MagicMock()
+        client.__enter__.return_value = sidecar
+        client.__exit__.return_value = False
+        with (
+            mock.patch.object(
+                cli, "discover_installations", return_value=[(package, tested)]
+            ),
+            mock.patch.object(cli, "RuntimeClient", return_value=client),
+            mock.patch.object(cli, "_SIDECAR_RETRY_BACKOFF_S", 0.0),
+        ):
+            rc = cli.run_doctor()
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "FAIL 0" in out
+        assert out.count("sidecar boot transient") == 1
+        warn_line = next(
+            line for line in out.splitlines() if "boot transient" in line
+        )
+        assert "status -6" in warn_line
+        assert "timed out after 60.0s during hello" in warn_line
+        assert "(fast-fail retry)" in warn_line
+
+    def test_liveness_window_env_resolution(self, monkeypatch):
+        # default when unset; junk falls back; huge values clamp to the
+        # honesty ceiling; non-positive degenerates to zero (no
+        # corroboration possible — the doctor stays FAIL-honest)
+        monkeypatch.delenv(hg.LIVENESS_WINDOW_ENV, raising=False)
+        assert (
+            cli._boot_transient_liveness_window_s() == hg.LIVENESS_WINDOW_S
+        )
+        monkeypatch.setenv(hg.LIVENESS_WINDOW_ENV, "junk")
+        assert (
+            cli._boot_transient_liveness_window_s() == hg.LIVENESS_WINDOW_S
+        )
+        monkeypatch.setenv(hg.LIVENESS_WINDOW_ENV, "99999999")
+        assert (
+            cli._boot_transient_liveness_window_s()
+            == hg.LIVENESS_WINDOW_MAX_S
+        )
+        monkeypatch.setenv(hg.LIVENESS_WINDOW_ENV, "120")
+        assert cli._boot_transient_liveness_window_s() == 120.0
+        monkeypatch.setenv(hg.LIVENESS_WINDOW_ENV, "-5")
+        assert cli._boot_transient_liveness_window_s() == 0.0

@@ -303,3 +303,119 @@ class TestWALSecondConnection:
         finally:
             writer.close()
         assert row == ("noop", hg.MARKER_REASON)
+
+
+class TestLivenessStatus:
+    """U1 (plan 2026-11-24-001, finding d59758598379) — read-only liveness
+    corroboration for the doctor's boot-transient WARN lane. Positive
+    evidence only: fresh success/noop rows corroborate; stale, empty,
+    or failed-only stores never do; unreadable/missing stores are
+    fail-visible and never corroborate. No test here writes through the
+    guard's deploy path — the helper is strictly read-only."""
+
+    def _insert(self, db, status, age_s, *, failure_reason=None):
+        con = sqlite3.connect(db)
+        try:
+            now_ms = int(time.time() * 1000)
+            return hg.insert_run(
+                con,
+                session_id="s-liveness",
+                status=status,
+                failure_reason=failure_reason,
+                created_at=now_ms - int(age_s * 1000),
+            )
+        finally:
+            con.close()
+
+    def test_fresh_success_row_corroborates(self, tmp_path):
+        db = make_db(tmp_path)
+        self._insert(db, "success", 60.0)
+        status = hg.liveness_status(db)
+        assert status.ok is True
+        assert status.recent_rows == 1
+        assert status.latest_status == "success"
+        assert status.latest_row_age_s is not None
+        assert 55.0 <= status.latest_row_age_s <= 65.0
+        assert status.error is None
+
+    def test_fresh_noop_row_corroborates(self, tmp_path):
+        # Episode-time guard-marker rows are reclassified to noop — they
+        # are the live-traffic signal the doctor will actually see (the
+        # live store runs the guard, so replicate it here).
+        db = make_db(tmp_path)
+        assert hg.apply_guard(db, verify=False).applied
+        self._insert(db, "failed", 30.0)  # NULL reason -> guard -> noop
+        status = hg.liveness_status(db)
+        assert status.ok is True
+        assert status.recent_rows == 1
+        assert status.latest_status == "noop"
+
+    def test_reasoned_failed_row_does_not_corroborate(self, tmp_path):
+        # Positive-liveness means upstream's healthy vocabulary: a reasoned
+        # failure row proves traffic but not health, so it must not
+        # corroborate.
+        db = make_db(tmp_path)
+        self._insert(db, "failed", 10.0, failure_reason="boom")
+        status = hg.liveness_status(db)
+        assert status.ok is False
+        assert status.recent_rows == 0
+        assert status.latest_status == "failed"
+
+    def test_stale_success_row_does_not_corroborate(self, tmp_path):
+        # The live store's quiet-estate shape: rows days old. A stale row
+        # must never white-wash an outage.
+        db = make_db(tmp_path)
+        self._insert(db, "success", 7 * 60 * 60.0)  # > 6 h default window
+        status = hg.liveness_status(db)
+        assert status.ok is False
+        assert status.recent_rows == 0
+        assert status.latest_status == "success"
+
+    def test_window_is_inclusive_at_the_boundary(self, tmp_path):
+        db = make_db(tmp_path)
+        self._insert(db, "success", 3599.0)
+        self._insert(db, "success", 3601.0)
+        status = hg.liveness_status(db, window_s=3600)
+        assert status.ok is True
+        assert status.recent_rows == 1
+
+    def test_empty_store_never_corroborates(self, tmp_path):
+        db = make_db(tmp_path)
+        status = hg.liveness_status(db)
+        assert status.ok is False
+        assert status.recent_rows == 0
+        assert status.latest_status is None
+        assert status.latest_row_age_s is None
+        assert status.error is None
+
+    def test_missing_store_is_fail_visible(self, tmp_path):
+        status = hg.liveness_status(tmp_path / "absent.db")
+        assert status.ok is False
+        assert status.error is not None
+        assert status.recent_rows == 0
+
+    def test_unreadable_store_is_fail_visible(self, tmp_path):
+        bad = tmp_path / "corrupt.db"
+        bad.write_bytes(b"this is not a sqlite database" * 8)
+        status = hg.liveness_status(bad)
+        assert status.ok is False
+        assert status.error is not None
+        assert status.recent_rows == 0
+
+    def test_helper_never_writes(self, tmp_path):
+        # R3: the doctor path is read-only — after a liveness probe the
+        # store's change counter must be untouched.
+        db = make_db(tmp_path)
+        self._insert(db, "success", 5.0)
+        con = sqlite3.connect(db)
+        try:
+            before = con.execute("pragma data_version").fetchone()[0]
+        finally:
+            con.close()
+        assert hg.liveness_status(db).ok
+        con = sqlite3.connect(db)
+        try:
+            after = con.execute("pragma data_version").fetchone()[0]
+        finally:
+            con.close()
+        assert before == after

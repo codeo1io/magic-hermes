@@ -25,11 +25,15 @@ from pathlib import Path
 from typing import Any
 
 from .historian_guard import (
+    LIVENESS_WINDOW_ENV,
+    LIVENESS_WINDOW_MAX_S,
+    LIVENESS_WINDOW_S,
     RETIRES_AT_UPSTREAM,
     TRIGGER_NAME,
     GuardError,
     apply_guard,
     guard_status,
+    liveness_status,
     remove_guard,
 )
 from .provenance import (
@@ -507,6 +511,70 @@ def _doctor_wall_budget_s() -> float:
     return value
 
 
+def _boot_transient_liveness_window_s() -> float:
+    """Resolve the liveness corroboration window for the boot-transient
+    severity lane (finding d59758598379).
+
+    Junk falls back to the default — garbage never widens the window —
+    and a parsed value is clamped to the honesty ceiling: past 24 h the
+    store can hold rows minted in an entirely dead era, so corroboration
+    would stop being evidence of *current* liveness. Non-positive values
+    degenerate to zero corroboration (the doctor stays FAIL-honest);
+    the knob can only narrow below the default or widen up to the
+    ceiling, never beyond it.
+    """
+    raw = os.environ.get(LIVENESS_WINDOW_ENV, "")
+    try:
+        value = float(raw) if raw.strip() else float(LIVENESS_WINDOW_S)
+    except ValueError:
+        return float(LIVENESS_WINDOW_S)
+    if value != value or value == float("inf"):  # NaN / +inf would widen
+        return float(LIVENESS_WINDOW_S)
+    return max(0.0, min(value, float(LIVENESS_WINDOW_MAX_S)))
+
+
+def _sidecar_failures_are_boot_transients(sidecar_failures: list[str]) -> bool:
+    """True when every sidecar failure is a boot-window transient.
+
+    The flap episode class (finding d59758598379): the Node sidecar
+    aborts at boot under host memory/swap pressure — a native crash
+    during hello (``uv_thread_create`` EAGAIN -> SIGABRT, status -6)
+    whose fast-fail retry then times out still during hello. A failure
+    naming any later phase ("during doctor", ...) disqualifies the whole
+    list: the runtime booted, so the failure is not a boot transient.
+    Unrecognized shapes simply fail this predicate and keep the FAIL
+    verdict — the lane only ever fires on the verified episode shapes.
+    """
+    if not sidecar_failures:
+        return False
+    for message in sidecar_failures:
+        if "during hello" not in message:
+            return False
+        if not any(
+            marker in message
+            for marker in ("status -6", "uv_thread_create", "timed out")
+        ):
+            return False
+    return True
+
+
+def _boot_transient_corroborated(db_path) -> bool:
+    """Positive-liveness check for the boot-transient WARN lane.
+
+    Corroboration requires fresh healthy historian rows (upstream's
+    'success'/'noop' vocabulary) inside the trailing window — live
+    sessions minting rows prove the subsystem is serving traffic even
+    while fresh doctor boots die. Stale, empty, failed-only, unreadable,
+    or missing stores never corroborate (fail-visible), so a genuine
+    outage keeps its FAIL verdict.
+    """
+    if db_path is None:
+        return False
+    return liveness_status(
+        db_path, window_s=_boot_transient_liveness_window_s()
+    ).ok
+
+
 def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
     report = DoctorReport()
     wall_started = time.monotonic()
@@ -909,6 +977,49 @@ def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
                     "scripts/sync_magic_context_release.py (series jumps "
                     "are PR-gated), release, then run `magic-hermes "
                     f"install`. Underlying failure: {underlying}",
+                )
+            elif _sidecar_failures_are_boot_transients(sidecar_failures) and (
+                _boot_transient_corroborated(db_path)
+            ):
+                # Boot-transient severity lane (finding d59758598379):
+                # fresh sidecar boots die under host memory/swap pressure
+                # (native uv_thread_create crash + hello-window timeout)
+                # while live sessions keep minting healthy historian rows
+                # — the subsystem is UP, only fresh doctor boots die.
+                # Corroborated transients degrade honestly to WARN —
+                # maestro's verdict requires rc==0 plus "FAIL 0" in
+                # stdout; a WARN keeps both — exactly like the wall-budget
+                # and bind-contention lanes. The typed row REPLACES the
+                # generic sidecar FAIL (D5: exactly one row either way),
+                # quotes the underlying pair, and names the remedy. No
+                # corroboration (stale/empty/unreadable store) or any
+                # post-hello shape keeps the FAIL verdict below.
+                if len(sidecar_failures) == 2:
+                    underlying = (
+                        f"{sidecar_failures[0]} (fast-fail retry) "
+                        f"{sidecar_failures[1]}"
+                    )
+                else:
+                    underlying = sidecar_failures[0]
+                window = _boot_transient_liveness_window_s()
+                recent = liveness_status(
+                    db_path, window_s=window
+                ).recent_rows
+                report.add(
+                    "WARN",
+                    "Magic Context sidecar boot transient under host "
+                    "memory/swap pressure (native crash + hello-window "
+                    "timeout; live sessions still mint healthy historian "
+                    "rows, so the subsystem is serving traffic — honest "
+                    "degradation, not an outage): "
+                    f"{underlying}. Corroborated by {recent} healthy "
+                    f"historian row(s) within the trailing {window:g}s "
+                    f"window (adjust via {LIVENESS_WINDOW_ENV}). Offline "
+                    "audit: `magic-hermes doctor --full-integrity`, or "
+                    "raise "
+                    f"{_DOCTOR_WALL_BUDGET_ENV} and re-run; if fresh "
+                    "boots keep dying, check host memory/swap pressure "
+                    "and thread limits.",
                 )
             elif len(sidecar_failures) == 2:
                 report.add(
