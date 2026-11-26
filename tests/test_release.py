@@ -38,6 +38,110 @@ def test_set_version_rejects_non_release_version():
         release.set_version("0.2.0.dev0")
 
 
+#: README install-example block shaped exactly like the real one (prose
+#: note + uv and pip wheel-URL forms) so the updater's rewrite is proven
+#: against the fielded format, not a toy abbreviation.
+_EXAMPLE_README_TEMPLATE = """# magic-hermes
+
+### 3. Install Magic-Hermes into Hermes
+
+Install the latest published wheel into the Python environment used by Hermes.
+This repository is public, so install the release wheel directly from its
+GitHub Release
+URL (shown for v0.3.57; newer versions follow the same URL pattern on the
+[Releases](https://github.com/codeo1io/magic-hermes/releases) page):
+
+```bash
+uv pip install --python /path/to/hermes/venv/bin/python --no-deps \\
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.57/magic_hermes-0.3.57-py3-none-any.whl
+```
+
+If `uv` is not installed, use the Hermes environment's `pip` instead:
+
+```bash
+/path/to/hermes/venv/bin/python -m pip install --no-deps \\
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.57/magic_hermes-0.3.57-py3-none-any.whl
+```
+"""
+
+
+def _write_release_tree(tmp_path, readme_text):
+    """Minimal set_version fixture in the existing test's shape, plus README."""
+    (tmp_path / "src" / "magic_hermes").mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "magic-hermes"\nversion = "0.3.57"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "plugin.yaml").write_text(
+        "name: magic-hermes\nversion: 0.3.57\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "magic_hermes" / "__init__.py").write_text(
+        '__version__ = "0.3.57"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text(readme_text, encoding="utf-8")
+
+
+def test_set_version_updates_readme_install_example(monkeypatch, tmp_path):
+    """The release bump rewrites every example occurrence and nothing else."""
+    _write_release_tree(tmp_path, _EXAMPLE_README_TEMPLATE)
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+
+    release.set_version("0.3.58")
+
+    release.assert_versions("0.3.58")
+    expected = _EXAMPLE_README_TEMPLATE.replace("0.3.57", "0.3.58")
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == expected
+
+
+def test_set_version_rewrites_single_url_form_without_error(monkeypatch, tmp_path):
+    """A future README carrying only one URL form still rewrites cleanly."""
+    readme_text = (
+        "# magic-hermes\n\n"
+        "URL (shown for v0.3.57; newer versions follow the same pattern):\n\n"
+        "```bash\n"
+        "/path/to/hermes/venv/bin/python -m pip install --no-deps \\\n"
+        "  https://github.com/codeo1io/magic-hermes/releases/download/"
+        "v0.3.57/magic_hermes-0.3.57-py3-none-any.whl\n"
+        "```\n"
+    )
+    _write_release_tree(tmp_path, readme_text)
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+
+    release.set_version("0.3.58")
+
+    updated = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert updated == readme_text.replace("0.3.57", "0.3.58")
+
+
+def test_set_version_example_rewrite_handles_version_length_change(
+    monkeypatch, tmp_path
+):
+    """0.3.9 -> 0.3.10 leaves no partial-match residue (bounded regex)."""
+    readme_text = _EXAMPLE_README_TEMPLATE.replace("0.3.57", "0.3.9")
+    _write_release_tree(tmp_path, readme_text)
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+
+    release.set_version("0.3.10")
+
+    updated = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert updated == readme_text.replace("0.3.9", "0.3.10")
+    assert "0.3.9" not in updated
+
+
+def test_set_version_leaves_readme_without_example_untouched(monkeypatch, tmp_path):
+    """No example in README means a byte-identical no-op, never an error."""
+    readme_text = "# magic-hermes\n\nNo install example here.\n"
+    _write_release_tree(tmp_path, readme_text)
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+
+    release.set_version("0.3.58")
+
+    release.assert_versions("0.3.58")
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == readme_text
+
+
 def test_release_semver_only_accepts_three_numeric_components():
     assert release.SEMVER.fullmatch("0.2.0")
     assert release.SEMVER.fullmatch("12.34.56")
