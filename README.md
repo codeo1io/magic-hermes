@@ -132,7 +132,9 @@ it for exactly that).
 Modeled after the upstream `@cortexkit/magic-context doctor`: a sequence of
 PASS/WARN/FAIL/INFO checks (Node, magic-hermes distribution, upstream package
 discovery + version pin, Hermes config wiring, shared DB presence and schema
-lane, live sidecar handshake + DB quick_check + core-symbol check) with a
+lane, live sidecar handshake + DB quick_check + core-symbol check, historian
+guard status, partial-coverage salvage INFO, and repository provenance — the
+last three families are documented in depth in the sections below) with a
 summary line and non-zero exit on FAIL. `--json` emits machine-readable
 output.
 
