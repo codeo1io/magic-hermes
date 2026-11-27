@@ -132,7 +132,9 @@ it for exactly that).
 Modeled after the upstream `@cortexkit/magic-context doctor`: a sequence of
 PASS/WARN/FAIL/INFO checks (Node, magic-hermes distribution, upstream package
 discovery + version pin, Hermes config wiring, shared DB presence and schema
-lane, live sidecar handshake + DB quick_check + core-symbol check) with a
+lane, live sidecar handshake + DB quick_check + core-symbol check, historian
+guard status, partial-coverage salvage INFO, and repository provenance — the
+last three families are documented in depth in the sections below) with a
 summary line and non-zero exit on FAIL. `--json` emits machine-readable
 output.
 
@@ -365,19 +367,19 @@ export MAGIC_CONTEXT_PACKAGE_ROOT=/path/to/node_modules/@cortexkit/pi-magic-cont
 
 Install the latest published wheel into the Python environment used by Hermes. This
 repository is public, so install the release wheel directly from its GitHub Release
-URL (shown for v0.3.20; newer versions follow the same URL pattern on the
+URL (shown for v0.3.74; newer versions follow the same URL pattern on the
 [Releases](https://github.com/codeo1io/magic-hermes/releases) page):
 
 ```bash
 uv pip install --python /path/to/hermes/venv/bin/python --no-deps \
-  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.20/magic_hermes-0.3.20-py3-none-any.whl
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.74/magic_hermes-0.3.74-py3-none-any.whl
 ```
 
 If `uv` is not installed, use the Hermes environment's `pip` instead:
 
 ```bash
 /path/to/hermes/venv/bin/python -m pip install --no-deps \
-  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.20/magic_hermes-0.3.20-py3-none-any.whl
+  https://github.com/codeo1io/magic-hermes/releases/download/v0.3.74/magic_hermes-0.3.74-py3-none-any.whl
 ```
 
 For development from a local checkout, install the repository directly instead:

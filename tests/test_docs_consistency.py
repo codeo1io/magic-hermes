@@ -63,6 +63,21 @@ def _ci_node_major() -> int:
     return int(match.group(1))
 
 
+def _readme_section(start_heading: str) -> str:
+    """README text from ``start_heading`` to the next ``###`` heading.
+
+    Section-bounded so a claim about one section cannot be satisfied by
+    text elsewhere in the document. The start heading must be spelled
+    exactly (``### 1b.`` with the period) so it cannot match a sibling
+    like ``### 1b-2.``.
+    """
+    readme = README.read_text(encoding="utf-8")
+    start = readme.find(start_heading)
+    assert start != -1, f"README must keep the {start_heading!r} section"
+    end = readme.find("\n### ", start + len(start_heading))
+    return readme[start:] if end == -1 else readme[start:end]
+
+
 def test_upstream_pin_matches_compatibility_manifest():
     """package.json and magic_context_compat.json must never disagree."""
     assert _upstream_pin() == _tested_version()
@@ -162,6 +177,26 @@ def test_readme_node_floor_agrees_with_ci_pin():
         f"CI validates on node {ci_node}, below the README floor {floor}; "
         "the documented floor must never exceed what CI validates"
     )
+
+
+def test_readme_doctor_summary_lists_documented_row_families():
+    """§1b's doctor summary must name the row families README documents.
+
+    Regression for the 2026-10/2026-11 reconciliation rounds
+    (docs/ROADMAP-RECONCILIATION-2026-10.md, -2026-11.md): §1b's
+    parenthetical check list stayed silent about the historian guard
+    status WARN row, the partial-coverage salvage INFO row, and the
+    provenance rows while §1c/§1d documented them in depth — an internal
+    inconsistency a reader had no way to notice. When README grows a new
+    doctor-row section, extend this mapping and the summary together.
+    """
+    section = _readme_section("### 1b. Check installation health")
+    for family in ("guard", "partial-coverage", "provenance"):
+        assert family in section, (
+            f"README §1b doctor summary does not name the {family!r} row "
+            "family that README documents in depth in §1c/§1d; update the "
+            "README claim and this test together"
+        )
 
 
 class TestSyncWorkflowGuardrails:
