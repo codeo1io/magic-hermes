@@ -18,7 +18,9 @@ the contract the 2026-10-01 v91 migration incident taught us:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -356,3 +358,178 @@ class TestDbSubcommandWiring:
     def test_no_action_prints_usage(self, capsys):
         assert main_db([]) == 1
         assert "usage:" in capsys.readouterr().out
+
+
+class TestDbCensus:
+    """`db census` (plan 2026-11-28-001 U1): read-only readability sampler.
+
+    The census replicates maestro's bounded-operational-scan reader
+    byte-for-byte (mode=ro + query_only + busy_timeout=8000 + the frozen
+    query sequence) and records lock-window evidence to JSONL OUTSIDE
+    the repository tree. Exit contract: 0 = every tick read clean;
+    2 = lock events observed (the operational signal); 1 = harness error.
+    """
+
+    SCHEMA = (
+        "CREATE TABLE pending_ops (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE migration_pending (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE pending_session_cleanup (id INTEGER PRIMARY KEY)",
+        (
+            "CREATE TABLE historian_runs (id INTEGER PRIMARY KEY, status TEXT,"
+            " failure_reason TEXT, created_at TEXT)"
+        ),
+        (
+            "CREATE TABLE dream_runs (id INTEGER PRIMARY KEY, started_at TEXT,"
+            " finished_at TEXT, tasks_succeeded INTEGER, tasks_failed INTEGER)"
+        ),
+        (
+            "CREATE TABLE task_schedule_state (task TEXT PRIMARY KEY,"
+            " last_run_at TEXT, next_due_at TEXT, last_status TEXT,"
+            " retry_count INTEGER)"
+        ),
+        (
+            "CREATE TABLE mirror_cursors (domain TEXT PRIMARY KEY, cursor TEXT,"
+            " updated_at TEXT)"
+        ),
+        "CREATE TABLE memory_verifications (id INTEGER PRIMARY KEY, verified_at TEXT)",
+    )
+
+    def _fixture_store(self, tmp_path, monkeypatch) -> Path:
+        db = tmp_path / "fixture.db"
+        con = sqlite3.connect(db)
+        con.execute("PRAGMA journal_mode=WAL")
+        for ddl in self.SCHEMA:
+            con.execute(ddl)
+        con.commit()
+        con.close()
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(db))
+        return db
+
+    def test_single_tick_census_clean(self, tmp_path, monkeypatch, capsys):
+        self._fixture_store(tmp_path, monkeypatch)
+        out = tmp_path / "census.jsonl"
+        rc = main_db(["census", "--out", str(out), "--json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["census"] == "ok"
+        assert payload["ticks"] == 1
+        assert payload["events"] == 0
+        assert payload["evidence"] == str(out)
+        rows = [json.loads(line) for line in out.read_text().splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["ok"] is True
+        assert rows[0]["exception"] is None
+        assert rows[0]["failing_query"] is None
+        assert rows[0]["latency_ms"] >= 0.0
+
+    def test_census_multi_tick_and_default_interval(self, tmp_path, monkeypatch, capsys):
+        import time as _time
+
+        self._fixture_store(tmp_path, monkeypatch)
+        out = tmp_path / "census.jsonl"
+        started = _time.monotonic()
+        rc = main_db(
+            [
+                "census",
+                "--duration",
+                "0.5",
+                "--interval",
+                "0.15",
+                "--out",
+                str(out),
+                "--json",
+            ]
+        )
+        elapsed = _time.monotonic() - started
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ticks"] >= 2
+        rows = [json.loads(line) for line in out.read_text().splitlines()]
+        assert len(rows) == payload["ticks"]
+        assert all(row["ok"] for row in rows)
+        assert 0.3 <= elapsed < 5.0
+
+    def test_census_default_output_lands_in_xdg_state_dir(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        self._fixture_store(tmp_path, monkeypatch)
+        state = tmp_path / "xdg-state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state))
+        rc = main_db(["census", "--json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        evidence = Path(payload["evidence"])
+        assert evidence.parent == state / "magic-hermes" / "census"
+        assert evidence.exists() and evidence.suffix == ".jsonl"
+
+    def test_census_records_exclusive_holder_event(self, tmp_path, monkeypatch, capsys):
+        import os as _os
+        import time as _time
+
+        db = self._fixture_store(tmp_path, monkeypatch)
+        out = tmp_path / "census.jsonl"
+        # THE empirically reproducible reader-blocker on this host
+        # (SQLite 3.53.1): a live holder in PRAGMA locking_mode=EXCLUSIVE.
+        holder = sqlite3.connect(db)
+        holder.execute("PRAGMA locking_mode=EXCLUSIVE")
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute("INSERT INTO pending_ops VALUES (1)")
+        try:
+            started = _time.monotonic()
+            rc = main_db(["census", "--out", str(out), "--json"])
+            elapsed = _time.monotonic() - started
+        finally:
+            holder.rollback()
+            holder.close()
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 2
+        assert payload["events"] == 1
+        assert payload["census"] == "events"
+        rows = [json.loads(line) for line in out.read_text().splitlines()]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["ok"] is False
+        assert "database is locked" in row["exception"]
+        assert row["failing_query"] == "schema_table_count"
+        # the lsof holder census names the live holder (this pytest process)
+        assert any(h["pid"] == _os.getpid() for h in row["holders"])
+        # the post-event recovery probe is recorded, bounded and roll-back only
+        assert row["recovery"]["recovered"] is False
+        assert "database is locked" in row["recovery"]["exception"]
+        # 8 s reader busy window + 10 s recovery busy window, bounded
+        assert 15.0 <= elapsed < 30.0
+
+    def test_census_store_missing_rc2(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("MAGIC_CONTEXT_DB_PATH", str(tmp_path / "absent.db"))
+        rc = main_db(["census", "--json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 2
+        assert "not found" in payload["error"]
+        assert not (tmp_path / "absent.db").exists()
+        assert not tmp_path.joinpath("census").exists()
+
+    @pytest.mark.skipif(
+        os.geteuid() == 0,
+        reason="running as root: directory permissions do not block writes",
+    )
+    def test_census_output_dir_unwritable_rc1(self, tmp_path, monkeypatch, capsys):
+        self._fixture_store(tmp_path, monkeypatch)
+        ro_dir = tmp_path / "ro"
+        ro_dir.mkdir()
+        ro_dir.chmod(0o555)
+        try:
+            rc = main_db(["census", "--out", str(ro_dir / "c.jsonl"), "--json"])
+        finally:
+            ro_dir.chmod(0o755)
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "census refused" in out
+        assert "fix permissions or pass --out" in out or "cannot write evidence" in out
+
+    def test_census_invalid_duration_fails_loud(self, tmp_path, monkeypatch, capsys):
+        self._fixture_store(tmp_path, monkeypatch)
+        rc = main_db(
+            ["census", "--duration", "banana", "--out", str(tmp_path / "c.jsonl")]
+        )
+        assert rc == 1
+        assert "invalid --duration value" in capsys.readouterr().out

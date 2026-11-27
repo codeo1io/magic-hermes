@@ -1780,3 +1780,151 @@ class TestDoctorLaneSkewVerdict:
         assert "lane v95" in out and "max v94" in out
         assert "tail-slow" in out
         assert "(fast-fail retry)" not in out
+
+
+class TestDoctorOuterHardDeadline:
+    """U5 (plan 2026-11-28-001): the outermost hard wall bound.
+
+    The doctor can never hang past the evaluator's 90 s kill: a hard
+    deadline armed at CLI entry (wall budget + render reserve) whose
+    expiry emits the typed ``budget-exhausted`` verdict (FAIL) and
+    exits — never silence, never rc 124.
+    """
+
+    def test_hard_deadline_resolution_distinct_from_wall_budget(self, monkeypatch):
+        monkeypatch.delenv("MAGIC_CONTEXT_DOCTOR_HARD_DEADLINE_S", raising=False)
+        monkeypatch.delenv("MAGIC_CONTEXT_DOCTOR_WALL_BUDGET_S", raising=False)
+        # default: wall budget (75) + render reserve (10) < 90
+        assert cli._doctor_hard_deadline_s() == pytest.approx(85.0)
+        # the explicit override is the DISTINCT outer path
+        monkeypatch.setenv("MAGIC_CONTEXT_DOCTOR_HARD_DEADLINE_S", "1.5")
+        assert cli._doctor_hard_deadline_s() == 1.5
+        # the outer wall always sits above the in-doctor lane by the
+        # reserve, whatever the budget: a tiny WALL_BUDGET never makes
+        # the outer wall fire first
+        monkeypatch.delenv("MAGIC_CONTEXT_DOCTOR_HARD_DEADLINE_S", raising=False)
+        monkeypatch.setenv("MAGIC_CONTEXT_DOCTOR_WALL_BUDGET_S", "2")
+        assert cli._doctor_hard_deadline_s() == pytest.approx(12.0)
+        # junk never widens or degenerates the wall silently
+        monkeypatch.setenv("MAGIC_CONTEXT_DOCTOR_HARD_DEADLINE_S", "banana")
+        assert cli._doctor_hard_deadline_s() == pytest.approx(12.0)
+
+    def test_run_doctor_arms_and_disarms_outer_deadline(self, monkeypatch):
+        import signal
+
+        seen: dict = {}
+
+        def fake_inner(json_output: bool, full_integrity: bool) -> int:
+            seen["itimer"] = signal.getitimer(signal.ITIMER_REAL)[0]
+            return 0
+
+        monkeypatch.setattr(cli, "_run_doctor_inner", fake_inner)
+        previous = signal.getsignal(signal.SIGALRM)
+        assert cli.run_doctor() == 0
+        # armed during the run, above the default in-doctor budget
+        assert 0.0 < seen["itimer"] <= 85.0
+        # disarmed after: no pending alarm leaks into other tests
+        assert signal.getitimer(signal.ITIMER_REAL)[0] == 0.0
+        # the previous handler is restored byte-for-byte
+        assert signal.getsignal(signal.SIGALRM) == previous
+
+    def test_run_doctor_from_worker_thread_stays_unarmed(self):
+        import threading
+
+        results: dict = {}
+
+        def _run() -> None:
+            import signal
+
+            results["itimer"] = signal.getitimer(signal.ITIMER_REAL)[0]
+            disarm = cli._arm_doctor_hard_deadline(60.0, False)
+            results["armed"] = disarm is not None
+            if disarm is not None:
+                disarm()
+
+        worker = threading.Thread(target=_run)
+        worker.start()
+        worker.join(5.0)
+        assert results["armed"] is False  # worker threads never install handlers
+
+    def test_emergency_reap_kills_live_client_process_groups(self, monkeypatch):
+        import subprocess
+
+        from magic_hermes import runtime
+
+        class _StubClient:
+            """Weakref-able stand-in for a RuntimeClient holding a process."""
+
+            def __init__(self, process):
+                self._process = process
+
+        process = subprocess.Popen(
+            ["sleep", "60"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        stub = _StubClient(process)
+        runtime._live_clients.add(stub)
+        try:
+            cli._reap_runtime_clients_emergency()
+            deadline = time.monotonic() + 2.0
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert process.poll() is not None  # SIGKILLed, no waits needed
+        finally:
+            runtime._live_clients.discard(stub)
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+    def _doctor_subprocess(self, tmp_path: Path, extra_args: list[str]):
+        import os
+        import subprocess
+        import sys
+
+        fake_bin = tmp_path / "fakebin"
+        fake_bin.mkdir()
+        node = fake_bin / "node"
+        node.write_text("#!/bin/sh\nsleep 30\n")
+        node.chmod(0o755)
+        src_root = Path(__file__).resolve().parents[1] / "src"
+        env = dict(
+            os.environ,
+            PATH=str(fake_bin),
+            PYTHONPATH=str(src_root),
+            MAGIC_CONTEXT_DOCTOR_HARD_DEADLINE_S="1.0",
+        )
+        env.pop("MAGIC_CONTEXT_PACKAGE_ROOT", None)
+        code = "import sys; from magic_hermes.cli import main; sys.exit(main(sys.argv[1:]))"
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-c", code, "doctor", *extra_args],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return proc, time.monotonic() - started
+
+    def test_outer_deadline_renders_typed_verdict_text(self, tmp_path):
+        """An un-deadlined phase (the version probe) hangs past a small outer
+        override → the typed budget-exhausted row renders, rc 1, bounded."""
+        proc, elapsed = self._doctor_subprocess(tmp_path, [])
+        assert proc.returncode == 1
+        assert "Doctor outer hard deadline exhausted" in proc.stdout
+        assert "1.0s (in-doctor budget + render reserve)" in proc.stdout
+        assert "Summary: PASS 0 / WARN 0 / FAIL 1" in proc.stdout
+        assert "Doctor complete" in proc.stdout
+        # never rc 124, never the 90 s kill: bounded at deadline + overhead
+        assert elapsed < 30.0
+
+    def test_outer_deadline_renders_typed_verdict_json(self, tmp_path):
+        proc, elapsed = self._doctor_subprocess(tmp_path, ["--json"])
+        assert proc.returncode == 1
+        payload = json.loads(proc.stdout)
+        assert payload["summary"] == {"pass": 0, "warn": 0, "fail": 1}
+        assert len(payload["checks"]) == 1
+        assert payload["checks"][0]["status"] == "FAIL"
+        assert "outer hard deadline exhausted" in payload["checks"][0]["message"]
+        assert elapsed < 30.0

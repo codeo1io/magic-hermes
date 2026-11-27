@@ -16,13 +16,15 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .historian_guard import (
     RETIRES_AT_UPSTREAM,
@@ -93,6 +95,18 @@ _DOCTOR_WALL_RENDER_RESERVE_S = 0.25
 # belts with the bridge-side deadline derivation (U1): the deferred
 # bind can never outrun the verdict budget.
 _DOCTOR_BIND_WAIT_MARGIN_S = 2.0
+# --- outermost hard wall (plan 2026-11-28-001 U5) ---------------------------
+# The rc-124 pipe-hang class (2026-11) proved that phases of the doctor
+# OUTSIDE the in-doctor budget lane (version probe, installs scan, the
+# runtime's stdin-write path) had no bound of their own: a stalled
+# sidecar could hold the process past maestro's 90 s single-shot kill.
+# The outer wall arms at doctor ENTRY at the in-doctor budget plus a
+# render/reap reserve — 75 + 10 = 85 < 90 — so a typed verdict always
+# renders before the evaluator's kill. DISTINCT override on purpose:
+# tests can reach the outer path without the in-doctor lane firing
+# first, and a tiny WALL_BUDGET override never narrows the outer wall.
+_DOCTOR_HARD_DEADLINE_ENV = "MAGIC_CONTEXT_DOCTOR_HARD_DEADLINE_S"
+_DOCTOR_OUTER_RENDER_RESERVE_S = 10.0
 SHARED_DB_RELPATH = (
     Path(".local") / "share" / "cortexkit" / "magic-context" / "context.db"
 )
@@ -507,7 +521,142 @@ def _doctor_wall_budget_s() -> float:
     return value
 
 
+def _doctor_hard_deadline_s() -> float:
+    """Resolve the outermost hard wall for the whole doctor process (U5).
+
+    maestro observes the whole ``magic-hermes doctor`` process for 90 s
+    single-shot; a typed verdict must render before that kill no matter
+    which phase stalls. Default: the in-doctor wall budget plus the
+    outer render/reap reserve. An explicit positive finite override is
+    honoured (tests use it to reach this path directly); junk or
+    non-positive values never widen or degenerate the wall silently.
+    """
+
+    raw = os.environ.get(_DOCTOR_HARD_DEADLINE_ENV, "")
+    try:
+        value = float(raw) if raw.strip() else 0.0
+    except ValueError:
+        value = 0.0
+    if value > 0.0 and value == value and value != float("inf"):
+        return value
+    return _doctor_wall_budget_s() + _DOCTOR_OUTER_RENDER_RESERVE_S
+
+
+def _reap_runtime_clients_emergency() -> None:
+    """Kill every live sidecar process group without waiting (expiry path).
+
+    The expiry path must leave no sidecar child holding the evaluator's
+    pipes when the doctor exits. SIGTERM then SIGKILL per process group,
+    no waits: the render reserve absorbs the kernel-side reap.
+    """
+
+    from . import runtime
+
+    with runtime._clients_lock:
+        clients = list(runtime._live_clients)
+    for client in clients:
+        process = getattr(client, "_process", None)
+        if process is None or process.poll() is not None:
+            continue
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _render_doctor_budget_exhausted(deadline_s: float, json_output: bool) -> None:
+    """Emit the typed budget-exhausted verdict (U5) — never silence, never rc 124.
+
+    The expiry path does NO new blocking I/O: no fresh probes, no
+    corroboration reads — severity is FAIL by default (the
+    cached-corroboration WARN upgrade belongs to the severity policy,
+    plan 2026-11-28-001 U6). The text is emitted with one direct
+    ``os.write`` so the render can never deadlock on a Python-level
+    stdout lock the interrupted main thread may still hold, and can
+    never be lost to an unflushed buffer at ``os._exit``.
+    """
+
+    message = (
+        f"Doctor outer hard deadline exhausted: {deadline_s:.1f}s "
+        "(in-doctor budget + render reserve) elapsed before a verdict "
+        "could render; typed budget-exhausted verdict, no probes at expiry"
+    )
+    if json_output:
+        payload = {
+            "checks": [{"status": "FAIL", "message": message}],
+            "summary": {"pass": 0, "warn": 0, "fail": 1},
+        }
+        text = json.dumps(payload, indent=2)
+    else:
+        text = (
+            "┌  magic-hermes doctor\n"
+            f"│\n◆  FAIL {message}\n"
+            "│\n│  Summary: PASS 0 / WARN 0 / FAIL 1\n│\n"
+            "└  Doctor complete\n"
+        )
+    data = text.encode("utf-8", "replace")
+    try:
+        fd = sys.stdout.fileno()
+    except (AttributeError, OSError, ValueError):
+        fd = 1
+    # single atomic write (< PIPE_BUF): the evaluator greps this verbatim
+    os.write(fd, data)
+
+
+def _arm_doctor_hard_deadline(
+    deadline_s: float, json_output: bool
+) -> Callable[[], None] | None:
+    """Arm SIGALRM at doctor entry; return the disarm callable (or None).
+
+    Only the main thread may install a signal handler; a doctor run
+    from a worker thread simply stays unarmed (the in-doctor budget
+    lane still bounds its own work) rather than raising. Disarming
+    cancels the timer and restores the previous handler byte-for-byte.
+    """
+
+    if threading.current_thread() is not threading.main_thread():
+        return None
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def _handler(signum: int, frame: object) -> None:
+        _render_doctor_budget_exhausted(deadline_s, json_output)
+        _reap_runtime_clients_emergency()
+        os._exit(1)
+
+    signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, deadline_s)
+
+    def _disarm() -> None:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+    return _disarm
+
+
 def run_doctor(json_output: bool = False, full_integrity: bool = False) -> int:
+    """Doctor entry (plan 2026-11-28-001 U5): arm the outermost hard wall.
+
+    The wall spans every phase of the doctor — version probes, installs
+    scan, sidecar boots, store work, render — so no un-deadlined phase
+    can hold the process past the evaluator's 90 s kill. On expiry the
+    SIGALRM handler emits the typed ``budget-exhausted`` verdict and
+    exits by its severity (FAIL); a normal completion disarms the wall
+    byte-for-byte (no row, unchanged output).
+    """
+
+    disarm = _arm_doctor_hard_deadline(_doctor_hard_deadline_s(), json_output)
+    try:
+        return _run_doctor_inner(json_output=json_output, full_integrity=full_integrity)
+    finally:
+        if disarm is not None:
+            disarm()
+
+
+def _run_doctor_inner(
+    json_output: bool = False, full_integrity: bool = False
+) -> int:
     report = DoctorReport()
     wall_started = time.monotonic()
     wall_budget_s = _doctor_wall_budget_s()
@@ -1566,12 +1715,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     db.add_argument(
         "db_action",
-        choices=("status", "blockers", "migrate"),
+        choices=("status", "blockers", "migrate", "census"),
         help="status: read-only fence + holder report; blockers: live "
         "holders with build attribution; migrate: drive the sanctioned "
-        "upstream migration (openDatabase) with drain support",
+        "upstream migration (openDatabase) with drain support; census: "
+        "sample store readability in maestro's reader shape (lock-window "
+        "evidence, JSONL under the XDG state dir)",
     )
     db.add_argument("--json", action="store_true", help="machine-readable output")
+    db.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="census: total sampling window (default: single tick)",
+    )
+    db.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="census: seconds between ticks (default: 30)",
+    )
+    db.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="census: evidence file path (default: XDG state dir, never "
+        "inside the repository tree)",
+    )
     db.add_argument(
         "--wait",
         type=float,
@@ -1642,6 +1815,13 @@ def main(argv: list[str] | None = None) -> int:
                 *(["--json"] if args.json else []),
                 *(["--wait", str(args.wait)] if args.wait is not None else []),
                 *(["--kill-blockers"] if args.kill_blockers else []),
+                *(["--duration", str(args.duration)]
+                  if args.duration is not None
+                  else []),
+                *(["--interval", str(args.interval)]
+                  if args.interval is not None
+                  else []),
+                *(["--out", args.out] if args.out is not None else []),
             ]
         )
     if args.command == "provenance":

@@ -34,6 +34,15 @@ _PROCESS_GROUP = os.name == "posix"
 # host event loop (gateway exit-75 storms, 2026-09-21).
 _IDLE_SWEEP_INTERVAL_S = 60.0
 _DEFAULT_IDLE_TTL_S = 300.0
+
+# Stdin-write deadline (plan 2026-11-28-001 U5): a stalled sidecar that
+# stops reading its stdin can leave this write blocking forever on a full
+# pipe — the second observed hang class behind maestro's rc-124 kills.
+# The write runs on a helper thread bounded by this deadline; on expiry
+# the process group is disposed (closing the pipe unblocks the writer)
+# and the typed RuntimeProtocolError carries the call context. Tests
+# monkeypatch this module constant to reach the path quickly.
+_STDIN_WRITE_TIMEOUT_S = 30.0
 _DEFAULT_FAILURE_COOLDOWN_S = 30.0
 
 _clients_lock = threading.Lock()
@@ -526,15 +535,47 @@ class RuntimeClient:
     ) -> None:
         if process.stdin is None:
             raise RuntimeProtocolError("Runtime stdin is unavailable")
-        try:
-            with self._stdin_lock:
-                process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
-                process.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError) as exc:
+        data = json.dumps(payload, separators=(",", ":")) + "\n"
+        failure: list[BaseException] = []
+
+        def _writer() -> None:
+            try:
+                with self._stdin_lock:
+                    process.stdin.write(data)
+                    process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                failure.append(exc)
+
+        writer = threading.Thread(
+            target=_writer,
+            name="magic-hermes-stdin-write",
+            daemon=True,
+        )
+        writer.start()
+        writer.join(float(_STDIN_WRITE_TIMEOUT_S))
+        if writer.is_alive():
+            # A writer blocked on a full stdin pipe only unblocks when the
+            # read end closes — i.e. when the child DIES. Kill the process
+            # group BEFORE disposing: _dispose closes the stream first, and
+            # closing a stream another thread is blocked writing to would
+            # itself block on that stream's lock until the child exits.
+            if _PROCESS_GROUP:
+                with contextlib.suppress(OSError):
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            with contextlib.suppress(OSError):
+                process.kill()
+            self._dispose(process)
+            writer.join(2.0)
+            raise RuntimeProtocolError(
+                f"Runtime stdin write stalled for "
+                f"{float(_STDIN_WRITE_TIMEOUT_S):.1f}s during {context}; "
+                "request was not replayed"
+            )
+        if failure:
             self._dispose(process)
             raise RuntimeProtocolError(
                 f"Runtime failed while {context}; request was not replayed"
-            ) from exc
+            ) from failure[0]
 
     def _dispatch_host_callback(
         self,

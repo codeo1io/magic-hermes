@@ -511,3 +511,92 @@ class TestDiscoveryWidening:
 
         assert candidates[0] == override.resolve()
         assert runtime.find_magic_context_package() == override.resolve()
+
+
+class TestStdinWriteDeadline:
+    """U5 (plan 2026-11-28-001): the stdin-write path is deadline-guarded.
+
+    A sidecar that stops reading its stdin used to leave _write_payload
+    blocking forever on a full pipe — the second observed hang class
+    behind maestro's rc-124 kills. The guard disposes the process group
+    (closing the pipe unblocks the writer) and raises the typed
+    RuntimeProtocolError; the request was never replayed.
+    """
+
+    def test_default_timeout_is_30s(self):
+        assert runtime._STDIN_WRITE_TIMEOUT_S == 30.0
+
+    def test_write_deadline_disposes_stalled_sidecar(self, monkeypatch):
+        import contextlib
+        import subprocess
+
+        monkeypatch.setattr(runtime, "_STDIN_WRITE_TIMEOUT_S", 0.5)
+        client = runtime.RuntimeClient()
+        # start_new_session: the disposal kills the process GROUP, which
+        # must never be the test runner's group.
+        process = subprocess.Popen(
+            ["sleep", "60"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+
+        def _fill_pipe() -> None:
+            with contextlib.suppress(OSError, ValueError):
+                while True:
+                    process.stdin.write("x" * 65536)
+
+        feeder = threading.Thread(target=_fill_pipe, daemon=True)
+        feeder.start()
+        time.sleep(0.4)  # let the pipe fill so the guarded write blocks
+        started = time.monotonic()
+        try:
+            with pytest.raises(runtime.RuntimeProtocolError) as excinfo:
+                client._write_payload(
+                    process,
+                    {"id": 1, "method": "fence", "params": {}},
+                    context="fence test",
+                )
+            elapsed = time.monotonic() - started
+            assert "stdin write stalled" in str(excinfo.value)
+            assert "fence test" in str(excinfo.value)
+            assert "not replayed" in str(excinfo.value)
+            # bounded: fired at the deadline, not a hang
+            assert 0.4 <= elapsed < 10.0
+            # the process group was reaped: no pipe holder survives
+            assert process.poll() is not None
+        finally:
+            feeder.join(2.0)
+            client.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+    def test_write_payload_still_delivers_fast_payload(self, monkeypatch):
+        """The guard must not change the happy path: a readable pipe write
+        completes synchronously with no typed error."""
+        import subprocess
+
+        client = runtime.RuntimeClient()
+        process = subprocess.Popen(
+            ["cat"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            client._write_payload(
+                process,
+                {"id": 1, "method": "nop", "params": {}},
+                context="happy path test",
+            )
+            line = process.stdout.readline()
+            assert json.loads(line)["id"] == 1
+        finally:
+            client.close()
+            process.terminate()
+            process.wait(timeout=5)

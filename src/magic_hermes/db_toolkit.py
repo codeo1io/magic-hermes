@@ -609,6 +609,14 @@ def run_db_blockers(json_output: bool = False) -> int:
 
 _MIGRATE_USAGE = """\
 usage: magic-hermes db migrate [--wait SECONDS] [--kill-blockers] [--json]
+usage: magic-hermes db census [--duration SECONDS] [--interval SECONDS]
+                              [--out PATH] [--json]
+
+census: read-only store readability sampler replicating maestro's
+bounded-operational-scan reader, recording lock-window evidence to
+JSONL under the XDG state dir (never inside the repo tree). Exit 0
+when every tick read clean, 2 when lock events were observed, 1 on a
+harness error.
 
 Drives the sanctioned upstream migration path (openDatabase) with a
 one-shot Node driver. Default: single attempt, fail-loud on refusal
@@ -774,6 +782,260 @@ def run_db_migrate(
         time.sleep(5.0)
 
 
+# ---------------------------------------------------------------------------
+# db census — read-only store readability sampler (plan 2026-11-28-001 U1)
+# ---------------------------------------------------------------------------
+
+# maestro's bounded-operational-scan reader, byte-for-byte (the frozen
+# contract from maestro/src/maestro/context.py `_ro`): a mode=ro URI open
+# with timeout=8, a Row factory, PRAGMA query_only=ON, then
+# PRAGMA busy_timeout=8000, followed by the exact query sequence in
+# order. A readability failure mid-sequence is the failure class this
+# census exists to observe, so the replica must never drift from the
+# reader shape that actually failed in production.
+_MAESTRO_READER_TIMEOUT_S = 8.0
+_MAESTRO_BUSY_TIMEOUT_MS = 8000
+
+MAESTRO_QUERY_SEQUENCE: tuple[tuple[str, str], ...] = (
+    (
+        "schema_table_count",
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+    ),
+    ("pending_ops", "SELECT COUNT(*) FROM pending_ops"),
+    ("migration_pending", "SELECT COUNT(*) FROM migration_pending"),
+    (
+        "pending_session_cleanup",
+        "SELECT COUNT(*) FROM pending_session_cleanup",
+    ),
+    (
+        "historian_runs",
+        "SELECT id,status,failure_reason,created_at FROM historian_runs "
+        "ORDER BY id DESC LIMIT 20",
+    ),
+    (
+        "dream_runs",
+        "SELECT id,started_at,finished_at,tasks_succeeded,tasks_failed "
+        "FROM dream_runs ORDER BY id DESC LIMIT 20",
+    ),
+    (
+        "task_schedule_state",
+        "SELECT task,last_run_at,next_due_at,last_status,retry_count "
+        "FROM task_schedule_state ORDER BY task",
+    ),
+    (
+        "mirror_cursors",
+        "SELECT domain,cursor,updated_at FROM mirror_cursors",
+    ),
+    (
+        "memory_verifications",
+        "SELECT COUNT(*) n,MAX(verified_at) mx FROM memory_verifications",
+    ),
+)
+
+_CENSUS_INTERVAL_S_DEFAULT = 30.0
+
+
+def _maestro_reader_probe(db_path: Path) -> dict[str, Any]:
+    """Replicate maestro's bounded scan read of the shared store.
+
+    Returns a probe result: ``latency_ms`` always; ``exception`` and
+    ``failing_query`` (the query name whose statement raised, or
+    "open" when the connection itself failed) only on failure. The
+    probe NEVER writes the store (mode=ro + query_only).
+    """
+
+    started = time.monotonic()
+    result: dict[str, Any] = {}
+    try:
+        con = sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, timeout=_MAESTRO_READER_TIMEOUT_S
+        )
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")
+        con.execute(f"PRAGMA busy_timeout={_MAESTRO_BUSY_TIMEOUT_MS}")
+        try:
+            for name, sql in MAESTRO_QUERY_SEQUENCE:
+                con.execute(sql).fetchall()
+        except sqlite3.Error as exc:
+            result["exception"] = f"{type(exc).__name__}: {exc}"
+            result["failing_query"] = name
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        result["exception"] = f"{type(exc).__name__}: {exc}"
+        result["failing_query"] = "open"
+    result["latency_ms"] = round((time.monotonic() - started) * 1000.0, 1)
+    return result
+
+
+def _census_state_dir() -> Path:
+    """XDG state dir for census evidence (never inside the repo tree)."""
+
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "magic-hermes" / "census"
+
+
+def _census_recovery_probe(db_path: Path) -> dict[str, Any]:
+    """Post-event write-recovery probe (bounded, rollback-only).
+
+    The ONLY writable connection attempt the census ever makes: after a
+    lock event, one bounded busy-timeout read-write open plus a
+    BEGIN IMMEDIATE / ROLLBACK pair tells the evidence file whether the
+    write lane had recovered by the time the tick recorded the event.
+    """
+
+    started = time.monotonic()
+    try:
+        con = sqlite3.connect(str(db_path), timeout=10.0)
+        try:
+            con.execute("PRAGMA busy_timeout=10000")
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("ROLLBACK")
+        finally:
+            con.close()
+        return {
+            "recovered": True,
+            "latency_ms": round((time.monotonic() - started) * 1000.0, 1),
+        }
+    except sqlite3.Error as exc:
+        return {
+            "recovered": False,
+            "exception": f"{type(exc).__name__}: {exc}",
+            "latency_ms": round((time.monotonic() - started) * 1000.0, 1),
+        }
+
+
+def _stat_sibling(path: Path) -> dict[str, Any] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {
+        "bytes": stat.st_size,
+        "mtime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stat.st_mtime)),
+    }
+
+
+def run_db_census(
+    duration_s: float = 0.0,
+    interval_s: float = _CENSUS_INTERVAL_S_DEFAULT,
+    json_output: bool = False,
+    out_path: str | os.PathLike[str] | None = None,
+) -> int:
+    """Sample the store's readability in maestro's exact reader shape.
+
+    Records one JSONL row per tick (probe result, WAL/SHM stats, holder
+    snapshot + recovery verdict on lock events) under the XDG state
+    dir — never inside the repository tree. Exit codes: 0 every tick
+    read clean; 2 lock events observed (the operational signal); 1
+    harness error (e.g. the output dir is unwritable).
+    """
+
+    scan = scan_store()
+    db_path = scan.db_path
+    if not scan.exists:
+        message = f"census refused: shared store not found at {db_path}"
+        if json_output:
+            print(json.dumps({"census": "error", "error": message}, indent=2))
+        else:
+            print(message)
+        return 2
+
+    started = time.monotonic()
+    started_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if out_path is not None:
+        target = Path(out_path)
+    else:
+        target = _census_state_dir() / f"census-{started_utc.replace(':', '')}.jsonl"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message = (
+            f"census refused: cannot create output directory {target.parent} "
+            f"({exc}); fix permissions or pass --out"
+        )
+        if json_output:
+            print(json.dumps({"census": "error", "error": message}, indent=2))
+        else:
+            print(message)
+        return 1
+
+    ticks = 0
+    events = 0
+    worst_latency_ms = 0.0
+    wal_max_bytes = 0
+    holder_commands: list[str] = []
+    try:
+        with open(target, "a", encoding="utf-8") as handle:
+            while True:
+                ticks += 1
+                probe = _maestro_reader_probe(db_path)
+                wal_stat = _stat_sibling(Path(f"{db_path}-wal"))
+                shm_stat = _stat_sibling(Path(f"{db_path}-shm"))
+                row: dict[str, Any] = {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "tick": ticks,
+                    "ok": "exception" not in probe,
+                    "latency_ms": probe["latency_ms"],
+                    "exception": probe.get("exception"),
+                    "failing_query": probe.get("failing_query"),
+                    "wal": wal_stat,
+                    "shm": shm_stat,
+                }
+                if not row["ok"]:
+                    events += 1
+                    holders = list_holders(db_path)
+                    row["holders"] = [
+                        {
+                            "pid": h.pid,
+                            "kind": h.kind,
+                            "command": h.command,
+                            "age_s": h.age_s,
+                        }
+                        for h in holders
+                    ]
+                    for holder in holders:
+                        if holder.command not in holder_commands:
+                            holder_commands.append(holder.command)
+                    row["recovery"] = _census_recovery_probe(db_path)
+                handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+                handle.flush()
+                worst_latency_ms = max(worst_latency_ms, probe["latency_ms"])
+                if wal_stat is not None:
+                    wal_max_bytes = max(wal_max_bytes, wal_stat["bytes"])
+                if duration_s <= 0 or time.monotonic() - started >= duration_s:
+                    break
+                time.sleep(max(0.0, interval_s))
+    except OSError as exc:
+        message = f"census refused: cannot write evidence file {target} ({exc})"
+        if json_output:
+            print(json.dumps({"census": "error", "error": message}, indent=2))
+        else:
+            print(message)
+        return 1
+
+    summary = {
+        "census": "ok" if events == 0 else "events",
+        "store": str(db_path),
+        "started_utc": started_utc,
+        "duration_s": round(time.monotonic() - started, 1),
+        "ticks": ticks,
+        "events": events,
+        "worst_latency_ms": worst_latency_ms,
+        "wal_max_bytes": wal_max_bytes,
+        "holder_commands": holder_commands,
+        "evidence": str(target),
+    }
+    if json_output:
+        print(json.dumps(summary, indent=2))
+    else:
+        print(
+            f"census: {summary['census']} — {ticks} tick(s), {events} lock event(s), "
+            f"worst probe latency {worst_latency_ms:.1f} ms; evidence: {target}"
+        )
+    return 0 if events == 0 else 2
+
+
 def main_db(argv: list[str]) -> int:
     """Entry for `magic-hermes db <action> [options]`."""
 
@@ -791,6 +1053,34 @@ def main_db(argv: list[str]) -> int:
             with contextlib.suppress(ValueError):
                 wait_s = float(rest[i + 1])
     kill_blockers = "--kill-blockers" in rest
+    if action == "census":
+        duration_s = 0.0
+        interval_s = _CENSUS_INTERVAL_S_DEFAULT
+        out_override: str | None = None
+        for i, token in enumerate(rest):
+            if token in ("--duration", "--interval") and i + 1 < len(rest):
+                try:
+                    value = float(rest[i + 1])
+                except ValueError:
+                    print(f"invalid {token} value: {rest[i + 1]!r}")
+                    print(_MIGRATE_USAGE)
+                    return 1
+                if value < 0:
+                    print(f"invalid {token} value: {rest[i + 1]!r} (must be >= 0)")
+                    print(_MIGRATE_USAGE)
+                    return 1
+                if token == "--duration":
+                    duration_s = value
+                else:
+                    interval_s = value
+            elif token == "--out" and i + 1 < len(rest):
+                out_override = rest[i + 1]
+        return run_db_census(
+            duration_s=duration_s,
+            interval_s=interval_s,
+            json_output=json_output,
+            out_path=out_override,
+        )
     if action == "blockers":
         return run_db_blockers(json_output=json_output)
     if action == "migrate":
