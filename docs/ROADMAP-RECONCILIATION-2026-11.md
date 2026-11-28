@@ -202,3 +202,108 @@ verified against the local checkout, the roadmap store at
 (203 rows, mtime 2026-11-27 00:26), and live `gh` (remote master `9026f547`
 = v0.3.75; remote `ROADMAP.md` still `c44dccb`). The 2026-10 record remains
 authoritative for its window; its addendum conventions apply here.*
+
+## 9. Addendum (2026-11-28): stale mint, render resumption, fresh store census
+
+Recorded by the second campaign this window's `github_docs_due` clock
+minted. The clock fired again at 2026-11-27T16:32:06Z (severity 0.72,
+`stale_docs: ["ROADMAP.md"]`) — the instant of release v0.3.75 — while
+`ROADMAP.md` still sat at `c44dccb`. By the time the campaign it minted
+(run `62ec61541d2b41e994bbd2c93e0c5ae0`) was created, the observation it
+carries had already healed. This addendum is that resolution's record.
+
+**The stale mint, reproduced.** The detector is a pure timestamp freshness
+check (`hermes_autonomy/github_steward.py`, `_docs_due`): a doc is stale
+when `code_ts − doc_ts > days`, with windows README.md 7 days and
+ROADMAP.md 2 days. The dispatch timeline, from git history and the
+campaign record:
+
+- 2026-11-27 08:34:44Z — the same clock minted the predecessor campaign
+  (run `4ba1734095db45f181abb85999e1119f`).
+- 2026-11-27 16:32:06Z — this campaign's minting event fires at the
+  v0.3.75 release instant (`9026f54`); `ROADMAP.md` is ~2 days stale
+  then.
+- 2026-11-27 22:02:12Z — release v0.3.76 (`e0840cc`).
+- 2026-11-27 22:59:44Z — the predecessor run integrated (`2d1550c`):
+  this record, the README D1/D2 fixes, the D2 fence.
+- 2026-11-28 00:31:22Z — the managed render refresh (`952c91f`) resets
+  the ROADMAP clock (doc_ts = code_ts at that instant).
+- 2026-11-28 00:36:59Z — this campaign created: **5m37s after the
+  reset**.
+- 2026-11-28 00:38:55Z — dispatched (maestro outbox
+  `ev-fe237bcc3d488564b40a46968573fd06`).
+
+The dispatch pipeline does not re-validate doc freshness at campaign
+creation, so it minted on a healed observation. This is the second
+confirmed instance of the class in scoped-github-autonomy campaigns (the
+first: run `025415a79bbd`, 2026-11-27, ~2.9 days stale). The estate-side
+fix — re-validate freshness at dispatch time — is escalated via this
+record; nothing in this repo can make it.
+
+**§5a resolved for the current period: the renderer runs.** Two render
+commits now sit in-repo after the 19-day silence this record escalated:
+
+- `c44dccb` (2026-11-25 00:45:46) — the resumption render; cosmetic-only
+  diff (§5a's own bullet).
+- `952c91f` (2026-11-28 00:31:22) — the render that reset this window's
+  clock; its diff vs `c44dccb` is 3 lines of Fleet-context relabels
+  (upstreams/dependents); the 14-item open set and every status
+  unchanged.
+
+So hypothesis 1 ("the renderer pass stopped") is answered for the current
+period: the renderer runs and commits when its render produces a delta.
+The 19-day silence itself remains undistinguished — a no-op stretch
+leaves no in-repo trace by construction (hypothesis 2), and the
+distinguishing evidence is still roadmap-sync run logs estate-side. And
+the renders that resumed are cosmetic by store content, not by renderer
+health: the open set stayed frozen through both.
+
+**§5b re-affirmed with fresh census evidence.** The store grew 203 → 205
+rows since this record was written — the two new rows are rm-001/rm-003
+detector recounts, no status movements. Latest-per-id census: 23 items
+(10 candidate, 4 in_progress, 8 done, 1 superseded); 14 open; zero
+closures of done items ever — the gap is now 40+ days old and still live.
+Every §3 verdict row re-spot-checked at the addendum base, all stand:
+`v0.3.4` exists; `0e860ea`, `cae53bc`, `40fe03b` are ancestors of the
+base (rm-012/rm-013/rm-016 done); the docs battery is green (now 10
+fences); `bridge/runtime.mjs` is still 3,650 lines (rm-001 open); no
+`status` subcommand in `cli.py` (install/wire/doctor/guard/db/provenance
+— rm-020 open); `ci.yml` lines 50–61 still seed the historian config
+(rm-022 open); the README's rm-023 historian-config leg is still absent
+(all `@cortexkit` README mentions are package/config/doctor references);
+`wiring.py` still ships `BACKUP_KEEP = 10` with `_prune_backups`
+(rm-021's shipped retention leg); the rm-003 recount is unchanged
+(10/12 modules test-covered; §5c stands).
+
+**Current status.** By the detector's own criterion at this base,
+`README.md` and `ROADMAP.md` are both CURRENT: the render set
+`doc_ts == code_ts` at 00:31:22Z, five and a half minutes before this
+campaign existed, and every mechanically checkable README claim is
+fenced and green. The only divergence from shipped behavior is the
+estate-owned store layer this record's §3/§5b already document — there
+is nothing further in-repo to reconcile this window. The discharge of
+this run's mint is this addendum.
+
+**Considered and declined for this addendum** (completing §8 for this
+window):
+
+- A second full dated record for the 2026-11-28 window: duplicates a
+  record hours old whose verdict table re-verified unchanged; declined.
+- A new docs-consistency fence (an in-repo ROADMAP-freshness pin):
+  nothing unfenced remains in-repo to pin, and a freshness pin would
+  fail CI for an estate-owned cadence (render gaps are the renderer's
+  operational state, not this repo's); declined.
+- Any README change: current by design and fenced; declined.
+
+*Addendum recorded 2026-11-28 by conductor run
+`62ec61541d2b41e994bbd2c93e0c5ae0` against base `952c91f` (v0.3.76) on
+`conductor/run-62ec61541d2b`. Facts verified against the worktree at that
+base, git history, the roadmap store at
+`/work/projects/hermes-autonomy/runtime/roadmap-state/magic-hermes/items.jsonl`
+(205 rows, mtime 2026-11-28 00:31), and the campaign record/outbox.
+Write-time live state: origin/master had moved one release ahead
+(`fa748d5`, v0.3.77, 2026-11-28T01:16:44Z, standard version/pin
+transaction); the ROADMAP freshness verdict holds at either base
+(00:31:22Z → 01:16:44Z is ~45 minutes against the 2-day window). `gh`
+was unreachable from the delegate shell — remote state verified via git
+fetch.*
